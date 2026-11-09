@@ -1,0 +1,971 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CORVX — UX prototype</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#11161d; --line:#262d36; --text:#c9d1d9; --dim:#7d8590;
+    --blue:#58a6ff; --amber:#e3b341; --red:#f85149; --green:#3fb950; --violet:#bc8cff;
+    --grey:#6e7681; --accent:#79c0ff; --sel:#1c2633;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    display:flex;flex-direction:column;overflow:hidden}
+  #top{display:flex;gap:14px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden}
+  #top .right{margin-left:auto;display:flex;gap:10px}
+  #top .toast{color:var(--accent);max-width:38ch;overflow:hidden;text-overflow:ellipsis}
+  .brand{color:var(--accent);letter-spacing:.08em}
+  #body{flex:1;display:flex;min-height:0}
+  #rail{width:252px;border-right:1px solid var(--line);overflow:auto;padding:6px 0;flex:none}
+  #main{flex:1;overflow:auto;padding:10px 16px;min-width:0}
+  #rail.focus,#main.focus{box-shadow:inset 0 0 0 1px rgba(121,192,255,.35)}
+  #peek{border-top:1px solid var(--line);padding:4px 12px;color:var(--dim);white-space:pre;overflow:hidden;max-height:76px}
+  #status{border-top:1px solid var(--line);padding:5px 12px;display:flex;gap:10px;white-space:nowrap;overflow:hidden;align-items:center}
+  #status .hints{color:var(--dim);overflow:hidden;text-overflow:ellipsis}
+  #input{border-top:1px solid var(--line);padding:5px 12px;min-height:28px;white-space:pre;overflow:hidden}
+  #input:empty{display:none}
+  #pal{position:fixed;top:44px;left:250px;width:440px;max-height:60vh;overflow:auto;background:#161b22;border:1px solid var(--line);border-radius:6px;padding:6px;display:none;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #pal.open{display:block}
+  .pi{padding:3px 8px;border-radius:3px}
+  .pi.sel{background:var(--sel);box-shadow:inset 2px 0 var(--violet)}
+  .mode{font-weight:bold;padding:0 6px;border-radius:3px;color:#0d1117}
+  .m-NORMAL{background:var(--blue)} .m-INSERT{background:var(--green)} .m-PALETTE{background:var(--violet)} .m-PREFIX{background:var(--amber)}
+  h2{font-size:12px;color:var(--accent);margin:16px 0 4px;letter-spacing:.06em;text-transform:uppercase;font-weight:600}
+  h2:first-child{margin-top:4px}
+  .row{display:flex;gap:12px;align-items:baseline;white-space:nowrap;padding:2px 8px;border-radius:3px;border-left:2px solid transparent}
+  .row.sel{background:var(--sel);border-left-color:var(--accent)}
+  .lab{width:15ch;flex:none}
+  .ctx{width:31ch;flex:none;overflow:hidden;text-overflow:ellipsis}
+  .colhead{display:flex;gap:12px;color:var(--dim);text-transform:uppercase;padding:2px 10px;margin-top:8px;border-bottom:1px solid var(--line)}
+  .ttl{width:30ch;flex:none;overflow:hidden;text-overflow:ellipsis}
+  .colhead .age{margin-left:auto}
+  .sep{color:#3a424d}
+  .panes{display:flex;height:100%;min-height:0}
+  .pane{flex:1;min-width:0;overflow:auto;padding:2px 6px;border-radius:4px}
+  .pane + .pane{border-left:1px solid var(--line);margin-left:12px;padding-left:14px}
+  .pane.focus{box-shadow:inset 0 0 0 1px rgba(121,192,255,.35)}
+  .log .trace{color:#5c6470}
+  .log .decision{color:var(--violet)}
+  .det{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .age{color:var(--dim);margin-left:auto;flex:none}
+  .blk{color:var(--amber)} .fail{color:var(--red)} .done{color:var(--green)} .work{color:var(--blue)}
+  .idle{color:var(--grey)} .stale{color:var(--dim);font-style:italic} .plan{color:var(--violet)}
+  .dim{color:var(--dim)} .kv{color:var(--dim)} .cur{color:var(--accent)}
+  .hint{margin-top:14px;color:var(--dim)}
+  .card{border:1px solid var(--line);border-radius:5px;padding:8px 10px;margin:8px 0;background:var(--panel)}
+  .card.blkcard{border-color:var(--amber)}
+  .log{white-space:pre-wrap;border:1px solid var(--line);border-radius:4px;padding:6px 8px;background:#0a0e13;max-height:46vh;overflow:auto;margin-top:4px}
+  .log .you{color:var(--accent)} .log .orchl{color:var(--violet)}
+  .bar{display:inline-block;width:110px;height:7px;background:#21262d;border-radius:2px;overflow:hidden;vertical-align:middle}
+  .bar i{display:block;height:100%;background:var(--blue)}
+  .ev{color:var(--dim);font-size:12px}
+  .ws{color:var(--dim);text-transform:uppercase;font-size:11px;padding:10px 12px 2px;letter-spacing:.06em}
+  .rrow{display:flex;justify-content:space-between;gap:8px;padding:2px 12px;white-space:nowrap;border-left:2px solid transparent}
+  .rrow.sel{background:var(--sel);border-left-color:var(--accent)}
+  .rrow.cur .rname{color:var(--accent)}
+  .rrow .rsub{color:var(--dim);overflow:hidden;text-overflow:ellipsis;max-width:13ch;text-align:right}
+  .rrow .rname{white-space:nowrap}
+  .caret::after{content:'▌';color:var(--accent);animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .help td{padding:2px 14px 2px 0;vertical-align:top}
+  .help td:first-child{color:var(--accent);white-space:nowrap}
+  @media (max-width:760px){ #rail{width:150px} .ctx{width:20ch} .lab{width:11ch} }
+</style>
+</head>
+<body>
+<div id="top"></div>
+<div id="body"><aside id="rail"></aside><main id="main"></main></div>
+<div id="peek"></div>
+<div id="status"></div>
+<div id="input"></div>
+<div id="pal"></div>
+
+<script>
+/* ---------- helpers ---------- */
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = s => s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm' : Math.floor(s/3600) + 'h';
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const row = (sel, html) => `<div class="row${sel ? ' sel' : ''}">${html}</div>`;
+const hintLine = t => `<div class="hint">${esc(t)}</div>`;
+const bar = p => `<span class="bar"><i style="width:${p}%"></i></span>`;
+
+const ST = {
+  working:['●','working','work'], running:['●','running','work'], blocked:['!','BLOCKED','blk'],
+  done:['✓','DONE','done'], idle:['◌','idle','idle'], failed:['✗','FAILED','fail'],
+  stale:['?','stale','stale'], planned:['◇','planned','plan'], waiting:['…','waiting','idle'],
+  planning:['◆','planning','plan'], 'plan-ready':['◆','PLAN READY','plan'],
+  rejected:['■','rejected','idle'], accepted:['✓','accepted','done'], stopped:['■','stopped','idle']
+};
+const badge = s => { const [g,l,c] = ST[s] || ['?', s, 'idle']; return `<span class="${c}">${g} ${l}</span>`; };
+
+/* ---------- static world ---------- */
+const PROJECTS = [
+  {id:'api-gateway', ws:'Client work',   branch:'main',           dirty:true},
+  {id:'billing-ui',  ws:'Client work',   branch:'feat/pdf-export', dirty:false},
+  {id:'ml-pipeline', ws:'Side projects', branch:'main',           dirty:false},
+  {id:'dotfiles',    ws:'Side projects', branch:'main',           dirty:false}
+];
+const ORCH_OF = {'api-gateway':'orch-api', 'billing-ui':'orch-billing'};
+const POOL = {
+  claude:['Reading src/…','Editing file · 2 hunks','Running tests … 14 passed','Checking edge cases for expired tokens'],
+  codex:['applying patch (3 files)','cargo test … ok','refactoring helper module']
+};
+const NODES = {local:{status:'online', since:0}, vps1:{status:'online', since:0}};
+
+/* ---------- state ---------- */
+const S = {
+  view:'inbox', params:{}, hist:[], cursor:0, railCursor:0, focus:'main',
+  mode:'NORMAL', prefix:false, input:'', target:null,
+  palette:false, palQuery:'', palCursor:0,
+  peek:false, peekId:'claude-2', ctx:'api-gateway',
+  t:0, toast:'', toastUntil:0, snoozed:{}, counter:10,
+  sort:0, showAll:false, split:false, splitId:null, trace:false
+};
+let agents, missions, proposals, stale, l3;
+
+function mkAgent(o){
+  return Object.assign({role:'coder', runtime:'claude', node:'local', project:'api-gateway', state:'idle',
+    task:null, since:0, log:[], pending:null, standalone:false, left:0}, o);
+}
+
+function init(){
+  Object.assign(S, {view:'inbox', params:{}, hist:[], cursor:0, railCursor:0, focus:'main', mode:'NORMAL',
+    prefix:false, input:'', target:null, palette:false, peek:false, t:0, toast:'', toastUntil:0, snoozed:{}, counter:10, ctx:'api-gateway'});
+  NODES.local.status = 'online'; NODES.vps1.status = 'online'; NODES.vps1.since = 0;
+
+  agents = {
+    'claude-1': mkAgent({id:'claude-1', project:'api-gateway', state:'working', task:'schema migration', since:720,
+      log:['Reading db/migrations/…','Writing 0007_users_password.sql','Running migration on test db ✓']}),
+    'claude-2': mkAgent({id:'claude-2', project:'api-gateway', state:'blocked', task:'handler + validation', since:240,
+      pending:{cmd:'rm -rf dist/', path:'.worktrees/claude-2/dist', risk:'destructive',
+        reason:'clear previous build output before running the test build', blast:'214 files, 18 MB'},
+      log:['Writing src/routes/login.ts','Running npm run build','Build wants to clear dist/ — requesting approval']}),
+    'a3': mkAgent({id:'a3', runtime:'codex', node:'vps1', project:'ml-pipeline', state:'failed', task:'training tests',
+      since:60, standalone:true, log:['pytest -q','FAILED tests/test_loader.py::test_shapes','FAILED tests/test_loader.py::test_cache','exit 1']}),
+    'orch-api': mkAgent({id:'orch-api', role:'orchestrator', project:'api-gateway', state:'working', task:'supervising add-login', since:900,
+      log:['Monitoring claude-1 (done) and claude-2 (blocked)','Plan: schema → handler → tests. Waiting on approval for build clean.',
+        'decision › Keep claude-2 on the handler; ask you before any destructive build cleanup (policy rule).',
+        'decision › Run tests after the handler, not in parallel: both touch src/routes.',
+        'trace › read policy.yaml → destructive rule for dist/ found',
+        'trace › facts used: ADR-004, convention C-12, L2 test history (3 runs, 1 flaky)']}),
+    'orch-billing': mkAgent({id:'orch-billing', role:'orchestrator', project:'billing-ui', state:'idle', task:'plan: PDF export', since:900,
+      log:['Plan ready for PDF export: 4 tasks, est $1.80. Waiting for your review.']}),
+    'orch-top': mkAgent({id:'orch-top', role:'orchestrator', project:null, state:'idle', task:'watching 4 projects', since:1500,
+      log:['Digest: 1 mission running, 1 plan waiting, 1 proposal pending.']})
+  };
+
+  missions = [
+    {id:'m-login', title:'Add login endpoint with tests', project:'api-gateway', status:'running', cap:4, spent:1.10, est:2.40,
+      autonomy:2, reviewed:false, age:0, planTicks:0, note:'', acceptance:['login returns 200 with a session token','invalid input is rejected with 422','tests green'],
+      tasks:[
+        {id:'t1', title:'schema migration', runtime:'claude', agent:'claude-1', state:'done', progress:100, deps:[], predicts:'db/migrations/*'},
+        {id:'t2', title:'handler + validation', runtime:'claude', agent:'claude-2', state:'blocked', progress:40, deps:['t1'], predicts:'src/routes/login.ts'},
+        {id:'t3', title:'tests', runtime:'claude', agent:null, state:'waiting', progress:0, deps:['t2'], predicts:'tests/login.*'}
+      ]},
+    {id:'m-pdf', title:'Add invoice PDF export', project:'billing-ui', status:'plan-ready', cap:5, spent:0, est:1.80,
+      autonomy:2, reviewed:false, age:0, planTicks:0, note:'', acceptance:['export returns a valid PDF','existing tests green','no new dependencies'],
+      tasks:[
+        {id:'p1', title:'model + PDF renderer', runtime:'claude', agent:null, state:'planned', progress:0, deps:[], predicts:'src/invoice/*.ts'},
+        {id:'p2', title:'API endpoint', runtime:'codex', agent:null, state:'planned', progress:0, deps:['p1'], predicts:'src/api/*.ts'},
+        {id:'p3', title:'UI button + download', runtime:'claude', agent:null, state:'planned', progress:0, deps:['p2'], predicts:'src/ui/*.tsx'},
+        {id:'p4', title:'tests', runtime:'codex', agent:null, state:'planned', progress:0, deps:['p1','p2'], predicts:'tests/invoice/*'}
+      ]}
+  ];
+
+  proposals = [{id:'pr1', project:'api-gateway', status:'pending', text:'API errors use RFC 7807 problem+json',
+    evidence:'review in add-login ×2 · billing-ui plan review ×1'}];
+  stale = [{id:'f1', status:'stale', text:'ADR-004 refers to src/auth/session.ts (changed 1d ago)'}];
+  l3 = 3;
+  render();
+}
+
+/* ---------- derived data ---------- */
+function displayState(a){
+  return (a.node === 'vps1' && NODES.vps1.status === 'offline') ? 'stale' : a.state;
+}
+function setState(a, s){ if(a.state !== s){ a.state = s; a.since = 0; } }
+
+function items(){
+  const out = [];
+  Object.values(agents).forEach(a => {
+    if(a.pending) out.push({k:'approval', sev:3, ref:a.id, project:a.project, age:a.since, key:'approval:'+a.id});
+    else if(a.state === 'failed') out.push({k:'failed', sev:3, ref:a.id, project:a.project, age:a.since, key:'failed:'+a.id});
+  });
+  missions.forEach(m => {
+    if(m.status === 'plan-ready') out.push({k:'plan', sev:2, ref:m.id, project:m.project, age:m.age, key:'plan:'+m.id});
+    if(m.status === 'done' && !m.reviewed) out.push({k:'done', sev:2, ref:m.id, project:m.project, age:m.age, key:'done:'+m.id});
+  });
+  proposals.filter(p => p.status === 'pending').forEach(p =>
+    out.push({k:'proposal', sev:1, ref:p.id, project:p.project, age:3600, key:'proposal:'+p.id}));
+  if(NODES.vps1.status === 'offline')
+    out.push({k:'node', sev:2, ref:'vps1', project:null, age:NODES.vps1.since, key:'node:vps1'});
+  return sortItems(out.filter(i => !(S.snoozed[i.key] > S.t)));
+}
+
+const SORTS = ['severity', 'project', 'newest first', 'oldest first'];
+function sortItems(list){
+  const arr = [...list];
+  switch(S.sort){
+    case 0: return arr.sort((a,b) => (b.sev - a.sev) || (b.age - a.age));
+    case 1: return arr.sort((a,b) => String(a.project || '~').localeCompare(String(b.project || '~')) || (b.sev - a.sev));
+    case 2: return arr.sort((a,b) => a.age - b.age);
+    default: return arr.sort((a,b) => b.age - a.age);
+  }
+}
+function visibleItems(){ const all = items(); return S.showAll ? all : all.slice(0, 7); }
+
+function digest(){
+  const running = missions.filter(m => m.status === 'running').length;
+  const working = Object.values(agents).filter(a => a.state === 'working').length;
+  const pend = proposals.filter(p => p.status === 'pending').length;
+  return `while you were away: ${running} mission${running===1?'':'s'} running · ${working} agents working · ${pend} proposal${pend===1?'':'s'} pending`;
+}
+
+function railItems(){ return [{type:'orch'}, ...PROJECTS.map(p => ({type:'project', id:p.id}))]; }
+
+function pickables(){
+  switch(S.view){
+    case 'inbox': return visibleItems();
+    case 'project': {
+      const pid = S.params.id;
+      return [
+        ...missions.filter(m => m.project === pid).map(m => ({type:'mission', id:m.id})),
+        ...Object.values(agents).filter(a => a.project === pid && a.role === 'coder').map(a => ({type:'agent', id:a.id}))
+      ];
+    }
+    case 'model': return [
+        ...proposals.filter(p => p.status === 'pending').map(p => ({type:'proposal', id:p.id})),
+        ...stale.filter(s => s.status === 'stale').map(s => ({type:'stale', id:s.id}))
+      ];
+    case 'mission': {
+      const m = missions.find(x => x.id === S.params.id);
+      return m ? m.tasks.map(t => ({type:'task', id:t.id})) : [];
+    }
+    default: return [];
+  }
+}
+
+function currentItem(){
+  const list = items();
+  if(S.view === 'inbox') return visibleItems()[S.cursor] || null;
+  if(S.view === 'mission') return list.find(i => i.ref === S.params.id && (i.k === 'plan' || i.k === 'done')) || null;
+  if(S.view === 'agent') return list.find(i => i.ref === S.params.id && (i.k === 'approval' || i.k === 'failed')) || null;
+  if(S.view === 'model') return list.filter(i => i.k === 'proposal')[S.cursor] || null;
+  return null;
+}
+
+function orchId(scope){ return (scope && ORCH_OF[scope]) ? ORCH_OF[scope] : 'orch-top'; }
+
+/* ---------- navigation ---------- */
+function setCtxFor(view, params){
+  if(params.id){
+    if(view === 'project') S.ctx = params.id;
+    if(view === 'mission'){ const m = missions.find(x => x.id === params.id); if(m) S.ctx = m.project; }
+    if(view === 'agent'){ const a = agents[params.id]; if(a && a.project) S.ctx = a.project; }
+  }
+  if(view === 'orch' && params.scope) S.ctx = params.scope;
+}
+function navigate(view, params = {}){
+  S.hist.push({view:S.view, params:S.params, cursor:S.cursor});
+  S.view = view; S.params = params; S.cursor = 0; S.focus = 'main';
+  setCtxFor(view, params);
+}
+function jump(view, params = {}){
+  S.hist = []; S.view = view; S.params = params; S.cursor = 0; S.focus = 'main';
+  setCtxFor(view, params);
+}
+function back(){
+  const prev = S.hist.pop();
+  if(prev){ S.view = prev.view; S.params = prev.params; S.cursor = prev.cursor || 0; }
+  else { S.view = 'inbox'; S.params = {}; S.cursor = 0; }
+}
+function openProject(id){ navigate('project', {id}); }
+function newMission(){
+  navigate('newmission', {});
+  S.mode = 'INSERT'; S.target = {type:'goal'}; S.input = '';
+}
+function typeInto(){
+  if(S.split && S.focus === 'split'){ S.mode='INSERT'; S.target={type:'agent', id:S.splitId}; S.input=''; return; }
+  if(S.view === 'agent'){ S.mode='INSERT'; S.target={type:'agent', id:S.params.id}; S.input=''; }
+  else if(S.view === 'orch'){ S.mode='INSERT'; S.target={type:'orch', id:orchId(S.params.scope)}; S.input=''; }
+  else if(S.view === 'newmission'){ S.mode='INSERT'; S.target={type:'goal'}; S.input=''; }
+  else toast('nothing to type into here · open an agent (Enter) or the orchestrator (o)');
+}
+function enter(){
+  if(S.focus === 'rail'){
+    const r = railItems()[S.railCursor];
+    if(r.type === 'orch') navigate('orch', {scope:null});
+    else openProject(r.id);
+    return;
+  }
+  const pk = pickables()[S.cursor];
+  if(!pk) return;
+  switch(S.view){
+    case 'inbox':
+      if(pk.k === 'approval' || pk.k === 'failed') navigate('agent', {id:pk.ref});
+      else if(pk.k === 'plan' || pk.k === 'done') navigate('mission', {id:pk.ref});
+      else if(pk.k === 'proposal') navigate('model');
+      else toast('reconnect vps1 with Ctrl+K → "Reconnect vps1"');
+      break;
+    case 'project': navigate(pk.type === 'mission' ? 'mission' : 'agent', {id:pk.id}); break;
+    case 'model': {
+      const p = proposals.find(x => x.id === pk.id);
+      toast(p ? 'evidence: ' + p.evidence : 'stale fact · v to re-verify');
+      break;
+    }
+    case 'mission': {
+      const m = missions.find(x => x.id === S.params.id);
+      if(m && m.status === 'plan-ready'){
+        const t = m.tasks[S.cursor]; const order = ['claude', 'codex', 'openrouter'];
+        t.runtime = order[(order.indexOf(t.runtime) + 1) % order.length];
+        m.rev = (m.rev || 1) + 1;
+        toast(`[${S.cursor + 1}] runtime → ${t.runtime} · plan rev ${m.rev}`);
+      } else toast('running tasks: change them through the orchestrator (o)');
+      break;
+    }
+  }
+}
+function move(d){
+  if(S.focus === 'rail'){ S.railCursor = clamp(S.railCursor + d, 0, railItems().length - 1); }
+  else { const n = pickables().length; S.cursor = clamp(S.cursor + d, 0, Math.max(0, n - 1)); }
+}
+function togglePeek(){
+  S.peek = !S.peek;
+  if(S.peek){
+    const it = currentItem();
+    S.peekId = (it && agents[it.ref]) ? it.ref : (S.params.id && agents[S.params.id]) ? S.params.id : 'claude-2';
+  }
+}
+
+function toggleSplit(){
+  S.split = !S.split;
+  if(S.split){
+    const it = currentItem();
+    const viewed = S.view === 'agent' ? agents[S.params.id] : null;
+    // when the main view already shows an agent, the split shows its project orchestrator instead
+    if(viewed) S.splitId = orchId(viewed.project);
+    else S.splitId = (it && agents[it.ref]) ? it.ref : S.peekId;
+    toast('split open · ' + S.splitId + ' · Tab moves focus');
+  } else {
+    if(S.focus === 'split') S.focus = 'main';
+    toast('split closed');
+  }
+}
+
+/* ---------- actions ---------- */
+function toast(msg){ S.toast = msg; S.toastUntil = S.t + 4; }
+
+function approveAgent(id){
+  const a = agents[id]; const cmd = a.pending.cmd; a.pending = null;
+  setState(a, 'working');
+  a.log.push('✓ approval granted (once): ' + cmd);
+  missions.forEach(m => m.tasks.forEach(t => { if(t.agent === id && t.state === 'blocked') t.state = 'running'; }));
+  toast(id + ' resumed');
+}
+function denyAgent(id, note){
+  const a = agents[id]; const cmd = a.pending.cmd; a.pending = null;
+  setState(a, 'working');
+  a.log.push(`✗ denied: ${cmd} · note: "${note}"`);
+  a.log.push('agent: choosing a different approach');
+  missions.forEach(m => m.tasks.forEach(t => { if(t.agent === id && t.state === 'blocked') t.state = 'running'; }));
+  toast(id + ' denied · note sent');
+}
+function retryAgent(id){
+  const a = agents[id]; a.left = 8; a.task = 'training tests (retry)';
+  setState(a, 'working'); a.log.push('retrying: pytest -q'); toast(id + ' retrying');
+}
+function approvePlan(m){
+  m.status = 'running';
+  m.tasks.forEach(t => { if(t.state === 'planned') t.state = 'waiting'; });
+  startReady(m);
+  toast('plan approved · tasks starting in dependency order');
+}
+function rejectPlan(m, note){
+  m.status = 'planning'; m.planTicks = 3; m.note = note;
+  toast('plan rejected · orchestrator replanning');
+}
+function acceptProposal(p){ p.status = 'accepted'; l3++; toast('accepted · written to .corvx/conventions.md (human-verified)'); }
+function rejectProposal(p, note){ p.status = 'rejected'; p.note = note; toast('rejected · will not be re-proposed'); }
+function verifyStale(){
+  if(S.view !== 'model') return;
+  const pend = proposals.filter(p => p.status === 'pending').length;
+  const st = stale.filter(s => s.status === 'stale');
+  const idx = S.cursor - pend;
+  if(idx >= 0 && st[idx]){ st[idx].status = 'current'; toast('re-verified · fact is current'); }
+  else toast('select a stale fact (j/k) to re-verify');
+}
+function setNode(online){
+  NODES.vps1.status = online ? 'online' : 'offline'; NODES.vps1.since = 0;
+  toast(online ? 'vps1 reconnected · state resynced from event log' : 'vps1 unreachable · agents there keep running');
+}
+function actOn(it, key){
+  if(!it){ toast(`'${key}' has nothing to act on here`); return; }
+  if(key === 's'){ S.snoozed[it.key] = S.t + 60; toast('snoozed for 60s'); return; }
+  switch(it.k){
+    case 'approval':
+      if(key === 'a'){ approveAgent(it.ref); return; }
+      if(key === 'd'){ prompt('deny reason', n => denyAgent(it.ref, n)); return; }
+      break;
+    case 'failed':
+      if(key === 'r'){ retryAgent(it.ref); return; }
+      break;
+    case 'plan': {
+      const m = missions.find(x => x.id === it.ref);
+      if(key === 'a'){ approvePlan(m); return; }
+      if(key === 'r'){ prompt('reject reason', n => rejectPlan(m, n)); return; }
+      break;
+    }
+    case 'done':
+      if(key === 'a'){ missions.find(x => x.id === it.ref).reviewed = true; toast('marked reviewed'); return; }
+      break;
+    case 'proposal': {
+      const p = proposals.find(x => x.id === it.ref);
+      if(key === 'a'){ acceptProposal(p); return; }
+      if(key === 'd'){ prompt('reject note (kept so it is not re-proposed)', n => rejectProposal(p, n)); return; }
+      break;
+    }
+  }
+  toast(`'${key}' is not available for this item`);
+}
+function prompt(label, fn){
+  S.mode = 'INSERT'; S.target = {type:'note', label, fn}; S.input = '';
+}
+function createMission(text){
+  const id = 'm-' + (++S.counter);
+  missions.push({id, title:text, project:S.ctx, status:'planning', cap:5, spent:0, est:1.80, autonomy:2,
+    reviewed:false, age:0, planTicks:3, note:'', acceptance:['criteria drafted by the orchestrator (review in plan)'],
+    tasks:[
+      {id:'x1', title:'design & data model', runtime:'claude', agent:null, state:'planned', progress:0, deps:[], predicts:'src/…'},
+      {id:'x2', title:'implementation', runtime:'codex', agent:null, state:'planned', progress:0, deps:['x1'], predicts:'src/…'},
+      {id:'x3', title:'tests', runtime:'claude', agent:null, state:'planned', progress:0, deps:['x2'], predicts:'tests/…'}
+    ]});
+  navigate('mission', {id});
+  toast('orchestrator is planning…');
+}
+function startTask(m, t){
+  if(!t.agent){
+    const id = `${t.runtime}-${++S.counter}`;
+    agents[id] = mkAgent({id, runtime:t.runtime, project:m.project, role:'coder'});
+    t.agent = id;
+  }
+  const a = agents[t.agent];
+  t.state = 'running'; setState(a, 'working'); a.task = t.title; a.log.push('started: ' + t.title);
+}
+function startReady(m){
+  m.tasks.forEach(t => {
+    if(t.state === 'waiting' && t.deps.every(d => m.tasks.find(x => x.id === d).state === 'done')) startTask(m, t);
+  });
+}
+function advance(m){
+  m.tasks.forEach(t => {
+    if(t.state !== 'running') return;
+    const a = agents[t.agent];
+    if(a && a.state === 'working'){
+      t.progress = Math.min(100, t.progress + 6);
+      if(t.progress >= 100){ t.state = 'done'; setState(a, 'idle'); a.task = null; a.log.push('✓ done: ' + t.title); }
+    }
+  });
+  startReady(m);
+  if(m.tasks.every(t => t.state === 'done')){
+    m.status = 'done'; m.age = 0; toast('✓ mission complete: ' + m.title);
+  }
+}
+
+/* ---------- submit / cancel in INSERT ---------- */
+function submit(){
+  const text = S.input.trim(); const tg = S.target;
+  if(!tg){ S.mode = 'NORMAL'; return; }
+  if(tg.type === 'note' && !text){ toast('a note is required · Esc to cancel'); return; }
+  if(tg.type === 'goal' && !text){ toast('describe the outcome first'); return; }
+  S.mode = 'NORMAL'; S.input = ''; S.target = null;
+  switch(tg.type){
+    case 'note': tg.fn(text); break;
+    case 'goal': createMission(text); break;
+    case 'agent': agents[tg.id].log.push('you › ' + text); toast('sent to ' + tg.id); break;
+    case 'orch': {
+      const a = agents[tg.id]; a.log.push('you › ' + text);
+      setTimeout(() => {
+        a.log.push(`orch › Noted: "${text}". A real orchestrator answers here and shows any action it takes as a card.`);
+        render();
+      }, 1400);
+      toast('message sent to ' + tg.id);
+      break;
+    }
+  }
+}
+function cancelInsert(){
+  const tg = S.target;
+  S.mode = 'NORMAL'; S.input = ''; S.target = null;
+  if(tg && tg.type === 'goal') back();
+}
+
+/* ---------- commands for palette ---------- */
+function commands(){
+  const c = [
+    {label:()=>'Go to Inbox', run:()=>jump('inbox')},
+    {label:()=>'New mission', run:()=>newMission()},
+    {label:()=>'Open orchestrator (top-level)', run:()=>navigate('orch', {scope:null})},
+    {label:()=>'Open project model (api-gateway)', run:()=>navigate('model')},
+    {label:()=>NODES.vps1.status === 'online' ? 'Simulate: vps1 goes offline' : 'Reconnect vps1', run:()=>setNode(NODES.vps1.status !== 'online')},
+    {label:()=>'Help', run:()=>navigate('help')},
+    {label:()=>'Reset prototype', run:()=>init()}
+  ];
+  PROJECTS.forEach(p => c.push({label:()=>'Open project: ' + p.id, run:()=>openProject(p.id)}));
+  return c;
+}
+
+/* ---------- timer: the world moves ---------- */
+function tick(){
+  S.t++;
+  Object.values(agents).forEach(a => {
+    a.since++;
+    if(a.state === 'working' && S.t % 4 === 0){
+      const p = POOL[a.runtime] || POOL.claude;
+      a.log.push(p[(S.t + a.since) % p.length]);
+    }
+    if(a.standalone && a.state === 'working' && a.left > 0){
+      a.left--;
+      if(a.left === 0){ setState(a, 'idle'); a.task = null; a.log.push('✓ tests pass after retry'); }
+    }
+  });
+  missions.forEach(m => {
+    if(m.status === 'planning'){
+      m.planTicks--;
+      if(m.planTicks <= 0){ m.status = 'plan-ready'; m.age = 0; toast('plan ready for ' + m.project); }
+    } else if(m.status === 'running'){
+      advance(m); m.age++;
+    } else { m.age++; }
+  });
+  if(NODES.vps1.status === 'offline') NODES.vps1.since++;
+  if(S.toast && S.t >= S.toastUntil) S.toast = '';
+  render();
+}
+
+/* ---------- keyboard ---------- */
+document.addEventListener('keydown', e => {
+  const k = e.key;
+  if(e.ctrlKey && (k === 'k' || k === 'K')){
+    e.preventDefault();
+    S.palette = !S.palette; S.palQuery = ''; S.palCursor = 0; S.prefix = false;
+    S.mode = S.palette ? 'PALETTE' : 'NORMAL';
+    return render();
+  }
+  if(e.ctrlKey && (k === 'b' || k === 'B')){
+    e.preventDefault();
+    if(S.mode === 'NORMAL'){ S.prefix = true; S.mode = 'PREFIX'; }
+    return render();
+  }
+  if(S.mode === 'PALETTE') return handlePalette(e);
+  if(S.mode === 'INSERT') return handleInsert(e);
+  if(S.mode === 'PREFIX'){
+    e.preventDefault(); S.prefix = false; S.mode = 'NORMAL';
+    const map = {
+      i: () => jump('inbox'),
+      p: () => jump('project', {id:S.ctx}),
+      o: () => jump('orch', {scope:S.ctx}),
+      d: () => jump('model'),
+      a: () => { const it = currentItem(); const id = (it && agents[it.ref]) ? it.ref : S.peekId; jump('agent', {id}); },
+      m: () => { jump('inbox'); toast('open a mission from the inbox or a project'); },
+      '"': () => toggleSplit(),
+      '%': () => toggleSplit()
+    };
+    if(map[k]) map[k](); else toast('prefix: unknown key');
+    return render();
+  }
+  handleNormal(e);
+});
+
+function handlePalette(e){
+  const q = S.palQuery.toLowerCase();
+  const cmds = commands().filter(c => c.label().toLowerCase().includes(q));
+  if(e.key === 'Escape'){ S.palette = false; S.mode = 'NORMAL'; }
+  else if(e.key === 'ArrowDown'){ S.palCursor = clamp(S.palCursor + 1, 0, cmds.length - 1); }
+  else if(e.key === 'ArrowUp'){ S.palCursor = clamp(S.palCursor - 1, 0, cmds.length - 1); }
+  else if(e.key === 'Enter'){
+    const c = cmds[S.palCursor]; S.palette = false; S.mode = 'NORMAL';
+    if(c) c.run();
+  }
+  else if(e.key === 'Backspace'){ S.palQuery = S.palQuery.slice(0, -1); S.palCursor = 0; }
+  else if(e.key.length === 1 && !e.ctrlKey && !e.metaKey){ S.palQuery += e.key; S.palCursor = 0; }
+  else return;
+  e.preventDefault(); render();
+}
+
+function handleInsert(e){
+  if(e.key === 'Escape'){ e.preventDefault(); cancelInsert(); return render(); }
+  if(e.key === 'Enter'){ e.preventDefault(); submit(); return render(); }
+  if(e.key === 'Backspace'){ e.preventDefault(); S.input = S.input.slice(0, -1); return render(); }
+  if(e.key.length === 1 && !e.ctrlKey && !e.metaKey){ e.preventDefault(); S.input += e.key; return render(); }
+}
+
+function handleNormal(e){
+  if(e.ctrlKey || e.metaKey) return;
+  const k = e.key; let handled = true;
+  switch(k){
+    case 'j': case 'ArrowDown': move(1); break;
+    case 'k': case 'ArrowUp': move(-1); break;
+    case 'Enter': enter(); break;
+    case 'Escape': if(S.focus !== 'main') S.focus = 'main'; else back(); break;
+    case 'Tab': {
+      const zones = S.split ? ['rail', 'main', 'split'] : ['rail', 'main'];
+      S.focus = zones[(zones.indexOf(S.focus) + 1) % zones.length];
+      break;
+    }
+    case 'S': if(S.view === 'inbox'){ S.sort = (S.sort + 1) % SORTS.length; S.cursor = 0; toast('sorted by ' + SORTS[S.sort]); } break;
+    case 'A': if(S.view === 'inbox'){ S.showAll = !S.showAll; toast(S.showAll ? 'showing all items' : 'showing top 7'); } break;
+    case 'T': if(S.view === 'orch'){ S.trace = !S.trace; toast('reasoning trace ' + (S.trace ? 'shown' : 'hidden')); } break;
+    case 'a': case 'd': case 'r': case 's': actOn(currentItem(), k); break;
+    case 'v': verifyStale(); break;
+    case 'i': typeInto(); break;
+    case 'm': newMission(); break;
+    case 'o': {
+      const it = S.view === 'inbox' ? currentItem() : null;
+      const scope = it && it.project ? it.project : S.ctx;
+      navigate('orch', {scope});
+      if(it) toast('handed to orchestrator: ' + it.key);
+      break;
+    }
+    case 'p': togglePeek(); break;
+    case '?': navigate('help'); break;
+    default: handled = false;
+  }
+  if(handled) e.preventDefault();
+  render();
+}
+
+/* ---------- rendering ---------- */
+function itemRow(i, sel){
+  const a = agents[i.ref]; const m = missions.find(x => x.id === i.ref);
+  let g, l, c, ctxT, det;
+  switch(i.k){
+    case 'approval': g='!'; l='BLOCKED'; c='blk'; ctxT=`${a.id} / ${a.project}`; det=`approval: ${a.pending.cmd}`; break;
+    case 'failed': g='✗'; l='FAILED'; c='fail'; ctxT=`${a.id}@${a.node} / ${a.project}`; det=`${a.task} · exit 1`; break;
+    case 'plan': g='◆'; l='PLAN'; c='plan'; ctxT=`${m.project} / ${m.title}`; det=`plan ready · ${m.tasks.length} tasks · est $${m.est.toFixed(2)}`; break;
+    case 'done': g='✓'; l='DONE'; c='done'; ctxT=`${m.project} / ${m.title}`; det='mission complete · review'; break;
+    case 'proposal': { const p = proposals.find(x => x.id === i.ref); g='◆'; l='PROPOSAL'; c='plan'; ctxT=p.project; det=p.text; break; }
+    case 'node': g='◌'; l='NODE'; c='stale'; ctxT='vps1'; det='unreachable · agents there keep running'; break;
+  }
+  return row(sel, `<span class="lab ${c}">${g} ${l}</span><span class="ctx">${esc(ctxT)}</span><span class="det">${esc(det)}</span><span class="age">${fmt(i.age)}</span>`);
+}
+
+function vInbox(){
+  const all = items(); const vis = visibleItems();
+  let h = `<h2>Inbox · ${all.length} need${all.length===1?'s':''} you</h2>
+    <div class="dim">sorted by ${SORTS[S.sort]} · S change sort</div>`;
+  if(!all.length) return h + `<div class="dim" style="margin-top:12px">Nothing needs you right now.</div><div class="dim">${esc(digest())}</div>`;
+  h += `<div class="colhead"><span class="lab">state</span><span class="ctx">context</span><span class="det">detail</span><span class="age">age</span></div>`;
+  vis.forEach((i, idx) => h += itemRow(i, idx === S.cursor));
+  const more = all.length - vis.length;
+  if(more > 0) h += `<div class="hint">+${more} more · A show all</div>`;
+  else if(S.showAll && all.length > 7) h += `<div class="hint">showing all · A show top 7</div>`;
+  return h + hintLine('Enter open · a approve · d deny · r retry · s snooze · o orchestrator · m new mission');
+}
+
+function vProject(pid){
+  const p = PROJECTS.find(x => x.id === pid); if(!p) return 'Unknown project';
+  const ms = missions.filter(m => m.project === pid);
+  const as = Object.values(agents).filter(a => a.project === pid && a.role === 'coder');
+  const orch = agents[orchId(pid)];
+  const stc = stale.filter(s => s.status === 'stale').length;
+  let h = `<h2>Project · ${esc(pid)}</h2>
+    <div class="dim">${esc(p.branch)}${p.dirty ? ' · ✎ dirty' : ''} · ${esc(p.ws)} · orchestrator ${esc(orch.id)} ${badge(displayState(orch))}</div>`;
+  h += `<h2>Missions</h2>`;
+  if(!ms.length) h += `<div class="dim">No missions yet · press m to start one</div>`;
+  ms.forEach((m, i) => {
+    const dn = m.tasks.filter(t => t.state === 'done').length;
+    h += row(i === S.cursor, `<span class="ctx">${badge(m.status)} ${esc(m.title)}</span><span class="lab dim">${dn}/${m.tasks.length} tasks</span>`);
+  });
+  h += `<h2>Agents</h2>`;
+  if(!as.length) h += `<div class="dim">No agents in this project</div>`;
+  as.forEach((a, j) => {
+    h += row(ms.length + j === S.cursor, `<span class="ctx">${badge(displayState(a))} ${esc(a.id)}</span><span class="det">${esc(a.task || '—')}</span><span class="age">${fmt(a.since)}</span>`);
+  });
+  h += `<h2>Project Model</h2>
+    <div class="kv">L1 structure    42 facts · fresh</div>
+    <div class="kv">L2 state        118 facts · fresh · last commit 3m ago</div>
+    <div class="kv">L3 knowledge    ${l3} ADR + conventions · ${stc} stale ⚠</div>
+    <div class="kv">L4 experience   9 missions · 27 outcomes</div>`;
+  return h + hintLine('j/k select · Enter open · m new mission · o orchestrator · Esc back');
+}
+
+function vMission(id){
+  const m = missions.find(x => x.id === id); if(!m) return 'Mission not found';
+  let h = `<h2>${esc(m.title)}</h2>
+    <div class="dim">${esc(m.project)} · ${badge(m.status)} · autonomy level ${m.autonomy} · budget $${m.spent.toFixed(2)} / $${m.cap.toFixed(2)}</div>`;
+  if(m.status === 'planning'){
+    return h + `<div class="card plan">◆ orchestrator is planning · ready in ~${m.planTicks}s${m.note ? `<br><span class="dim">replanning with your note: ${esc(m.note)}</span>` : ''}</div>` + hintLine('Esc back');
+  }
+  if(m.status === 'plan-ready'){
+    h += `<h2>Plan review</h2><div class="dim">plan rev ${m.rev || 1} · Enter on a task cycles its runtime (direct edit, recorded as a revision)</div>`;
+    m.tasks.forEach((t, i) => {
+      const deps = t.deps.length ? t.deps.map(d => '[' + (m.tasks.findIndex(x => x.id === d) + 1) + ']').join(' ') : '—';
+      h += row(i === S.cursor, `<span class="ttl">[${i+1}] ${esc(t.title)}</span><span class="lab">${esc(t.runtime)}</span><span class="det dim">deps ${deps} · predicts ${esc(t.predicts)}</span>`);
+    });
+    h += `<h2>Acceptance</h2>` + m.acceptance.map(a => `<div>• ${esc(a)}</div>`).join('');
+    h += `<div class="card">est $${m.est.toFixed(2)} · cap $${m.cap.toFixed(2)}${m.note ? `<br><span class="dim">your note: ${esc(m.note)}</span>` : ''}</div>`;
+    return h + hintLine('a approve plan · r reject (note) · j/k select · Enter change runtime · o ask orchestrator · Esc back');
+  }
+  h += `<h2>Tasks</h2>`;
+  m.tasks.forEach((t, i) => {
+    const a = t.agent ? agents[t.agent] : null;
+    const who = a ? a.id : 'queued';
+    const note = t.state === 'blocked' ? ' <span class="dim">← approval needed (inbox)</span>' : '';
+    h += row(i === S.cursor, `<span class="ttl">${badge(t.state)} ${esc(t.title)}</span><span class="lab">${esc(who)}</span><span class="det">${bar(t.progress)} ${t.progress}%${note}</span>`);
+  });
+  h += `<h2>Acceptance</h2>` + m.acceptance.map(a => `<div>• ${esc(a)}</div>`).join('');
+  if(m.status === 'done') h += `<div class="card done">✓ all tasks done · press a to mark reviewed</div>`;
+  return h + hintLine(m.status === 'done' ? 'a mark reviewed · Esc back' : 'j/k select · Enter open · Esc back');
+}
+
+function logLine(l){
+  const cls = l.startsWith('you ›') ? 'you' : l.startsWith('orch ›') ? 'orchl'
+    : l.startsWith('trace ›') ? 'trace' : l.startsWith('decision ›') ? 'decision' : '';
+  return `<div class="${cls}">${esc(l)}</div>`;
+}
+
+function vAgent(id){
+  const a = agents[id]; if(!a) return 'No such agent';
+  const ds = displayState(a);
+  const offline = a.node === 'vps1' && NODES.vps1.status === 'offline';
+  let h = `<h2>${esc(a.id)} · ${esc(a.runtime)} · ${esc(a.node)} · ${esc(a.project || '—')}</h2>
+    <div>${badge(ds)} ${a.task ? '· ' + esc(a.task) : ''} · ${fmt(a.since)} in state
+    ${offline ? `<span class="stale"> · last seen ${fmt(NODES.vps1.since)} ago, state may be out of date</span>` : ''}</div>`;
+  if(a.pending){
+    h += `<div class="card blkcard"><b class="blk">APPROVAL</b> · risk: ${esc(a.pending.risk)}<br>
+      Command: <b>${esc(a.pending.cmd)}</b><br>Path: ${esc(a.pending.path)}<br>
+      Reason: "${esc(a.pending.reason)}"<br>Blast radius: ${esc(a.pending.blast)}</div>`;
+  }
+  h += `<h2>Output</h2><div class="log">${a.log.slice(-18).map(logLine).join('')}</div>`;
+  return h + hintLine(a.pending ? 'a approve once · d deny (note) · i type to agent · p peek · Esc back'
+                                : 'i type to agent · p peek · Esc back');
+}
+
+function vOrch(scope){
+  const a = agents[orchId(scope)];
+  const decisions = a.log.filter(l => l.startsWith('decision ›'));
+  const rest = a.log.filter(l => !l.startsWith('decision ›') && (S.trace || !l.startsWith('trace ›')));
+  let h = `<h2>Orchestrator · ${esc(scope || 'top-level')}</h2>
+    <div>${badge(displayState(a))} · ${esc(a.task)}</div>`;
+  if(decisions.length){
+    h += `<h2>Decisions</h2><div class="card plan">${decisions.slice(-3).map(d => `<div class="decision">${esc(d.replace('decision › ', '• '))}</div>`).join('')}</div>`;
+  }
+  h += `<h2>Activity</h2><div class="log">${rest.slice(-22).map(logLine).join('')}</div>`;
+  return h + hintLine(`i message the orchestrator · T reasoning trace ${S.trace ? 'on' : 'off'} · Esc back`);
+}
+
+function vModel(){
+  const pend = proposals.filter(p => p.status === 'pending');
+  const st = stale.filter(s => s.status === 'stale');
+  let h = `<h2>Project Model · api-gateway</h2>
+    <div class="kv">L1 structure    42 facts · fresh · re-scanned 2h ago</div>
+    <div class="kv">L2 state        118 facts · fresh · last commit 3m ago</div>
+    <div class="kv">L3 knowledge    ${l3} ADR + conventions · ${st.length} stale ⚠</div>
+    <div class="kv">L4 experience   9 missions · 27 outcomes</div>`;
+  h += `<h2>Proposals</h2>`;
+  if(!pend.length) h += `<div class="dim">No pending proposals.</div>`;
+  pend.forEach((p, i) => {
+    h += row(i === S.cursor, `<span class="lab plan">◆ PROPOSAL</span><span class="det">${esc(p.text)}<div class="ev">evidence: ${esc(p.evidence)}</div></span>`);
+  });
+  h += `<h2>Stale facts</h2>`;
+  if(!st.length) h += `<div class="dim">None.</div>`;
+  st.forEach((s, j) => {
+    h += row(pend.length + j === S.cursor, `<span class="lab stale">⚠ STALE</span><span class="det">${esc(s.text)}</span>`);
+  });
+  return h + hintLine('a accept · d reject (note) · v re-verify stale · Enter show evidence · Esc back');
+}
+
+function vNew(){
+  const typing = S.target && S.target.type === 'goal';
+  return `<h2>New mission · ${esc(S.ctx)}</h2>
+    <div class="card">
+      <div><span class="kv">Goal        </span>${esc(S.input)}${typing ? '<span class="caret"></span>' : ''}</div>
+      <div><span class="kv">Project     </span>${esc(S.ctx)} <span class="dim">(change from the rail)</span></div>
+      <div><span class="kv">Autonomy    </span>level 2 · execute with approval</div>
+      <div><span class="kv">Budget cap  </span>$5.00 (project policy default)</div>
+    </div>` + hintLine('type the outcome · Enter create · Esc cancel');
+}
+
+function vHelp(){
+  return `<h2>Keys</h2><table class="help">
+    <tr><td>NORMAL</td><td>j/k move · click select · Enter open · Esc back · Tab cycle focus (rail · main · split) · a approve/accept · d deny/reject (note) · r retry / reject plan · s snooze · v re-verify · i type · m new mission · o orchestrator · p peek · ? help</td></tr>
+    <tr><td>INBOX</td><td>S cycle sort (severity · project · newest · oldest) · A show all / top 7</td></tr>
+    <tr><td>PLAN</td><td>Enter on a task cycles its runtime (recorded as a plan revision)</td></tr>
+    <tr><td>ORCHESTRATOR</td><td>T show or hide the reasoning trace</td></tr>
+    <tr><td>INSERT</td><td>type · Enter submit · Esc cancel</td></tr>
+    <tr><td>PALETTE</td><td>Ctrl+K · type to filter · ↑ ↓ select · Enter run · Esc close</td></tr>
+    <tr><td>PREFIX</td><td>Ctrl+B then i inbox · p project · o orchestrator · a agent · d model · " or % split pane</td></tr>
+  </table>` + hintLine('Esc back');
+}
+
+function renderTop(){
+  const it = items(); const c = k => it.filter(i => i.k === k).length;
+  const crumb = {inbox:'Inbox', project:'Project · ' + S.params.id, mission:'Mission', agent:'Agent · ' + S.params.id,
+    orch:'Orchestrator', model:'Model · api-gateway', newmission:'New mission', help:'Help'}[S.view] || S.view;
+  $('#top').innerHTML = `<span class="brand">CORVX</span><span class="dim">${esc(crumb)}</span>
+    <span class="blk">! ${c('approval')} blocked</span><span class="fail">✗ ${c('failed')} failed</span>
+    <span class="done">✓ ${c('plan') + c('done')} to review</span><span class="plan">◆ ${c('proposal')} proposals</span>
+    <span class="right"><span class="${NODES.local.status === 'online' ? 'done' : 'stale'}">local ●</span>
+    <span class="${NODES.vps1.status === 'online' ? 'done' : 'stale'}">vps1 ${NODES.vps1.status === 'online' ? '●' : '◌ reconnecting ' + fmt(NODES.vps1.since)}</span></span>
+    <span class="toast">${esc(S.toast)}</span>`;
+}
+
+function renderRail(){
+  const it = items(); let h = '';
+  const rowR = (i, name, sub, count) => `<div class="rrow${S.focus === 'rail' && S.railCursor === i ? ' sel' : ''}${S.ctx === name && i > 0 ? ' cur' : ''}">
+    <span class="rname">${esc(name)}</span><span class="rsub">${esc(sub)}${count ? ` <span class="blk">${count}!</span>` : ''}</span></div>`;
+  h += `<div class="ws">Orchestration</div>`;
+  h += rowR(0, '◆ top-level', `${displayState(agents['orch-top'])}`, 0);
+  let idx = 1;
+  ['Client work', 'Side projects'].forEach(ws => {
+    h += `<div class="ws">${esc(ws)}</div>`;
+    PROJECTS.filter(p => p.ws === ws).forEach(p => {
+      const n = it.filter(i => i.project === p.id).length;
+      h += rowR(idx++, p.id, p.branch + (p.dirty ? ' ✎' : ''), n);
+    });
+  });
+  h += `<div class="ws">Nodes</div>
+    <div class="rrow"><span class="done">● local</span><span class="rsub">this machine</span></div>
+    <div class="rrow"><span class="${NODES.vps1.status === 'online' ? 'done' : 'stale'}">${NODES.vps1.status === 'online' ? '●' : '◌'} vps1</span><span class="rsub">${NODES.vps1.status === 'online' ? 'ssh · 42ms' : 'reconnecting'}</span></div>`;
+  $('#rail').innerHTML = h;
+  $('#rail').classList.toggle('focus', S.focus === 'rail');
+}
+
+function renderMain(){
+  const n = pickables().length; S.cursor = clamp(S.cursor, 0, Math.max(0, n - 1));
+  let h = '';
+  switch(S.view){
+    case 'inbox': h = vInbox(); break;
+    case 'project': h = vProject(S.params.id || S.ctx); break;
+    case 'mission': h = vMission(S.params.id); break;
+    case 'agent': h = vAgent(S.params.id); break;
+    case 'orch': h = vOrch(S.params.scope); break;
+    case 'model': h = vModel(); break;
+    case 'newmission': h = vNew(); break;
+    case 'help': h = vHelp(); break;
+  }
+  if(S.split){
+    const right = S.splitId && agents[S.splitId] ? vAgent(S.splitId) : 'no agent selected';
+    $('#main').innerHTML = `<div class="panes">
+      <div class="pane${S.focus === 'main' ? ' focus' : ''}">${h}</div>
+      <div class="pane${S.focus === 'split' ? ' focus' : ''}" data-zone="split">${right}</div></div>`;
+    $('#main').classList.remove('focus');
+  } else {
+    $('#main').innerHTML = h;
+    $('#main').classList.toggle('focus', S.focus === 'main');
+  }
+}
+
+/* rows get an index so mouse clicks can select them (click selects, Enter opens) */
+function tagRows(){
+  document.querySelectorAll('#main .row').forEach((el, i) => el.dataset.i = i);
+  document.querySelectorAll('#rail .rrow').forEach((el, i) => el.dataset.i = i);
+}
+
+function renderPeek(){
+  const el = $('#peek');
+  if(!S.peek){ el.style.display = 'none'; return; }
+  const a = agents[S.peekId]; el.style.display = 'block';
+  el.textContent = a ? `peek · ${a.id} (${displayState(a)})\n` + a.log.slice(-3).join('\n') : '';
+}
+
+function hints(){
+  if(S.mode === 'INSERT') return 'type · Enter submit · Esc cancel';
+  if(S.mode === 'PALETTE') return '↑ ↓ select · Enter run · Esc close';
+  if(S.mode === 'PREFIX') return 'i inbox · p project · o orchestrator · a agent · d model · Esc cancel';
+  const it = currentItem();
+  const acts = {
+    approval:[['a','approve'],['d','deny'],['s','snooze']], failed:[['r','retry'],['s','snooze']],
+    plan:[['a','approve plan'],['r','reject']], done:[['a','mark reviewed']],
+    proposal:[['a','accept'],['d','reject']]
+  };
+  const parts = it && acts[it.k] ? acts[it.k].map(x => x[0] + ' ' + x[1]) : [];
+  if(S.view === 'inbox') parts.push('S sort', 'A show all');
+  if(S.view === 'orch') parts.push('i message', 'T trace');
+  parts.push('Enter open', 'j/k move', 'Tab focus', '? help', 'Ctrl+K palette', 'Ctrl+B prefix');
+  return parts.join(' · ');
+}
+
+function renderStatus(){
+  $('#status').innerHTML = `<span class="mode m-${S.mode}">${S.mode}${S.prefix ? ' ^B' : ''}</span>
+    <span class="sep">│</span><span class="dim">${S.focus} · ${esc(S.view)}${S.split ? ' · split' : ''}</span>
+    <span class="sep">│</span><span class="hints">${esc(hints())}</span>`;
+}
+
+function renderInput(){
+  const el = $('#input');
+  if(S.mode === 'PALETTE'){ el.innerHTML = `<span class="dim">⌘ </span>${esc(S.palQuery)}<span class="caret"></span>`; return; }
+  if(S.mode !== 'INSERT'){ el.innerHTML = ''; return; }
+  const tg = S.target || {};
+  const label = tg.type === 'goal' ? 'goal ›' : tg.type === 'note' ? tg.label + ' ›'
+    : tg.type === 'agent' ? `to ${tg.id} ›` : tg.type === 'orch' ? `to ${tg.id} ›` : '›';
+  el.innerHTML = `<span class="plan">${esc(label)}</span> ${esc(S.input)}<span class="caret"></span>`;
+}
+
+function renderPal(){
+  const el = $('#pal');
+  if(!S.palette){ el.classList.remove('open'); return; }
+  const q = S.palQuery.toLowerCase();
+  const cmds = commands().filter(c => c.label().toLowerCase().includes(q));
+  S.palCursor = clamp(S.palCursor, 0, Math.max(0, cmds.length - 1));
+  el.innerHTML = cmds.map((c, i) => `<div class="pi${i === S.palCursor ? ' sel' : ''}">${esc(c.label())}</div>`).join('')
+    || '<div class="pi dim">no matching command</div>';
+  el.classList.add('open');
+}
+
+function render(){
+  renderTop(); renderRail(); renderMain(); tagRows(); renderPeek(); renderStatus(); renderInput(); renderPal();
+}
+
+/* ---------- mouse: click selects (never opens) ---------- */
+document.addEventListener('click', e => {
+  const sp = e.target.closest('[data-zone="split"]');
+  if(sp){ S.focus = 'split'; return render(); }
+  const rr = e.target.closest('#rail .rrow');
+  if(rr && rr.dataset.i !== undefined){
+    const i = +rr.dataset.i;
+    if(i < railItems().length){ S.focus = 'rail'; S.railCursor = i; render(); }
+    return;
+  }
+  const rw = e.target.closest('#main .row');
+  if(rw){ S.focus = 'main'; S.cursor = +rw.dataset.i; render(); }
+});
+
+/* ---------- deep links for review: #inbox  #mission/m-login  #agent/claude-2+split  #model+palette ---------- */
+function applyHash(){
+  const raw = decodeURIComponent(location.hash.replace(/^#\/?/, ''));
+  if(!raw) return;
+  const [base, ...flags] = raw.split('+');
+  const [view, id] = base.split('/');
+  const views = {
+    inbox: () => jump('inbox'),
+    project: () => jump('project', {id}),
+    mission: () => jump('mission', {id}),
+    agent: () => jump('agent', {id}),
+    orch: () => jump('orch', {scope: id || null}),
+    model: () => jump('model'),
+    new: () => { jump('newmission'); S.mode = 'INSERT'; S.target = {type:'goal'}; },
+    help: () => jump('help')
+  };
+  if(views[view]) views[view]();
+  flags.forEach(f => {
+    if(f === 'split'){ S.split = true; S.splitId = (view === 'agent' && agents[id]) ? orchId(agents[id].project) : 'claude-2'; }
+    if(f === 'palette'){ S.palette = true; S.mode = 'PALETTE'; }
+    if(f === 'peek'){ S.peek = true; }
+    if(f === 'trace'){ S.trace = true; }
+    if(f === 'sort'){ S.sort = 1; }
+  });
+}
+
+/* ---------- start ---------- */
+init();
+applyHash();
+render();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

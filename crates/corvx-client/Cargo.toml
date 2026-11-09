@@ -1,0 +1,16 @@
+[package]
+name = "corvx-client"
+description = "CORVX client: connects to corvxd and starts it on demand"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corvx-proto.workspace = true
+corvx-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+libc.workspace = true

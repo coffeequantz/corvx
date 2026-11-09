@@ -1,0 +1,393 @@
+//! Maps protocol methods onto core operations.
+//!
+//! `Core::handle` is the single entry point. The daemon calls it for every
+//! request, and tests call it directly without a socket.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use corvx_proto::{
+    codes, methods, AttentionDismissParams, AttentionIdParams, AttentionList, AttentionListParams,
+    AttentionSnoozeParams, DaemonInfo, Project, ProjectAddParams, ProjectList, ProjectRemoveParams,
+    PROTOCOL_VERSION,
+};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+
+use crate::scan::scan;
+use crate::store::{now_secs, Store, StoreError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    /// An error to return to the client, with a protocol error code.
+    #[error("{1}")]
+    Rpc(i64, String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl ServiceError {
+    fn rpc(code: i64, message: impl Into<String>) -> Self {
+        ServiceError::Rpc(code, message.into())
+    }
+}
+
+pub struct Core {
+    store: Store,
+    data_dir: PathBuf,
+}
+
+impl Core {
+    pub fn new(store: Store, data_dir: PathBuf) -> Self {
+        Self { store, data_dir }
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub fn handle(&self, method: &str, params: Value) -> Result<Value, ServiceError> {
+        match method {
+            methods::DAEMON_INFO => {
+                Ok(serde_json::to_value(self.daemon_info()).expect("DaemonInfo serializes"))
+            }
+            methods::PROJECT_ADD => {
+                let p: ProjectAddParams = parse(params)?;
+                Ok(serde_json::to_value(self.project_add(p)?).expect("Project serializes"))
+            }
+            methods::PROJECT_LIST => Ok(serde_json::to_value(ProjectList {
+                projects: self.store.list_projects()?,
+            })
+            .expect("ProjectList serializes")),
+            methods::PROJECT_REMOVE => {
+                let p: ProjectRemoveParams = parse(params)?;
+                self.project_remove(&p.id)?;
+                Ok(json!({"removed": p.id}))
+            }
+            methods::ATTENTION_LIST => {
+                let p: AttentionListParams = parse(params)?;
+                let items = self.store.list_attention(p.include_snoozed, now_secs())?;
+                Ok(
+                    serde_json::to_value(AttentionList { items })
+                        .expect("AttentionList serializes"),
+                )
+            }
+            methods::ATTENTION_ACK => {
+                let p: AttentionIdParams = parse(params)?;
+                self.attention_must_exist(&p.id, self.store.ack_attention(&p.id, now_secs())?)?;
+                self.store
+                    .append_event("attention.acknowledged", &json!({"id": p.id}))?;
+                Ok(json!({"ok": true}))
+            }
+            methods::ATTENTION_SNOOZE => {
+                let p: AttentionSnoozeParams = parse(params)?;
+                let now = now_secs();
+                let until = now + i64::from(p.minutes) * 60;
+                self.attention_must_exist(&p.id, self.store.snooze_attention(&p.id, until, now)?)?;
+                self.store.append_event(
+                    "attention.snoozed",
+                    &json!({"id": p.id, "minutes": p.minutes}),
+                )?;
+                Ok(json!({"snoozed_until": until}))
+            }
+            methods::ATTENTION_DISMISS => {
+                let p: AttentionDismissParams = parse(params)?;
+                let reason = p.reason.unwrap_or_else(|| "dismissed".into());
+                self.attention_must_exist(
+                    &p.id,
+                    self.store.dismiss_attention(&p.id, &reason, now_secs())?,
+                )?;
+                self.store.append_event(
+                    "attention.dismissed",
+                    &json!({"id": p.id, "reason": reason}),
+                )?;
+                Ok(json!({"ok": true}))
+            }
+            other => Err(ServiceError::rpc(
+                codes::METHOD_NOT_FOUND,
+                format!("unknown method: {other}"),
+            )),
+        }
+    }
+
+    fn attention_must_exist(&self, id: &str, changed: bool) -> Result<(), ServiceError> {
+        if changed {
+            Ok(())
+        } else {
+            Err(ServiceError::rpc(
+                codes::ATTENTION_NOT_FOUND,
+                format!("no open attention item '{id}'"),
+            ))
+        }
+    }
+
+    fn daemon_info(&self) -> DaemonInfo {
+        DaemonInfo {
+            name: "corvxd".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            protocol_version: PROTOCOL_VERSION,
+            pid: std::process::id(),
+            data_dir: self.data_dir.display().to_string(),
+        }
+    }
+
+    fn project_add(&self, params: ProjectAddParams) -> Result<Project, ServiceError> {
+        let raw = Path::new(&params.path);
+        let root = fs::canonicalize(raw).map_err(|_| {
+            ServiceError::rpc(
+                codes::PATH_INVALID,
+                format!("path does not exist: {}", params.path),
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(ServiceError::rpc(
+                codes::PATH_INVALID,
+                format!("not a directory: {}", root.display()),
+            ));
+        }
+
+        let path_str = root.display().to_string();
+        if let Some(existing) = self.store.find_by_path(&path_str)? {
+            return Err(ServiceError::rpc(
+                codes::PROJECT_EXISTS,
+                format!("already registered as '{}'", existing.id),
+            ));
+        }
+
+        let name = params
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "project".into());
+        let workspace = params
+            .workspace
+            .filter(|w| !w.trim().is_empty())
+            .unwrap_or_else(|| "default".into());
+
+        let found = scan(&root);
+        let project = Project {
+            id: self.unique_id(&slug(&name))?,
+            name,
+            path: path_str,
+            workspace,
+            added_at: now_secs(),
+            stack: found.stack,
+            test_command: found.test_command,
+            build_command: found.build_command,
+            branch: found.branch,
+        };
+        self.store.insert_project(&project)?;
+        self.store.append_event(
+            "project.added",
+            &json!({"id": project.id, "path": project.path, "stack": project.stack}),
+        )?;
+        Ok(project)
+    }
+
+    fn project_remove(&self, id: &str) -> Result<(), ServiceError> {
+        if !self.store.delete_project(id)? {
+            return Err(ServiceError::rpc(
+                codes::PROJECT_NOT_FOUND,
+                format!("no project with id '{id}'"),
+            ));
+        }
+        self.store
+            .append_event("project.removed", &json!({"id": id}))?;
+        Ok(())
+    }
+
+    fn unique_id(&self, base: &str) -> Result<String, ServiceError> {
+        let mut candidate = base.to_string();
+        let mut n = 2;
+        while self.store.get_project(&candidate)?.is_some() {
+            candidate = format!("{base}-{n}");
+            n += 1;
+        }
+        Ok(candidate)
+    }
+}
+
+fn parse<T: DeserializeOwned>(params: Value) -> Result<T, ServiceError> {
+    serde_json::from_value(params)
+        .map_err(|e| ServiceError::rpc(codes::INVALID_PARAMS, format!("invalid params: {e}")))
+}
+
+/// Lowercase identifier from a name: `"My App!"` becomes `"my-app"`.
+pub fn slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "project".into()
+    } else {
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn core() -> Core {
+        Core::new(
+            Store::open_in_memory().unwrap(),
+            PathBuf::from("/tmp/unused"),
+        )
+    }
+
+    fn code_of(err: ServiceError) -> i64 {
+        match err {
+            ServiceError::Rpc(c, _) => c,
+            other => panic!("expected rpc error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slug_normalises_names() {
+        assert_eq!(slug("My App!"), "my-app");
+        assert_eq!(slug("  --api_gateway--  "), "api-gateway");
+        assert_eq!(slug("!!!"), "project");
+    }
+
+    #[test]
+    fn add_list_remove_roundtrip() {
+        let core = core();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+
+        let added: Project = serde_json::from_value(
+            core.handle(methods::PROJECT_ADD, json!({"path": dir.path()}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(added.stack, vec!["rust"]);
+        assert_eq!(added.workspace, "default");
+        assert_eq!(added.test_command.as_deref(), Some("cargo test"));
+
+        let list: ProjectList =
+            serde_json::from_value(core.handle(methods::PROJECT_LIST, json!({})).unwrap()).unwrap();
+        assert_eq!(list.projects.len(), 1);
+
+        core.handle(methods::PROJECT_REMOVE, json!({"id": added.id}))
+            .unwrap();
+        let list: ProjectList =
+            serde_json::from_value(core.handle(methods::PROJECT_LIST, json!({})).unwrap()).unwrap();
+        assert!(list.projects.is_empty());
+    }
+
+    #[test]
+    fn duplicate_path_is_rejected() {
+        let core = core();
+        let dir = tempdir().unwrap();
+        core.handle(methods::PROJECT_ADD, json!({"path": dir.path()}))
+            .unwrap();
+        let err = core
+            .handle(methods::PROJECT_ADD, json!({"path": dir.path()}))
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::PROJECT_EXISTS);
+    }
+
+    #[test]
+    fn same_name_gets_a_suffixed_id() {
+        let core = core();
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let first = core
+            .handle(
+                methods::PROJECT_ADD,
+                json!({"path": a.path(), "name": "app"}),
+            )
+            .unwrap();
+        let second = core
+            .handle(
+                methods::PROJECT_ADD,
+                json!({"path": b.path(), "name": "app"}),
+            )
+            .unwrap();
+        assert_eq!(first["id"], "app");
+        assert_eq!(second["id"], "app-2");
+    }
+
+    #[test]
+    fn missing_path_is_a_path_error() {
+        let err = core()
+            .handle(
+                methods::PROJECT_ADD,
+                json!({"path": "/definitely/not/here"}),
+            )
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::PATH_INVALID);
+    }
+
+    #[test]
+    fn removing_unknown_project_is_an_error() {
+        let err = core()
+            .handle(methods::PROJECT_REMOVE, json!({"id": "nope"}))
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::PROJECT_NOT_FOUND);
+    }
+
+    #[test]
+    fn bad_params_are_reported() {
+        let err = core()
+            .handle(methods::PROJECT_ADD, json!({"wrong": 1}))
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn unknown_method_is_reported() {
+        let err = core().handle("nope.nope", json!({})).unwrap_err();
+        assert_eq!(code_of(err), codes::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn attention_items_can_be_snoozed_acked_and_dismissed() {
+        let core = core();
+        // Raise an item directly through the store, as the session manager does.
+        core.store()
+            .set_session_attention("s1", "app", "blocked", "needs permission", 3, now_secs())
+            .unwrap();
+        let list: AttentionList =
+            serde_json::from_value(core.handle(methods::ATTENTION_LIST, json!({})).unwrap())
+                .unwrap();
+        assert_eq!(list.items.len(), 1);
+        let id = list.items[0].id.clone();
+
+        core.handle(methods::ATTENTION_SNOOZE, json!({"id": id, "minutes": 15}))
+            .unwrap();
+        let list: AttentionList =
+            serde_json::from_value(core.handle(methods::ATTENTION_LIST, json!({})).unwrap())
+                .unwrap();
+        assert!(list.items.is_empty(), "snoozed items are hidden");
+
+        core.handle(
+            methods::ATTENTION_DISMISS,
+            json!({"id": id, "reason": "not now"}),
+        )
+        .unwrap();
+        let err = core
+            .handle(methods::ATTENTION_ACK, json!({"id": id}))
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::ATTENTION_NOT_FOUND);
+    }
+
+    #[test]
+    fn daemon_info_reports_protocol_version() {
+        let info: DaemonInfo =
+            serde_json::from_value(core().handle(methods::DAEMON_INFO, json!({})).unwrap())
+                .unwrap();
+        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(info.name, "corvxd");
+    }
+}
