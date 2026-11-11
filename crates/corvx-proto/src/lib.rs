@@ -49,6 +49,10 @@ pub mod methods {
     pub const RULES_REMOVE: &str = "rules.remove";
     /// Sets what a rule does (ask, allow, deny, off), for one project or everywhere.
     pub const RULES_SET: &str = "rules.set";
+    /// Sets how much a project's agents may do without asking (see `autonomy`).
+    pub const PROJECT_AUTONOMY: &str = "project.autonomy";
+    /// Appends an entry to the journal of a session's project (`.corvx/journal/`).
+    pub const PROJECT_JOURNAL: &str = "project.journal";
 }
 
 /// Error codes. JSON-RPC reserved range plus CORVX codes from 1000.
@@ -159,6 +163,47 @@ pub struct Project {
     pub test_command: Option<String>,
     pub build_command: Option<String>,
     pub branch: Option<String>,
+    /// How much its agents may do without asking: one of `autonomy::ALL`.
+    #[serde(default = "guided")]
+    pub autonomy: String,
+}
+
+/// Autonomy levels: a dial from "you decide everything" to "agents decide almost everything".
+/// A level sets defaults; CORVX rules you set yourself always win.
+pub mod autonomy {
+    /// Every permission request comes to you. Orchestrators cannot decide them or turn on
+    /// autopilot.
+    pub const SUPERVISED: &str = "supervised";
+    /// An orchestrator decides its agents' requests; built-in rules ask you. The default.
+    pub const GUIDED: &str = "guided";
+    /// Requests are approved without asking, except what rules send you (pushes, publishing,
+    /// credentials, deleting directories, writing outside the worktree, sudo).
+    pub const AUTONOMOUS: &str = "autonomous";
+    /// Everything is approved without asking, except changes to CORVX's own rules and what
+    /// you set to ask or deny.
+    pub const FULL: &str = "full";
+    pub const ALL: &[&str] = &[SUPERVISED, GUIDED, AUTONOMOUS, FULL];
+}
+
+fn guided() -> String {
+    autonomy::GUIDED.into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectAutonomyParams {
+    pub id: String,
+    /// One of `autonomy::ALL`.
+    pub level: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectJournalParams {
+    /// The session writing (its project gets the entry).
+    pub session: String,
+    pub text: String,
+    /// A heading for the entry, e.g. "Done".
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -324,7 +369,7 @@ pub struct Rule {
     #[serde(default = "ask")]
     pub action: String,
     /// Where the action comes from: "project" (set for this project), "everywhere" (set for
-    /// every project), or "default" (the rule's own).
+    /// every project), "level" (the project's autonomy level), or "default" (the rule's own).
     #[serde(default)]
     pub set_in: String,
 }
@@ -528,7 +573,8 @@ pub struct SessionInputParams {
 pub struct AttentionItem {
     pub id: String,
     /// What raised it: an agent state ("blocked", "waiting", "done", "failed"), "question",
-    /// or "approval" (a permission request you can decide from the inbox).
+    /// "approval" (a permission request you can decide from the inbox), or "suggestion" (CORVX
+    /// offers to allow automatically what you keep approving; deciding it allow accepts).
     pub kind: String,
     /// 3 = act now (blocked, failed); 2 = review (done); 1 = your move (waiting). An approval
     /// at severity 1 is its agent's orchestrator's to decide; you may still decide it.

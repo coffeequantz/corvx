@@ -255,6 +255,46 @@ enum ProjectCommand {
         /// Project id, as shown by `corvx project list`.
         id: String,
     },
+    /// Show or set how much the project's agents may do without asking:
+    /// supervised (you decide every request), guided (orchestrators decide, rules ask you;
+    /// the default), autonomous (approved without asking, except what rules send you), full
+    /// (approved without asking, except changes to CORVX's rules and what you set to ask).
+    /// Rules you set yourself always win.
+    Autonomy {
+        id: String,
+        #[arg(value_enum)]
+        level: Option<Level>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Level {
+    Supervised,
+    Guided,
+    Autonomous,
+    Full,
+}
+
+impl Level {
+    fn name(self) -> &'static str {
+        match self {
+            Level::Supervised => "supervised",
+            Level::Guided => "guided",
+            Level::Autonomous => "autonomous",
+            Level::Full => "full",
+        }
+    }
+}
+
+/// What an autonomy level means, in one line.
+pub(crate) fn level_meaning(level: &str) -> &'static str {
+    match level {
+        "supervised" => "you decide every permission request",
+        "guided" => "orchestrators decide their agents' requests; rules send pushes, deletes, publishing, credentials and outside writes to you",
+        "autonomous" => "requests are approved without asking, except what rules send you (pushes, deletes, publishing, credentials, outside writes, sudo)",
+        "full" => "requests are approved without asking, except changes to CORVX's own rules and what you set to ask or deny",
+        _ => "",
+    }
 }
 
 fn main() {
@@ -620,14 +660,15 @@ fn project(command: ProjectCommand, data_dir: &std::path::Path) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<18} {:<12} {:<18} {:<14} PATH",
-                "ID", "WORKSPACE", "STACK", "TEST"
+                "{:<18} {:<12} {:<11} {:<18} {:<14} PATH",
+                "ID", "WORKSPACE", "AUTONOMY", "STACK", "TEST"
             );
             for p in list.projects {
                 println!(
-                    "{:<18} {:<12} {:<18} {:<14} {}",
+                    "{:<18} {:<12} {:<11} {:<18} {:<14} {}",
                     p.id,
                     p.workspace,
+                    p.autonomy,
                     if p.stack.is_empty() {
                         "-".into()
                     } else {
@@ -637,6 +678,30 @@ fn project(command: ProjectCommand, data_dir: &std::path::Path) -> Result<()> {
                     p.path
                 );
             }
+            Ok(())
+        }
+        ProjectCommand::Autonomy { id, level } => {
+            let p: Project = match level {
+                Some(level) => {
+                    let params = corvx_proto::ProjectAutonomyParams {
+                        id: id.clone(),
+                        level: level.name().into(),
+                    };
+                    client.call(methods::PROJECT_AUTONOMY, &params)?
+                }
+                None => {
+                    let list: ProjectList = client.call(methods::PROJECT_LIST, &json!({}))?;
+                    list.projects
+                        .into_iter()
+                        .find(|p| p.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("no project '{id}'"))?
+                }
+            };
+            println!("{}: {} · {}", p.id, p.autonomy, level_meaning(&p.autonomy));
+            println!(
+                "rules you set win over the level: corvx rules --project {}",
+                p.id
+            );
             Ok(())
         }
         ProjectCommand::Remove { id } => {
@@ -1196,8 +1261,10 @@ contract, how to test its work, and to commit on its branch when done. Agents ca
 instruction or a correction. When it reports done, review its result before accepting it.
 5. Use ask_human only for decisions the human must make (product choices, conflicts you cannot resolve, anything \
 risky). Do not ask about things you can check yourself.
-6. When the goal is met, summarize what each agent did, which branches hold the work, and what the human should \
-review or merge, then call report_done with that summary.";
+6. When the goal is met, write the mission's journal entry with journal: the goal, what happened, what went wrong, \
+and what was learned that the next mission on this project should know. Then summarize what each agent did, \
+which branches hold the work, and what the human should review or merge, and call report_done with that summary \
+(it is added to the journal too).";
 
 /// The orchestrator's role prompt, with its model and approval policy.
 fn orchestrator_prompt(agent_model: &str, human_approves_agents: bool) -> String {
@@ -1207,6 +1274,8 @@ start_agent uses {agent_model} unless you pass model. Pick haiku for mechanical 
 docs, simple tests) and a stronger model (opus) only for a piece that needs it (tricky design, hard debugging)."
     );
     let approvals = if human_approves_agents {
+        // (The project's autonomy level, which the human can change at any time, decides how
+        // many requests reach anyone at all; see below.)
         "Approvals: the human decides your agents' permission requests. When wait_for reports an approval, \
 just wait; you cannot decide it.".to_string()
     } else {
@@ -1220,7 +1289,10 @@ turn it off if it drifts. CORVX rules decide some requests whatever you or autop
 by default pushing, discarding work, deleting directories, publishing, sudo, credentials and writing outside \
 the agent's worktree go to the human, and the human may set rules to allow or deny requests at once. \
 wait_for reports requests sent to the human with decider \"human\" and the rule in note; wait for those, \
-or plan work that does not need them. A request a rule denies fails with the rule's reason: do it another way.".to_string()
+or plan work that does not need them. A request a rule denies fails with the rule's reason: do it another way. \
+The project's autonomy level, which the human sets and may change at any time, decides how much reaches you: \
+at supervised every request goes to the human and you cannot set_autopilot; at autonomous or full most \
+requests are approved without asking.".to_string()
     };
     format!("{ORCHESTRATOR_PROMPT}\n\n{models}\n\n{approvals}")
 }

@@ -325,6 +325,91 @@ def real_claude_attention(h: Harness):
         h.corvx("session", "stop", sid, check=False)
 
 
+def claude_ready(t: "Term"):
+    """Waits for real Claude's input line, answering the first-run folder trust question."""
+    assert t.wait_for("then d to detach", 15), "attach did not start"
+    if t.wait_for("trust this folder", 60):
+        t.pump(3.0)
+        for _ in range(3):
+            t.send(b"\x1b[B")
+            t.pump(1.0)
+            if "❯ Yes, I trust this folder" in t.text():
+                break
+        assert "❯ Yes, I trust this folder" in t.text(), "could not select 'Yes':\n" + t.text()
+        t.send(b"\r")
+    assert t.wait_for("❯", 120), "Claude did not reach its prompt. Screen was:\n" + t.text()
+    t.pump(2.0)
+
+
+def events_of(h: Harness, kind: str):
+    import sqlite3
+    con = sqlite3.connect(str(h.home / "corvx.db"))
+    try:
+        return [json.loads(p) for (p,) in con.execute(
+            "SELECT payload FROM events WHERE kind = ? ORDER BY seq", (kind,))]
+    finally:
+        con.close()
+
+
+def real_claude_rules(h: Harness):
+    """Real Claude: CORVX rules ask (even when Claude's settings allow the call), allow (no
+    prompt where Claude would ask) and deny.
+
+    Uses your Claude account for three short prompts. Opt in with CORVX_E2E_REAL_CLAUDE=1.
+    """
+    if os.environ.get("CORVX_E2E_REAL_CLAUDE") != "1":
+        raise SkipTest("set CORVX_E2E_REAL_CLAUDE=1 to run against real Claude (uses your account)")
+    # Claude's own settings allow echo, so without CORVX it would not ask.
+    settings = h.project / ".claude" / "settings.local.json"
+    settings.parent.mkdir(exist_ok=True)
+    settings.write_text(json.dumps({"permissions": {"allow": ["Bash(echo:*)"]}}))
+    rule = lambda *a: re.search(r"added rule (\S+)", h.corvx("rules", "add", *a, "--project", "e2e")).group(1)
+    ask = rule("--command", r"\becho\s+corvx-probe\b", "--reason", "probe: ask")
+    allow = rule("--command", r"\btouch\s+corvx_allowed\.txt\b", "--reason", "probe: allow",
+                 "--action", "allow")
+    deny = rule("--command", r"\bdate\b", "--reason", "probe: deny", "--action", "deny")
+
+    sid = h.start(runtime="claude", command=["claude", "--permission-mode", "default", "--model", "haiku"])
+    t = Term([str(CORVX), "session", "attach", sid], h.env)
+    try:
+        claude_ready(t)
+        turns = lambda: len([i for i in events_of(h, "session.status")
+                             if i.get("id") == sid and i.get("agent_state") == "waiting"])
+
+        # ask: the rule sends it to the inbox although Claude's settings allow it.
+        t.send(b"Use the Bash tool to run exactly: echo corvx-probe\r")
+        wait_until(lambda: item_id(h, "approval", f"CORVX rule {ask}: probe: ask") is not None, 180,
+                   "the ask rule to raise an approval. Screen:\n" + t.text())
+        h.corvx("attention", "approve", item_id(h, "approval", "corvx-probe"))
+        wait_until(lambda: item_id(h, "approval", "corvx-probe") is None, 60, "the approval to close")
+        wait_until(lambda: turns() >= 1, 240, "the first turn to finish")
+
+        # allow: runs without a prompt, where Claude would otherwise ask.
+        t.send(b"Use the Bash tool to run exactly: touch corvx_allowed.txt\r")
+        wait_until(lambda: (h.project / "corvx_allowed.txt").exists(), 180,
+                   "the allow rule to let it run. Screen:\n" + t.text())
+        assert not item_for_session(h, sid, "approval"), h.attention_text()
+        wait_until(lambda: turns() >= 2, 240, "the second turn to finish")
+
+        # deny: refused with the rule's reason, and no one is asked.
+        t.send(b"Use the Bash tool to run exactly: date\r")
+        wait_until(lambda: any(e.get("rule") == deny for e in events_of(h, "attention.auto_denied")),
+                   180, "the deny rule. Screen:\n" + t.text())
+        assert not item_for_session(h, sid, "approval"), h.attention_text()
+        wait_until(lambda: turns() >= 3, 240, "the third turn to finish")
+        assert any(e.get("rule") == allow for e in events_of(h, "attention.auto_approved"))
+        t.send(b"\x1c")
+        t.send(b"d")
+    except Exception as e:
+        raise AssertionError(f"{e}\nsession: {h.session_line(sid)}\nlast screen:\n{t.text()}") from e
+    finally:
+        t.close()
+        h.corvx("session", "stop", sid, check=False)
+        settings.unlink()
+        for r in (ask, allow, deny):
+            h.corvx("rules", "remove", r, check=False)
+
+
 def output_of(h: Harness, sid: str):
     return h.corvx("session", "output", sid)
 
@@ -371,7 +456,8 @@ def approve_in_the_terminal_ui(h: Harness):
             h.corvx("session", "input", sid, "request", "--enter")
             wait_until(lambda: item_id(h, "approval", "make test") is not None, 10, "approval item")
             assert t.wait_for("1 to approve", 10), "top bar does not count the approval:\n" + t.text()
-            t.send(b"i")
+            # The request is the most urgent item: the top of the inbox.
+            t.key(b"i", b"k", b"k", b"k")
             assert t.wait_for("asks to run", 5), "inbox does not show the request:\n" + t.text()
             assert "y approve" in t.text(), t.text()
             t.send(key)
@@ -740,11 +826,83 @@ def rules_reach_the_human(h: Harness):
     assert rule not in h.corvx("rules")
 
 
+def autonomy_trust_and_journal(h: Harness):
+    """The autonomy dial, suggestions from repeated approvals, and the mission journal."""
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    time.sleep(1.0)
+    out = lambda: output_of(h, sid).replace("\r", "")
+    allowed = lambda: out().count("allowed by hook")
+    request = lambda cmd: h.corvx("session", "input", sid, f"request {cmd}", "--enter")
+
+    # Autonomous: approved without asking anyone; a push still asks.
+    assert "guided" in h.corvx("project", "autonomy", "e2e")
+    assert "autonomous" in h.corvx("project", "autonomy", "e2e", "autonomous")
+    assert re.search(r"e2e\s+\S+\s+autonomous", h.corvx("project", "list"))
+    request("cargo fmt --check")
+    wait_until(lambda: allowed() == 1, 10, "the autonomous level to approve")
+    assert item_id(h, "approval", "cargo fmt") is None, h.attention_text()
+    request("git push")
+    wait_until(lambda: item_id(h, "approval", "CORVX rule git-push") is not None, 10, "the push to ask")
+    h.corvx("attention", "deny", item_id(h, "approval", "git push"), "not", "now")
+    wait_until(lambda: "denied by hook: not now" in out(), 10, "the denial")
+
+    # Guided again: you approve the same command three times; CORVX offers to allow it.
+    h.corvx("project", "autonomy", "e2e", "guided")
+    for n in range(3):
+        request("cargo fmt --check")
+        wait_until(lambda: item_id(h, "approval", "cargo fmt") is not None, 10, "the request")
+        h.corvx("attention", "approve", item_id(h, "approval", "cargo fmt"))
+        wait_until(lambda: allowed() == 2 + n, 10, "the approval")
+    wait_until(lambda: item_id(h, "suggestion", "`cargo fmt …` 3 times in e2e") is not None, 10,
+               "a suggestion:\n" + h.attention_text())
+
+    # Accepting it in the terminal UI; the dial moves there too.
+    t = Term([str(CORVX)], h.env)
+    try:
+        t.send(b"i")
+        assert t.wait_for("y allow it without asking from now on", 5), "inbox:\n" + t.text()
+        t.send(b"y")
+        wait_until(lambda: item_id(h, "suggestion", "cargo fmt") is None, 10, "the suggestion to close")
+        t.key(b"\x1b", b"l")
+        assert t.wait_for("- / + to move", 5), "rules view:\n" + t.text()
+        t.send(b"-")
+        wait_until(lambda: "supervised" in h.corvx("project", "autonomy", "e2e"), 5, "- to lower the level")
+        t.send(b"+")
+        t.pump(1.0)
+        wait_until(lambda: "guided" in h.corvx("project", "autonomy", "e2e"), 5, "+ to raise it:\n" + t.text())
+        t.key(b"\x1b", b"q")
+    finally:
+        t.close()
+    request("cargo fmt --check")
+    wait_until(lambda: "allowed before asking" in out(), 10, "the accepted suggestion to allow it")
+    assert re.search(r"you approved `cargo fmt …` before", h.corvx("rules", "--project", "e2e"))
+
+    # The journal: an orchestrator's entries and its report go to .corvx/journal/.
+    env = {**h.env, "CORVX_SESSION_ID": sid}
+    m = Mcp(env)
+    try:
+        m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "e2e", "version": "0"}})
+        m.notify("notifications/initialized")
+        m.tool("journal", {"title": "Mission", "text": "Goal: format check.\nLearned: run cargo fmt first."})
+        done = m.tool("report_done", {"summary": "Formatting is clean."})
+        assert done["journal"], done
+    finally:
+        m.close()
+    entries = list((h.project / ".corvx" / "journal").glob(f"*-{sid}.md"))
+    assert len(entries) == 1, entries
+    text = entries[0].read_text()
+    assert "## Mission · " in text and "Learned: run cargo fmt first." in text, text
+    assert "## Done · " in text and "Formatting is clean." in text, text
+
+
 SCENARIOS = [
     attach_and_detach_pty,
     orchestration_through_mcp,
     orchestrator_decides_approvals,
     rules_reach_the_human,
+    autonomy_trust_and_journal,
+    real_claude_rules,
     attach_from_the_terminal_ui,
     attach_and_detach_tmux,
     sessions_survive_a_daemon_restart,

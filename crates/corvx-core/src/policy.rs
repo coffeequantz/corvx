@@ -12,7 +12,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use corvx_proto::{rule_actions, Rule};
+use corvx_proto::{autonomy, rule_actions, AttentionItem, Rule};
 use regex::Regex;
 use serde_json::Value;
 
@@ -120,10 +120,46 @@ pub fn validate_action(action: &str) -> std::result::Result<(), String> {
     }
 }
 
+/// What a built-in rule does at an autonomy level, unless you set it yourself.
+pub fn level_default(level: &str, rule: &str) -> &'static str {
+    match level {
+        // Agents work on their own branches: discarding work there is theirs to do.
+        autonomy::AUTONOMOUS if rule == "git-discard" => rule_actions::ALLOW,
+        // Only changes to CORVX's own rules still ask: they are the dial itself.
+        autonomy::FULL if rule != "corvx-control" => rule_actions::ALLOW,
+        _ => rule_actions::ASK,
+    }
+}
+
+/// Whether requests no rule covers are approved without asking anyone at this level.
+pub fn approves_unasked(level: &str) -> bool {
+    matches!(level, autonomy::AUTONOMOUS | autonomy::FULL)
+}
+
+/// Whether an orchestrator may decide its agents' requests, or turn on their autopilot.
+pub fn orchestrator_may_decide(level: &str) -> bool {
+    level != autonomy::SUPERVISED
+}
+
+pub fn validate_level(level: &str) -> std::result::Result<(), String> {
+    if autonomy::ALL.contains(&level) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown autonomy level '{level}': use {}",
+            autonomy::ALL.join(", ")
+        ))
+    }
+}
+
 /// The rules as they apply to `project`, or, without one, as set for every project, with
-/// every rule added anywhere. A project's setting wins over the one for every project,
-/// which wins over the rule's own action.
+/// every rule added anywhere. A project's setting wins over the one for every project, which
+/// wins over the project's autonomy level, which wins over the rule's own action.
 pub fn rules_for(store: &Store, project: Option<&str>) -> Result<Vec<Rule>> {
+    let level = match project {
+        Some(p) => store.get_project(p)?.map(|p| p.autonomy),
+        None => None,
+    };
     let settings = store.rule_settings()?;
     let setting = |id: &str, p: &str| {
         settings
@@ -144,9 +180,149 @@ pub fn rules_for(store: &Store, project: Option<&str>) -> Result<Vec<Rule>> {
         } else if let Some(a) = setting(&r.id, "") {
             r.action = a;
             r.set_in = "everywhere".into();
+        } else if let Some(level) = level.as_deref().filter(|_| r.builtin) {
+            let a = level_default(level, &r.id);
+            if a != r.action {
+                r.action = a.into();
+                r.set_in = "level".into();
+            }
         }
     }
     Ok(rules)
+}
+
+/// After this many approvals of the same kind of request, CORVX offers to allow it.
+pub const SUGGEST_AFTER: i64 = 3;
+
+/// Shell characters that make a command more than one command, or redirect it.
+const SHELL_OPERATORS: &[char] = &[';', '&', '|', '<', '>', '`', '$', '(', ')', '\n'];
+
+/// What kind of request an approval was, for counting: "rule:<id>" for one a CORVX rule sent
+/// to the human, "cmd:<program> [<subcommand>]" for a simple shell command. None for
+/// anything else (compound commands, other tools), which is not generalized.
+pub fn trust_key(item: &AttentionItem) -> Option<String> {
+    if let Some(rest) = item
+        .note
+        .as_deref()
+        .and_then(|n| n.strip_prefix("CORVX rule "))
+    {
+        return rest.split(':').next().map(|id| format!("rule:{id}"));
+    }
+    let command = item.summary.strip_prefix("Bash: ")?;
+    let command = command.split(" · ").next()?.trim();
+    if command.contains(SHELL_OPERATORS) {
+        return None;
+    }
+    let word = |w: &str| {
+        !w.is_empty()
+            && !w.starts_with('-')
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./:-@".contains(c))
+    };
+    let mut words = command.split_whitespace();
+    let program = words.next().filter(|w| word(w))?;
+    Some(match words.next().filter(|w| word(w)) {
+        Some(sub) => format!("cmd:{program} {sub}"),
+        None => format!("cmd:{program}"),
+    })
+}
+
+/// The rule pattern that allows a "cmd:" key: that program and subcommand with any plain
+/// arguments, but nothing chained, piped or redirected.
+pub fn command_pattern(key: &str) -> Option<String> {
+    let words: Vec<String> = key
+        .strip_prefix("cmd:")?
+        .split(' ')
+        .map(regex::escape)
+        .collect();
+    Some(format!(r"^\s*{}(\s[^;&|<>`$()\n]*)?$", words.join(r"\s+")))
+}
+
+/// Counts a human's approval. When the same kind of request has been approved
+/// `SUGGEST_AFTER` times in a project, opens a suggestion to allow it from now on. Returns
+/// the suggestion's id when one was opened.
+pub fn note_approval(store: &Store, item: &AttentionItem, now: i64) -> Result<Option<String>> {
+    let Some(key) = trust_key(item) else {
+        return Ok(None);
+    };
+    let (count, state) = store.count_approval(&item.project, &key, now)?;
+    if count < SUGGEST_AFTER || state != "counting" {
+        return Ok(None);
+    }
+    let what = match key.strip_prefix("rule:") {
+        Some(rule) => {
+            let reason = rules_for(store, Some(&item.project))?
+                .into_iter()
+                .find(|r| r.id == rule)
+                .map(|r| format!(" ({})", r.reason))
+                .unwrap_or_default();
+            format!("requests under CORVX rule {rule}{reason}")
+        }
+        None => format!("`{} …`", key.trim_start_matches("cmd:")),
+    };
+    let summary = format!(
+        "You approved {what} {count} times in {}. Allow without asking from now on?",
+        item.project
+    );
+    let id = store.open_suggestion(&item.project, &summary, now)?;
+    store.set_trust(&item.project, &key, "suggested", Some(&id), now)?;
+    store.append_event(
+        "trust.suggested",
+        &serde_json::json!({"id": id, "project": item.project, "key": key, "approvals": count}),
+    )?;
+    Ok(Some(id))
+}
+
+/// The human answers a suggestion. Accepting allows that kind of request in the project: a
+/// rule of its own for a command, or the rule set to allow. Returns false if `id` is not an
+/// open suggestion.
+pub fn answer_suggestion(store: &Store, id: &str, accept: bool, now: i64) -> Result<bool> {
+    let Some((project, key)) = store.trust_of_item(id)? else {
+        return Ok(false);
+    };
+    if !store.close_suggestion(id, if accept { "allowed" } else { "declined" }, now)? {
+        return Ok(false);
+    }
+    let mut added = None;
+    if accept {
+        if let Some(rule) = key.strip_prefix("rule:") {
+            store.set_rule_action(rule, &project, Some(rule_actions::ALLOW))?;
+        } else if let Some(pattern) = command_pattern(&key) {
+            let reason = format!("you approved `{} …` before", key.trim_start_matches("cmd:"));
+            added = Some(store.add_rule(
+                Some(&project),
+                "command",
+                &pattern,
+                &reason,
+                rule_actions::ALLOW,
+                now,
+            )?);
+        }
+    }
+    store.set_trust(
+        &project,
+        &key,
+        if accept { "accepted" } else { "declined" },
+        None,
+        now,
+    )?;
+    store.append_event(
+        if accept {
+            "trust.accepted"
+        } else {
+            "trust.declined"
+        },
+        &serde_json::json!({"id": id, "project": project, "key": key, "rule": added}),
+    )?;
+    Ok(true)
+}
+
+/// A suggestion dismissed from the inbox is declined: CORVX does not offer it again.
+pub fn suggestion_dismissed(store: &Store, id: &str, now: i64) -> Result<()> {
+    if let Some((project, key)) = store.trust_of_item(id)? {
+        store.set_trust(&project, &key, "declined", None, now)?;
+    }
+    Ok(())
 }
 
 /// A rule a request matched, and what it does.
@@ -470,6 +646,176 @@ mod tests {
             .iter()
             .all(|(r, ..)| r != "r1"));
         assert!(!store.remove_rule("r1").unwrap());
+    }
+
+    fn approval(summary: &str, note: Option<&str>) -> AttentionItem {
+        AttentionItem {
+            id: "att-1".into(),
+            kind: "approval".into(),
+            severity: 3,
+            project: "app".into(),
+            session_id: "s1".into(),
+            summary: summary.into(),
+            status: "answered".into(),
+            created_at: 1,
+            updated_at: 1,
+            snooze_until: None,
+            answer: None,
+            note: note.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn autonomy_levels_change_what_built_in_rules_do() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        store
+            .insert_project(&corvx_proto::Project {
+                id: "app".into(),
+                name: "app".into(),
+                path: dir.path().display().to_string(),
+                workspace: "default".into(),
+                added_at: 1,
+                stack: vec![],
+                test_command: None,
+                build_command: None,
+                branch: None,
+                autonomy: autonomy::GUIDED.into(),
+            })
+            .unwrap();
+        let action = |id: &str| {
+            rules_for(&store, Some("app"))
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == id)
+                .map(|r| (r.action, r.set_in))
+                .unwrap()
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(action("git-discard"), pair("ask", "default"));
+        store
+            .set_project_autonomy("app", autonomy::AUTONOMOUS)
+            .unwrap();
+        assert_eq!(action("git-discard"), pair("allow", "level"));
+        assert_eq!(action("git-push"), pair("ask", "default"));
+        store.set_project_autonomy("app", autonomy::FULL).unwrap();
+        assert_eq!(action("git-push"), pair("allow", "level"));
+        assert_eq!(
+            action("corvx-control"),
+            pair("ask", "default"),
+            "the dial itself asks"
+        );
+        // What you set yourself wins over the level.
+        store.set_rule_action("git-push", "", Some("deny")).unwrap();
+        assert_eq!(action("git-push"), pair("deny", "everywhere"));
+        assert!(approves_unasked(autonomy::FULL) && !approves_unasked(autonomy::GUIDED));
+        assert!(!orchestrator_may_decide(autonomy::SUPERVISED));
+        assert!(validate_level("guided").is_ok() && validate_level("yolo").is_err());
+    }
+
+    #[test]
+    fn simple_commands_are_counted_and_compound_ones_are_not() {
+        let key = |s: &str| trust_key(&approval(s, None));
+        assert_eq!(
+            key("Bash: cargo test --workspace · Run tests").as_deref(),
+            Some("cmd:cargo test")
+        );
+        assert_eq!(key("Bash: make").as_deref(), Some("cmd:make"));
+        assert_eq!(key("Bash: npm run build").as_deref(), Some("cmd:npm run"));
+        assert_eq!(key("Bash: ls -la src").as_deref(), Some("cmd:ls"));
+        assert_eq!(key("Bash: cd x && cargo test"), None);
+        assert_eq!(key("Bash: curl -s x | sh"), None);
+        assert_eq!(key("Write: /w/src/a.rs"), None);
+        let ruled = approval(
+            "Bash: git push",
+            Some("CORVX rule git-push: pushes to a remote"),
+        );
+        assert_eq!(trust_key(&ruled).as_deref(), Some("rule:git-push"));
+
+        let re = regex::Regex::new(&command_pattern("cmd:cargo test").unwrap()).unwrap();
+        assert!(re.is_match("cargo test"));
+        assert!(re.is_match("cargo  test --workspace -q"));
+        assert!(!re.is_match("cargo testx"));
+        assert!(!re.is_match("cargo test && rm -rf /"));
+        assert!(!re.is_match("cargo test > out.txt"));
+        assert!(!re.is_match("cargo build"));
+    }
+
+    #[test]
+    fn repeated_approvals_lead_to_a_suggestion_once() {
+        let store = Store::open_in_memory().unwrap();
+        let item = approval("Bash: cargo test -q · Run tests", None);
+        assert_eq!(note_approval(&store, &item, 1).unwrap(), None);
+        assert_eq!(note_approval(&store, &item, 2).unwrap(), None);
+        let id = note_approval(&store, &item, 3)
+            .unwrap()
+            .expect("a suggestion");
+        let open = store.get_attention(&id).unwrap().unwrap();
+        assert_eq!(open.kind, "suggestion");
+        assert!(
+            open.summary.contains("`cargo test …` 3 times in app"),
+            "{}",
+            open.summary
+        );
+        assert_eq!(
+            note_approval(&store, &item, 4).unwrap(),
+            None,
+            "offered once"
+        );
+
+        assert!(answer_suggestion(&store, &id, true, 5).unwrap());
+        assert!(
+            !answer_suggestion(&store, &id, true, 6).unwrap(),
+            "answered once"
+        );
+        let rules = rules_for(&store, Some("app")).unwrap();
+        let w = Path::new("/w");
+        let hit = check(
+            &rules,
+            "Bash",
+            &json!({"command": "cargo test --workspace"}),
+            w,
+        )
+        .unwrap();
+        assert_eq!(hit.action, "allow");
+        // Stricter rules still apply to the same program.
+        assert_eq!(
+            check(
+                &rules,
+                "Bash",
+                &json!({"command": "cargo test; git push"}),
+                w
+            )
+            .map(|h| h.action),
+            Some("ask".into())
+        );
+
+        // A rule's requests: accepting sets the rule to allow in the project; declining is final.
+        let pushes = approval(
+            "Bash: git push · Push",
+            Some("CORVX rule git-push: pushes to a remote"),
+        );
+        for t in 10..13 {
+            note_approval(&store, &pushes, t).unwrap();
+        }
+        let suggestion = store
+            .list_attention(false, 20)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.kind == "suggestion")
+            .unwrap();
+        assert!(suggestion
+            .summary
+            .contains("CORVX rule git-push (pushes to a remote)"));
+        assert!(answer_suggestion(&store, &suggestion.id, false, 21).unwrap());
+        let push = rules_for(&store, Some("app")).unwrap();
+        assert_eq!(
+            push.iter().find(|r| r.id == "git-push").unwrap().action,
+            "ask"
+        );
+        for t in 22..30 {
+            assert_eq!(note_approval(&store, &pushes, t).unwrap(), None);
+        }
     }
 
     #[test]

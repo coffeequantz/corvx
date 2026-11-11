@@ -382,6 +382,37 @@ impl App {
         true
     }
 
+    /// Moves the selected project's autonomy level one step up or down the dial.
+    fn shift_level(&mut self, step: i32) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "select a project first".into();
+            return;
+        };
+        let levels = corvx_proto::autonomy::ALL;
+        let at = levels.iter().position(|l| *l == p.autonomy).unwrap_or(1) as i32;
+        let to = (at + step).clamp(0, levels.len() as i32 - 1) as usize;
+        if to as i32 == at {
+            self.flash = format!("{} is already {}", p.id, p.autonomy);
+            return;
+        }
+        let r = self.rpc(
+            methods::PROJECT_AUTONOMY,
+            json!({"id": p.id, "level": levels[to]}),
+        );
+        if self.report(r).is_some() {
+            self.flash = format!(
+                "{}: {} · {}",
+                p.id,
+                levels[to],
+                crate::level_meaning(levels[to])
+            );
+            let r = self.refresh();
+            self.report(r);
+            let r = self.load_rules();
+            self.report(r);
+        }
+    }
+
     fn key_rules(&mut self, code: KeyCode) {
         let max = self.rules.len().saturating_sub(1);
         let action = match code {
@@ -405,6 +436,10 @@ impl App {
                 }
                 let r = self.load_rules();
                 self.report(r);
+                return;
+            }
+            KeyCode::Char(c @ ('+' | '-' | '=')) => {
+                self.shift_level(if c == '-' { -1 } else { 1 });
                 return;
             }
             KeyCode::Char('h') => "ask",
@@ -555,6 +590,21 @@ impl App {
                         self.input.clear();
                     }
                 },
+                Some(item) if item.kind == "suggestion" => {
+                    if c == 'n' {
+                        self.attention_action(
+                            methods::ATTENTION_DECIDE,
+                            json!({"decision": "deny"}),
+                            "declined; CORVX keeps asking",
+                        )
+                    } else {
+                        self.attention_action(
+                            methods::ATTENTION_DECIDE,
+                            json!({"decision": "allow"}),
+                            "allowed without asking from now on",
+                        )
+                    }
+                }
                 Some(_) => self.flash = "only permission requests take y / n".into(),
                 None => {}
             },
@@ -963,6 +1013,11 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![label("path"), Span::raw(p.path.clone())]),
         Line::from(vec![label("workspace"), Span::raw(p.workspace.clone())]),
         Line::from(vec![
+            label("autonomy"),
+            Span::styled(p.autonomy.clone(), level_style(&p.autonomy)),
+            Span::styled("  · l to change", Style::default().fg(DIM)),
+        ]),
+        Line::from(vec![
             label("branch"),
             Span::raw(p.branch.clone().unwrap_or_else(|| "-".into())),
         ]),
@@ -1033,6 +1088,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                     "y approve · Y always · n deny · A autopilot · Enter attach · j/k move · Esc"
                         .into()
                 }
+                Some("suggestion") => {
+                    "y allow from now on · n keep asking · j/k move · Esc".into()
+                }
                 Some("question") => {
                     "r answer · Enter attach · a ack · z snooze · x dismiss · j/k move · Esc".into()
                 }
@@ -1045,8 +1103,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             }
             Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
             Mode::Deny => "why, or what to do instead (optional) · Enter deny · Esc cancel".into(),
-            Mode::Rules => "h ask · y allow · n deny · o off · d default · g this project/everywhere · Esc"
-                .into(),
+            Mode::Rules => {
+                "-/+ autonomy · h ask · y allow · n deny · o off · d default · g this project/everywhere · Esc"
+                    .into()
+            }
         }
     };
     let line = Line::from(vec![
@@ -1137,7 +1197,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "y approve · Y always · n deny · A autopilot · z snooze",
         ),
         ("  in sessions", "R resume · a autopilot on/off"),
-        ("l", "rules: what CORVX asks you, allows or denies"),
+        (
+            "l",
+            "rules and autonomy: what CORVX asks you, allows or denies",
+        ),
         ("?", "this help"),
         ("q", "quit the UI (the daemon keeps running)"),
         ("", ""),
@@ -1222,6 +1285,7 @@ fn kind_label(kind: &str) -> &'static str {
         "waiting" => "WAITING",
         "question" => "QUESTION",
         "approval" => "APPROVE?",
+        "suggestion" => "SUGGEST",
         "done" => "DONE",
         "failed" => "FAILED",
         _ => "?",
@@ -1234,6 +1298,7 @@ fn kind_style(kind: &str) -> Style {
         "waiting" => ACCENT,
         "question" => AMBER,
         "approval" => AMBER,
+        "suggestion" => GREEN,
         "done" => GREEN,
         "failed" => RED,
         _ => DIM,
@@ -1291,7 +1356,10 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
     }
     // The selected item in full: a long command or question does not fit on its row.
     let detail = app.attention.get(app.inbox_sel).filter(|i| {
-        matches!(i.kind.as_str(), "approval" | "question" | "blocked") || i.summary.len() > 60
+        matches!(
+            i.kind.as_str(),
+            "approval" | "question" | "blocked" | "suggestion"
+        ) || i.summary.len() > 60
     });
     let Some(item) = detail else {
         f.render_widget(Paragraph::new(lines).block(block), area);
@@ -1320,6 +1388,11 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
     if orchestrators(item) {
         text.push(Line::styled(
             "Its orchestrator is deciding · you can still decide it: y / Y / n",
+            Style::default().fg(DIM),
+        ));
+    } else if item.kind == "suggestion" {
+        text.push(Line::styled(
+            "y allow it without asking from now on · n keep asking (not offered again)",
             Style::default().fg(DIM),
         ));
     } else if let Some(rule) = rule_of(item) {
@@ -1459,6 +1532,17 @@ fn rule_of(item: &AttentionItem) -> Option<String> {
     rest.split(':').next().map(str::to_string)
 }
 
+fn level_style(level: &str) -> Style {
+    match level {
+        "supervised" => Style::default().fg(ACCENT),
+        "guided" => Style::default().fg(GREEN),
+        "autonomous" => Style::default().fg(AMBER),
+        "full" => Style::default().fg(RED),
+        _ => Style::default().fg(DIM),
+    }
+    .add_modifier(Modifier::BOLD)
+}
+
 fn action_style(action: &str) -> Style {
     match action {
         "allow" => Style::default().fg(GREEN),
@@ -1476,7 +1560,30 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
         .title(format!(" rules {scope} "))
         .border_style(Style::default().fg(BORDER));
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    if let Some(p) = app.selected_project().filter(|_| !app.rules_everywhere) {
+        let dial: Vec<Span> = corvx_proto::autonomy::ALL
+            .iter()
+            .flat_map(|l| {
+                let style = if *l == p.autonomy {
+                    level_style(l).add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().fg(DIM)
+                };
+                [Span::styled(format!(" {l} "), style), Span::raw(" ")]
+            })
+            .collect();
+        let mut line = vec![Span::styled("autonomy  ", Style::default().fg(DIM))];
+        line.extend(dial);
+        line.push(Span::styled("  - / + to move", Style::default().fg(DIM)));
+        lines.push(Line::from(line));
+        lines.push(Line::styled(
+            format!("          {}", crate::level_meaning(&p.autonomy)),
+            Style::default().fg(DIM),
+        ));
+        lines.push(Line::from(""));
+    }
+    lines.extend([
         Line::styled(
             "Applied to every agent's tool calls, whoever would decide them: ask = you decide,",
             Style::default().fg(DIM),
@@ -1486,7 +1593,7 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ),
         Line::from(""),
-    ];
+    ]);
     for (i, r) in app.rules.iter().enumerate() {
         let selected = i == app.rules_sel;
         let marker_style = if selected {
@@ -1497,6 +1604,7 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
         let set_in = match r.set_in.as_str() {
             "project" => "this project",
             "everywhere" => "everywhere",
+            "level" => "by level",
             _ => "",
         };
         lines.push(Line::from(vec![

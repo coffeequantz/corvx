@@ -20,8 +20,8 @@ use anyhow::{anyhow, Result};
 use corvx_client::{ensure_daemon, Client};
 use corvx_proto::{
     methods, AgentState, AttentionAskParams, AttentionDecideParams, AttentionItem, AttentionList,
-    ProjectList, Session, SessionAutopilotParams, SessionList, SessionReportParams, SessionScreen,
-    SessionStartParams, SessionState,
+    ProjectJournalParams, ProjectList, Session, SessionAutopilotParams, SessionList,
+    SessionReportParams, SessionScreen, SessionStartParams, SessionState,
 };
 use serde_json::{json, Value};
 
@@ -363,13 +363,50 @@ impl Server {
                     .clone()
                     .ok_or_else(|| anyhow!("report_done only works inside a CORVX session"))?;
                 let summary = s("summary").ok_or_else(|| anyhow!("summary is required"))?;
+                let outcome = s("outcome").unwrap_or_else(|| "done".into());
+                // An orchestrator's report closes its mission's journal entry.
+                let top_level = self
+                    .sessions()?
+                    .iter()
+                    .any(|x| x.id == me && x.supervisor.is_none());
+                let journal = if top_level {
+                    let title = if outcome == "failed" {
+                        "Failed"
+                    } else {
+                        "Done"
+                    };
+                    let params = ProjectJournalParams {
+                        session: me.clone(),
+                        text: summary.clone(),
+                        title: Some(title.into()),
+                    };
+                    self.rpc(methods::PROJECT_JOURNAL, serde_json::to_value(params)?)
+                        .ok()
+                        .and_then(|v| v["file"].as_str().map(str::to_string))
+                } else {
+                    None
+                };
                 let params = SessionReportParams {
                     id: me,
-                    outcome: s("outcome").unwrap_or_else(|| "done".into()),
+                    outcome,
                     summary,
                 };
                 self.rpc(methods::SESSION_REPORT, serde_json::to_value(params)?)?;
-                Ok(json!({"reported": true}))
+                Ok(json!({"reported": true, "journal": journal}))
+            }
+            "journal" => {
+                let me = self
+                    .me
+                    .clone()
+                    .ok_or_else(|| anyhow!("journal only works inside a CORVX session"))?;
+                let text = s("text").ok_or_else(|| anyhow!("text is required"))?;
+                let params = ProjectJournalParams {
+                    session: me,
+                    text,
+                    title: s("title"),
+                };
+                let v = self.rpc(methods::PROJECT_JOURNAL, serde_json::to_value(params)?)?;
+                Ok(json!({"file": v["file"]}))
             }
             other => Err(anyhow!("unknown tool: {other}")),
         }
@@ -583,8 +620,16 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}
         },
         {
+            "name": "journal",
+            "description": "Add an entry to this mission's journal, a Markdown file in the project's .corvx/journal/ that later missions read. At the end of a mission: the goal, what happened, what went wrong, what was learned.",
+            "inputSchema": {"type": "object", "properties": {
+                "text": {"type": "string", "description": "Markdown."},
+                "title": {"type": "string", "description": "A heading, e.g. Mission or Decision."}
+            }, "required": ["text"]}
+        },
+        {
             "name": "report_done",
-            "description": "Report that your own task is complete (or failed), with a short summary for your supervisor.",
+            "description": "Report that your own task is complete (or failed), with a short summary for your supervisor. An orchestrator's summary is also added to the mission's journal.",
             "inputSchema": {"type": "object", "properties": {
                 "summary": {"type": "string"},
                 "outcome": {"type": "string", "enum": ["done", "failed"]}

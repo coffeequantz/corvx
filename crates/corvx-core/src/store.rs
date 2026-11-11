@@ -23,7 +23,7 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE projects (
@@ -80,6 +80,21 @@ CREATE TABLE rule_settings (
     project TEXT NOT NULL DEFAULT '',
     action  TEXT NOT NULL,
     PRIMARY KEY (rule, project)
+);
+";
+
+/// Version 9: a project's autonomy level, and what the human keeps approving, so CORVX can
+/// offer to allow it automatically (`trust`: one row per project and kind of request).
+const SCHEMA_V9: &str = "
+ALTER TABLE projects ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'guided';
+CREATE TABLE trust (
+    project    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    approvals  INTEGER NOT NULL DEFAULT 0,
+    state      TEXT NOT NULL DEFAULT 'counting',
+    item       TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (project, key)
 );
 ";
 
@@ -187,6 +202,9 @@ impl Store {
         if version < 8 {
             conn.execute_batch(SCHEMA_V8)?;
         }
+        if version < 9 {
+            conn.execute_batch(SCHEMA_V9)?;
+        }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         }
@@ -201,8 +219,8 @@ impl Store {
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO projects (id, name, path, workspace, added_at, stack, test_command, build_command, branch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO projects (id, name, path, workspace, added_at, stack, test_command, build_command, branch, autonomy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 p.id,
                 p.name,
@@ -213,6 +231,7 @@ impl Store {
                 p.test_command,
                 p.build_command,
                 p.branch,
+                p.autonomy,
             ],
         )?;
         Ok(())
@@ -220,7 +239,7 @@ impl Store {
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, workspace, added_at, stack, test_command, build_command, branch
+            "SELECT id, name, path, workspace, added_at, stack, test_command, build_command, branch, autonomy
              FROM projects ORDER BY workspace, name, id",
         )?;
         let rows = stmt.query_map([], project_from_row)?;
@@ -231,7 +250,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, name, path, workspace, added_at, stack, test_command, build_command, branch
+                "SELECT id, name, path, workspace, added_at, stack, test_command, build_command, branch, autonomy
                  FROM projects WHERE id = ?1",
                 params![id],
                 project_from_row,
@@ -243,7 +262,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, name, path, workspace, added_at, stack, test_command, build_command, branch
+                "SELECT id, name, path, workspace, added_at, stack, test_command, build_command, branch, autonomy
                  FROM projects WHERE path = ?1",
                 params![path],
                 project_from_row,
@@ -547,6 +566,79 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Sets a project's autonomy level. Returns false if there is no such project.
+    pub fn set_project_autonomy(&self, id: &str, level: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE projects SET autonomy = ?2 WHERE id = ?1",
+            params![id, level],
+        )? > 0)
+    }
+
+    /// Counts one more human approval of `key` in `project`. Returns the new count and the
+    /// row's state ("counting", "suggested", "accepted" or "declined").
+    pub fn count_approval(&self, project: &str, key: &str, now: i64) -> Result<(i64, String)> {
+        self.conn.execute(
+            "INSERT INTO trust (project, key, approvals, updated_at) VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT (project, key) DO UPDATE SET approvals = approvals + 1, updated_at = ?3",
+            params![project, key, now],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT approvals, state FROM trust WHERE project = ?1 AND key = ?2",
+            params![project, key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// Sets a trust row's state, and the suggestion item that offered it.
+    pub fn set_trust(
+        &self,
+        project: &str,
+        key: &str,
+        state: &str,
+        item: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE trust SET state = ?3, item = COALESCE(?4, item), updated_at = ?5
+             WHERE project = ?1 AND key = ?2",
+            params![project, key, state, item, now],
+        )?;
+        Ok(())
+    }
+
+    /// The trust row a suggestion item offered: (project, key).
+    pub fn trust_of_item(&self, item: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT project, key FROM trust WHERE item = ?1",
+                params![item],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Opens a suggestion: an item for the human, tied to a project rather than a session
+    /// (its session is "-"), so agents' state changes do not close it.
+    pub fn open_suggestion(&self, project: &str, summary: &str, now: i64) -> Result<String> {
+        let id = new_attention_id(now);
+        self.conn.execute(
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
+             VALUES (?1, 'suggestion', 1, ?2, '-', ?3, 'open', ?4, ?4)",
+            params![id, project, summary, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Closes a suggestion with what the human said ("allowed" or "declined").
+    pub fn close_suggestion(&self, id: &str, answer: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attention SET status = 'answered', answer = ?2, resolved_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND kind = 'suggestion' AND status IN ('open', 'snoozed')",
+            params![id, answer, now],
+        )? > 0)
+    }
+
     /// Passes an open approval to a human: it becomes severity 3, with a note saying why.
     /// Returns false if there is no such open approval.
     pub fn escalate_approval(&self, id: &str, note: &str, now: i64) -> Result<bool> {
@@ -760,6 +852,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         test_command: row.get(6)?,
         build_command: row.get(7)?,
         branch: row.get(8)?,
+        autonomy: row.get(9)?,
     })
 }
 
@@ -786,6 +879,7 @@ mod tests {
             test_command: Some("cargo test".into()),
             build_command: None,
             branch: Some("main".into()),
+            autonomy: "guided".into(),
         }
     }
 

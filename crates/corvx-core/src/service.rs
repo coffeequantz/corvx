@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use corvx_proto::{
     codes, methods, rule_actions, AttentionAnswerParams, AttentionDismissParams, AttentionIdParams,
     AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, Project,
-    ProjectAddParams, ProjectList, ProjectRemoveParams, RuleList, RulesAddParams, RulesListParams,
-    RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
+    ProjectAddParams, ProjectAutonomyParams, ProjectList, ProjectRemoveParams, RuleList,
+    RulesAddParams, RulesListParams, RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -125,7 +125,23 @@ impl Core {
                     "attention.dismissed",
                     &json!({"id": p.id, "reason": reason}),
                 )?;
+                policy::suggestion_dismissed(&self.store, &p.id, now_secs())?;
                 Ok(json!({"ok": true}))
+            }
+            methods::PROJECT_AUTONOMY => {
+                let p: ProjectAutonomyParams = parse(params)?;
+                policy::validate_level(&p.level)
+                    .map_err(|e| ServiceError::rpc(codes::INVALID_PARAMS, e))?;
+                if !self.store.set_project_autonomy(&p.id, &p.level)? {
+                    return Err(ServiceError::rpc(
+                        codes::PROJECT_NOT_FOUND,
+                        format!("no project '{}'", p.id),
+                    ));
+                }
+                self.store
+                    .append_event("project.autonomy", &json!({"id": p.id, "level": p.level}))?;
+                let project = self.store.get_project(&p.id)?;
+                Ok(serde_json::to_value(project).expect("Project serializes"))
             }
             methods::RULES_LIST => {
                 let p: RulesListParams = parse(params)?;
@@ -299,6 +315,7 @@ impl Core {
             test_command: found.test_command,
             build_command: found.build_command,
             branch: found.branch,
+            autonomy: corvx_proto::autonomy::GUIDED.into(),
         };
         self.store.insert_project(&project)?;
         self.store.append_event(

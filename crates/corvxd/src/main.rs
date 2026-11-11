@@ -137,10 +137,12 @@ fn respond(line: &str, core: &Mutex<Core>, sessions: &Mutex<SessionManager>) -> 
     // consistent because each store call is its own transaction.
     let core = core.lock().unwrap_or_else(|p| p.into_inner());
     // Lock order is always core, then sessions.
-    // Session work, and questions (which need to know the asking session), go to the manager.
+    // Session work, and what needs to know the session asking (questions, decisions, journal
+    // entries), go to the manager.
     let result = if req.method.starts_with("session.")
         || req.method == methods::ATTENTION_ASK
         || req.method == methods::ATTENTION_DECIDE
+        || req.method == methods::PROJECT_JOURNAL
     {
         let mut mgr = sessions.lock().unwrap_or_else(|p| p.into_inner());
         mgr.handle(&core, &req.method, req.params)

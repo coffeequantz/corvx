@@ -38,6 +38,7 @@ python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no mode
 ./target/debug/corvx session resume <id>       # continue an agent interrupted by a restart
 ./target/debug/corvx session autopilot <id> on # approve its permission requests without asking
 ./target/debug/corvx orchestrate my-app "add CSV export"   # orchestrator on opus, agents on sonnet
+./target/debug/corvx project autonomy my-app autonomous   # supervised|guided|autonomous|full
 ./target/debug/corvx rules                     # what CORVX asks you, allows or denies
 ./target/debug/corvx rules set delete-recursive allow --project my-app   # ask|allow|deny|off|default
 ./target/debug/corvx rules add --command '\bterraform\s+apply\b' --reason "changes infrastructure"
@@ -47,7 +48,18 @@ python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no mode
 
 Permission requests from Claude Code agents reach the inbox as approvals. You can decide them there, or attach and answer the dialog in the session; whichever answer comes first applies. When the machine restarts, agent sessions are marked lost. Resuming one starts Claude Code again with its conversation, and resuming an orchestrator also resumes the lost agents under it.
 
-An orchestrator runs on a strong model (`--model`, default opus) and starts its agents on a cheaper one (`--agent-model`, default sonnet), picking another per task when it needs to. Its agents' permission requests go to it first. It allows, denies or escalates each one, and escalated ones reach your inbox. You see the rest there too, marked "orchestrator deciding", and can decide any of them yourself. `--approvals human` sends them all to you instead. An agent on autopilot is not asked at all, though each approval is still logged. The orchestrator can turn autopilot on for its agents (`set_autopilot`), and you can turn it on for any session (`a` in the sessions view, `A` on a request in the inbox). When an orchestrator ends, its agents' open requests come to you.
+An orchestrator runs on a strong model (`--model`, default opus) and starts its agents on a cheaper one (`--agent-model`, default sonnet), picking another per task when it needs to. Its agents' permission requests go to it first. It allows, denies or escalates each one, and escalated ones reach your inbox. You see the rest there too, marked "orchestrator deciding", and can decide any of them yourself. `--approvals human` sends them all to you instead. An agent on autopilot is not asked at all, though each approval is still logged. The orchestrator can turn autopilot on for its agents (`set_autopilot`), and you can turn it on for any session (`a` in the sessions view, `A` on a request in the inbox). When an orchestrator ends, its agents' open requests come to you. An orchestrator writes a journal entry for its mission (`.corvx/journal/<date>-<session>.md` in the project: the goal, what happened, what went wrong, what was learned), and its final report is added to it.
+
+How much agents do without asking is a dial you set per project, and can change at any time (`corvx project autonomy`, or `-`/`+` in the TUI rules view):
+
+| Level | Permission requests no rule covers | Built-in rules |
+|---|---|---|
+| `supervised` | come to you; orchestrators cannot decide them or turn on autopilot | ask you |
+| `guided` (default) | an orchestrator decides its agents' requests, and escalates what it should not decide | ask you |
+| `autonomous` | approved without asking | ask you, except discarding git work on the agent's own branch |
+| `full` | approved without asking | allow, except an agent changing CORVX's own rules |
+
+Rules you set yourself always win over the level, so "autonomous, but always ask me before `git push`" or "full, but never `sudo`" both work. And when you keep approving the same thing (three times for the same simple command, or for requests under the same rule), CORVX offers in the inbox to allow it without asking from now on; it never changes a rule by itself. An allowed command may take other arguments, but not be chained, piped or redirected.
 
 CORVX rules decide some requests themselves, whoever would otherwise decide them (the orchestrator, autopilot, or Claude Code's own settings). Each rule asks you, allows the request at once, or denies it at once, and you can change that at any time, for one project or all of them: `corvx rules set`, the rules view in the TUI (`l`; `h` ask, `y` allow, `n` deny, `o` off, `d` default, `g` switches between the selected project and every project), or `L` on a request a rule sent you, which allows that rule in its project from now on and approves the request. When several rules match, the strictest wins (deny, then ask, then allow), so a broad allow does not override a narrower ask. Built-in rules, all set to ask: `git push`, discarding git work (`reset --hard`, `clean -f`, `branch -D`), deleting directories, publishing (`npm publish`, `gh pr create`, ...), `sudo`, anything touching credentials or keys, an agent changing CORVX's own rules or approvals, and writing files outside the agent's working directory (temporary files excepted). You can add rules of your own (a regular expression on commands or paths). Every automatic approval or denial is logged. Rules match what an agent asks to run as text, so they catch the usual ways of doing these things, not an agent determined to get around them.
 

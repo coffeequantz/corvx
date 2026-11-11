@@ -29,11 +29,12 @@ use corvx_core::policy;
 use corvx_core::service::{Core, ServiceError};
 use corvx_core::store::now_secs;
 use corvx_proto::{
-    codes, methods, rule_actions, AgentState, AttentionAskParams, AttentionDecideParams,
-    AttentionItem, PermissionStatus, Session, SessionAutopilotParams, SessionHookParams,
-    SessionIdParams, SessionInputParams, SessionList, SessionOutput, SessionOutputParams,
-    SessionPermissionParams, SessionReportParams, SessionResizeParams, SessionResumeParams,
-    SessionResumed, SessionScreen, SessionScreenParams, SessionStartParams, SessionState,
+    autonomy, codes, methods, rule_actions, AgentState, AttentionAskParams, AttentionDecideParams,
+    AttentionItem, PermissionStatus, ProjectJournalParams, Session, SessionAutopilotParams,
+    SessionHookParams, SessionIdParams, SessionInputParams, SessionList, SessionOutput,
+    SessionOutputParams, SessionPermissionParams, SessionReportParams, SessionResizeParams,
+    SessionResumeParams, SessionResumed, SessionScreen, SessionScreenParams, SessionStartParams,
+    SessionState,
 };
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::de::DeserializeOwned;
@@ -455,6 +456,10 @@ impl SessionManager {
                 let p: SessionAutopilotParams = parse(params)?;
                 to_value(self.autopilot(core, &p)?)
             }
+            methods::PROJECT_JOURNAL => {
+                let p: ProjectJournalParams = parse(params)?;
+                self.journal(core, &p)
+            }
             methods::SESSION_RESUME => {
                 let p: SessionResumeParams = parse(params)?;
                 to_value(self.resume(core, &p.id)?)
@@ -493,6 +498,18 @@ impl SessionManager {
             })?,
         };
 
+        if p.autopilot
+            && p.supervisor.is_some()
+            && !policy::orchestrator_may_decide(&project.autonomy)
+        {
+            return Err(ServiceError::Rpc(
+                codes::NOT_SUPERVISOR,
+                format!(
+                    "{} is supervised: only the human can turn on autopilot",
+                    project.id
+                ),
+            ));
+        }
         if let Some(supervisor) = &p.supervisor {
             let depth = self.depth_of(supervisor)?;
             if depth >= MAX_DEPTH {
@@ -942,6 +959,13 @@ impl SessionManager {
             .and_then(|e| e.session.supervisor.as_ref())
             .and_then(|sup| self.entries.get(sup))
             .is_some_and(|sup| sup.is_running() && !sup.session.human_approves_agents);
+        let level = self
+            .entries
+            .get(&p.id)
+            .map(|e| project_level(core, &e.session.project))
+            .transpose()?
+            .unwrap_or_else(|| autonomy::GUIDED.into());
+        let orchestrator_decides = orchestrator_decides && policy::orchestrator_may_decide(&level);
         let entry = self
             .entries
             .get_mut(&p.id)
@@ -994,10 +1018,13 @@ impl SessionManager {
 
         if p.event == "PermissionRequest" {
             let summary = describe_request(&p.payload);
-            if entry.session.autopilot && rule_hit.is_none() {
+            let unasked = policy::approves_unasked(&level);
+            if (entry.session.autopilot || unasked) && rule_hit.is_none() {
                 core.store().append_event(
                     "attention.auto_approved",
-                    &json!({"session": p.id, "request": summary}),
+                    &json!({"session": p.id, "request": summary,
+                            "by": if entry.session.autopilot { "autopilot".to_string() }
+                                  else { format!("autonomy {level}") }}),
                 )?;
                 return Ok(json!({"ok": true, "decision": "allow"}));
             }
@@ -1123,6 +1150,27 @@ impl SessionManager {
                 ),
             ));
         }
+        // A suggestion: allow accepts it, deny declines it. Only the human answers them.
+        if let Some(item) = core
+            .store()
+            .get_attention(&p.id)?
+            .filter(|i| i.kind == "suggestion")
+        {
+            if p.by.is_some() || p.decision == "escalate" {
+                return Err(ServiceError::Rpc(
+                    codes::NOT_SUPERVISOR,
+                    "suggestions are the human's to answer".into(),
+                ));
+            }
+            let accept = p.decision != "deny";
+            if !policy::answer_suggestion(core.store(), &item.id, accept, now_secs())? {
+                return Err(ServiceError::Rpc(
+                    codes::ATTENTION_NOT_FOUND,
+                    format!("no open suggestion '{}'", p.id),
+                ));
+            }
+            return Ok(());
+        }
         let item = core
             .store()
             .get_attention(&p.id)?
@@ -1203,7 +1251,79 @@ impl SessionManager {
             &json!({"id": p.id, "session": item.session_id, "decision": p.decision,
                     "by": p.by.as_deref().unwrap_or("human")}),
         )?;
+        // What the human keeps approving, CORVX offers to allow without asking.
+        if p.by.is_none() && p.decision != "deny" {
+            policy::note_approval(core.store(), &item, now_secs())?;
+        }
         Ok(())
+    }
+
+    /// Appends an entry to the journal of a session's project:
+    /// `<project>/.corvx/journal/<date>-<session>.md`, one file per session.
+    fn journal(&self, core: &Core, p: &ProjectJournalParams) -> Result<Value, ServiceError> {
+        let entry = self
+            .entries
+            .get(&p.session)
+            .ok_or_else(|| not_found(&p.session))?;
+        let project = core
+            .store()
+            .get_project(&entry.session.project)?
+            .ok_or_else(|| {
+                ServiceError::Rpc(
+                    codes::PROJECT_NOT_FOUND,
+                    format!("no project '{}'", entry.session.project),
+                )
+            })?;
+        let dir = Path::new(&project.path).join(".corvx").join("journal");
+        fs::create_dir_all(&dir).map_err(|e| {
+            ServiceError::Rpc(
+                codes::INTERNAL,
+                format!("cannot create {}: {e}", dir.display()),
+            )
+        })?;
+        let started = entry.session.started_at;
+        let file = dir.join(format!("{}-{}.md", date_of(started), p.session));
+        let mut text = String::new();
+        if !file.exists() {
+            let name = entry
+                .session
+                .label
+                .clone()
+                .unwrap_or_else(|| p.session.clone());
+            text.push_str(&format!(
+                "# {name}\n\nSession {} · started {}\n",
+                p.session,
+                date_of(started)
+            ));
+        }
+        let title = p.title.as_deref().unwrap_or("Entry");
+        text.push_str(&format!(
+            "\n## {title} · {}\n\n{}\n",
+            time_of(now_secs()),
+            p.text.trim()
+        ));
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)
+            .map_err(|e| {
+                ServiceError::Rpc(
+                    codes::INTERNAL,
+                    format!("cannot write {}: {e}", file.display()),
+                )
+            })?;
+        f.write_all(text.as_bytes()).map_err(|e| {
+            ServiceError::Rpc(
+                codes::INTERNAL,
+                format!("cannot write {}: {e}", file.display()),
+            )
+        })?;
+        core.store().append_event(
+            "project.journal",
+            &json!({"session": p.session, "project": project.id, "file": file.display().to_string(),
+                    "title": title}),
+        )?;
+        Ok(json!({"file": file.display().to_string()}))
     }
 
     /// An orchestrator may only act on the sessions it supervises.
@@ -1233,6 +1353,17 @@ impl SessionManager {
     ) -> Result<Session, ServiceError> {
         if let Some(by) = &p.by {
             self.check_supervisor(&p.id, by)?;
+            let project = self
+                .entries
+                .get(&p.id)
+                .map(|e| e.session.project.clone())
+                .unwrap_or_default();
+            if p.on && !policy::orchestrator_may_decide(&project_level(core, &project)?) {
+                return Err(ServiceError::Rpc(
+                    codes::NOT_SUPERVISOR,
+                    format!("{project} is supervised: only the human can turn on autopilot"),
+                ));
+            }
         }
         let entry = self
             .entries
@@ -1854,6 +1985,45 @@ fn is_rule_hit(item: &AttentionItem) -> bool {
 
 /// How an approval's note starts when a CORVX rule sent it to the human.
 const RULE_NOTE: &str = "CORVX rule ";
+
+/// A project's autonomy level (guided if the project is gone).
+fn project_level(core: &Core, project: &str) -> Result<String, ServiceError> {
+    Ok(core
+        .store()
+        .get_project(project)?
+        .map(|p| p.autonomy)
+        .unwrap_or_else(|| autonomy::GUIDED.into()))
+}
+
+/// The UTC date of a unix time, as YYYY-MM-DD.
+fn date_of(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The UTC date and time of a unix time, as YYYY-MM-DD HH:MM UTC.
+fn time_of(secs: i64) -> String {
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02} UTC",
+        date_of(secs),
+        rem / 3600,
+        rem % 3600 / 60
+    )
+}
+
+/// Days since 1970-01-01 to a (year, month, day) date (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
 
 /// The CORVX rule a tool call matches, if any. Rules apply to the session's project; the
 /// working directory is its worktree, or the project itself.
@@ -3170,6 +3340,231 @@ mod tests {
                     && e.payload["rule"] == json!("git-push"))
         );
         stop_all(&mut f, &[&agent, &orch]);
+    }
+
+    fn set_level(f: &mut Fixture, level: &str) {
+        f.core
+            .handle(
+                methods::PROJECT_AUTONOMY,
+                json!({"id": f.project_id, "level": level}),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn autonomy_levels_move_the_dial() {
+        let mut f = fixture();
+        let orch = start(&mut f, "sleep", &["30"]);
+        let agent = start_supervised(&mut f, &orch, json!({}));
+
+        // Supervised: requests come to you, and the orchestrator cannot turn on autopilot.
+        set_level(&mut f, "supervised");
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm test"),
+        );
+        let item = reply["approval"].as_str().unwrap().to_string();
+        assert_eq!(
+            f.core
+                .store()
+                .get_attention(&item)
+                .unwrap()
+                .unwrap()
+                .severity,
+            3
+        );
+        let err = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": agent, "on": true, "by": orch}),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)),
+            "{err}"
+        );
+        let err = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::SESSION_START,
+                json!({"project": f.project_id, "command": "sleep", "args": ["30"],
+                       "supervisor": orch, "autopilot": true}),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)),
+            "{err}"
+        );
+
+        // Guided: the orchestrator decides.
+        set_level(&mut f, "guided");
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm test"),
+        );
+        let item = reply["approval"].as_str().unwrap().to_string();
+        assert_eq!(
+            f.core
+                .store()
+                .get_attention(&item)
+                .unwrap()
+                .unwrap()
+                .severity,
+            1
+        );
+
+        // Autonomous: approved without asking, except what the rules send you.
+        set_level(&mut f, "autonomous");
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm test"),
+        );
+        assert_eq!(reply["decision"], json!("allow"), "{reply}");
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("git push"),
+        );
+        assert!(reply.get("approval").is_some(), "pushes still ask: {reply}");
+        let pre = hook_reply(
+            &mut f,
+            &agent,
+            "PreToolUse",
+            bash_request("git reset --hard"),
+        );
+        assert_eq!(pre["pre"]["decision"], json!("allow"), "{pre}");
+
+        // Full: pushes too; the rules themselves still ask.
+        set_level(&mut f, "full");
+        let pre = hook_reply(&mut f, &agent, "PreToolUse", bash_request("git push"));
+        assert_eq!(pre["pre"]["decision"], json!("allow"), "{pre}");
+        let pre = hook_reply(
+            &mut f,
+            &agent,
+            "PreToolUse",
+            bash_request("corvx rules set git-push ask"),
+        );
+        assert_eq!(pre["pre"]["decision"], json!("ask"), "{pre}");
+        let err = f
+            .core
+            .handle(
+                methods::PROJECT_AUTONOMY,
+                json!({"id": f.project_id, "level": "yolo"}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(codes::INVALID_PARAMS, _)));
+        stop_all(&mut f, &[&agent, &orch]);
+    }
+
+    #[test]
+    fn what_you_keep_approving_is_offered_to_allow() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        for _ in 0..3 {
+            let reply = hook_reply(
+                &mut f,
+                &id,
+                "PermissionRequest",
+                bash_request("npm test -- --ci"),
+            );
+            let item = reply["approval"].as_str().unwrap().to_string();
+            poll(&mut f, &id, &item);
+            decide(&mut f, &item, "allow").unwrap();
+        }
+        let suggestion = open_items(&f)
+            .into_iter()
+            .find(|i| i.kind == "suggestion")
+            .expect("a suggestion after three approvals");
+        assert!(
+            suggestion.summary.contains("`npm test …` 3 times"),
+            "{}",
+            suggestion.summary
+        );
+        // An orchestrator cannot answer it; you accept it with allow.
+        let err = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::ATTENTION_DECIDE,
+                json!({"id": suggestion.id, "decision": "allow", "by": id}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)));
+        decide(&mut f, &suggestion.id, "allow").unwrap();
+        let pre = hook_reply(&mut f, &id, "PreToolUse", bash_request("npm test"));
+        assert_eq!(pre["pre"]["decision"], json!("allow"), "{pre}");
+        let pre = hook_reply(
+            &mut f,
+            &id,
+            "PreToolUse",
+            bash_request("npm test && git push"),
+        );
+        assert_eq!(
+            pre["pre"]["decision"],
+            json!("ask"),
+            "chained commands still ask: {pre}"
+        );
+        stop_all(&mut f, &[&id]);
+    }
+
+    #[test]
+    fn journal_entries_go_to_the_project() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        let reply = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::PROJECT_JOURNAL,
+                json!({"session": id, "text": "Goal: add CSV export.\nWhat happened: done.",
+                       "title": "Mission"}),
+            )
+            .unwrap();
+        f.mgr
+            .handle(
+                &f.core,
+                methods::PROJECT_JOURNAL,
+                json!({"session": id, "text": "Merged corvx/s2.", "title": "Done"}),
+            )
+            .unwrap();
+        let file = PathBuf::from(reply["file"].as_str().unwrap());
+        assert!(
+            file.starts_with(f._project_dir.path().canonicalize().unwrap())
+                || file.starts_with(f._project_dir.path()),
+            "{}",
+            file.display()
+        );
+        assert!(file.to_string_lossy().contains(".corvx/journal/"));
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(text.contains("## Mission · "), "{text}");
+        assert!(text.contains("Goal: add CSV export."), "{text}");
+        assert!(
+            text.contains("## Done · ") && text.contains("Merged corvx/s2."),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("# ").count() - text.matches("## ").count(),
+            1,
+            "one title: {text}"
+        );
+        stop_all(&mut f, &[&id]);
+    }
+
+    #[test]
+    fn dates_are_utc_calendar_dates() {
+        assert_eq!(date_of(0), "1970-01-01");
+        assert_eq!(date_of(951_782_400), "2000-02-29");
+        assert_eq!(time_of(1_794_412_999), "2026-11-11 16:03 UTC");
     }
 
     #[test]
