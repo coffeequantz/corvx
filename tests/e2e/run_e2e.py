@@ -614,6 +614,27 @@ def orchestrator_decides_approvals(h: Harness):
         h.corvx("attention", "deny", item_id(h, "approval", "not sure about this one"), "not", "now")
         wait_until(lambda: "denied by hook: not now" in output_of(h, wid), 10, "the human's denial")
 
+        # 2b. Escalated again; this time the human approves it in the terminal UI.
+        m.wait_event(lambda e: e["type"] == "agent" and e["agent"]["state"] == "waiting", "the turn to end")
+        before = output_of(h, wid).count("allowed by hook")
+        m.tool("send_message", {"id": wid, "text": "request"})
+        m.wait_event(lambda e: e["type"] == "approval", "the third request")
+        t = Term([str(CORVX)], h.env)
+        try:
+            assert t.wait_for("(1 with orchestrators)", 10), "top bar:\n" + t.text()
+            m.tool("decide_approval", {"id": wid, "decision": "escalate", "message": "you decide"})
+            assert t.wait_for("1 to approve", 10), "the escalation does not reach the top bar:\n" + t.text()
+            t.send(b"i")
+            assert t.wait_for("orchestrator: you decide", 5), "inbox:\n" + t.text()
+            assert "y approve · Y always · n deny" in t.text(), "no keys in the detail box:\n" + t.text()
+            t.send(b"y")
+            wait_until(lambda: output_of(h, wid).count("allowed by hook") > before, 10,
+                       "the approval from the terminal UI:\n" + t.text())
+            t.send(b"\x1bq")
+            t.pump(0.5)
+        finally:
+            t.close()
+
         # 3. Autopilot: no one is asked.
         m.tool("set_autopilot", {"id": wid, "on": True})
         before = output_of(h, wid).count("allowed by hook")

@@ -90,7 +90,7 @@ Optional, toggled with `p`. Shows the last few lines of one agent's output witho
    ◆ PROPOSAL  api-gateway                 convention: RFC 7807 errors (3×)  1h
    ✓ DONE      api-gateway / add-login    mission complete · review         —
 
- ▸ a approve · d deny · s snooze · Enter open · Ctrl+K palette
+ ▸ a approve · d deny · z snooze · Enter open · Ctrl+K palette
 ```
 
 Ordering rules:

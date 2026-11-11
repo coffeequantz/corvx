@@ -189,7 +189,13 @@ impl App {
         }
         let att: AttentionList =
             serde_json::from_value(self.rpc(methods::ATTENTION_LIST, json!({}))?)?;
+        // Items reorder as they change (an escalated request moves up): keep the same one selected.
+        let selected_item = self.attention.get(self.inbox_sel).map(|i| i.id.clone());
         self.attention = att.items;
+        if let Some(i) = selected_item.and_then(|id| self.attention.iter().position(|i| i.id == id))
+        {
+            self.inbox_sel = i;
+        }
         let list: SessionList =
             serde_json::from_value(self.rpc(methods::SESSION_LIST, json!({}))?)?;
         let (sessions, depths) = session_tree(list.sessions);
@@ -409,12 +415,20 @@ impl App {
         let max = self.attention.len().saturating_sub(1);
         match code {
             KeyCode::Esc | KeyCode::Char('i') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => self.inbox_sel = (self.inbox_sel + 1).min(max),
-            KeyCode::Char('k') | KeyCode::Up => self.inbox_sel = self.inbox_sel.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.inbox_sel = (self.inbox_sel + 1).min(max);
+                self.flash.clear();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.inbox_sel = self.inbox_sel.saturating_sub(1);
+                self.flash.clear();
+            }
             KeyCode::Char('a') => {
                 self.attention_action(methods::ATTENTION_ACK, json!({}), "acknowledged")
             }
-            KeyCode::Char('s') => self.attention_action(
+            // s goes to the sessions view, as it does from the main view.
+            KeyCode::Char('s') => self.open_sessions(),
+            KeyCode::Char('z') => self.attention_action(
                 methods::ATTENTION_SNOOZE,
                 json!({"minutes": 15}),
                 "snoozed for 15 minutes",
@@ -893,9 +907,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                         .into()
                 }
                 Some("question") => {
-                    "r answer · Enter attach · a ack · s snooze · x dismiss · j/k move · Esc".into()
+                    "r answer · Enter attach · a ack · z snooze · x dismiss · j/k move · Esc".into()
                 }
-                _ => "j/k move · Enter attach · a ack · s snooze · x dismiss · p project · Esc"
+                _ => "j/k move · Enter attach · a ack · z snooze · x dismiss · p project · Esc"
                     .into(),
             },
             Mode::Sessions => {
@@ -989,7 +1003,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (": or Ctrl+K", "command palette"),
         ("i", "attention inbox: what needs you"),
         ("s", "sessions: Enter attaches, Ctrl+\\ then d returns"),
-        ("  in inbox", "y approve · Y always · n deny · A autopilot"),
+        (
+            "  in inbox",
+            "y approve · Y always · n deny · A autopilot · z snooze",
+        ),
         ("  in sessions", "R resume · a autopilot on/off"),
         ("?", "this help"),
         ("q", "quit the UI (the daemon keeps running)"),
@@ -1173,6 +1190,11 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
     if orchestrators(item) {
         text.push(Line::styled(
             "Its orchestrator is deciding · you can still decide it: y / Y / n",
+            Style::default().fg(DIM),
+        ));
+    } else if item.kind == "approval" {
+        text.push(Line::styled(
+            "y approve · Y always · n deny · A autopilot · Enter attach",
             Style::default().fg(DIM),
         ));
     }
