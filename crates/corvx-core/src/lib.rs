@@ -2,10 +2,12 @@
 //!
 //! - `paths`: where CORVX keeps its data.
 //! - `scan`: L1 structure scan of a project (stack, test and build commands, branch).
+//! - `policy`: rules that send permission requests to the human, whoever would decide them.
 //! - `store`: SQLite persistence and the append-only event log.
 //! - `service`: maps protocol methods onto store operations.
 
 pub mod paths;
+pub mod policy;
 pub mod scan;
 pub mod service;
 pub mod store;

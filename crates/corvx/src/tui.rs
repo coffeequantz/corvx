@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use corvx_client::{ensure_daemon, is_connection_error, Client};
 use corvx_proto::{
-    methods, AttentionItem, AttentionList, Project, ProjectList, Session, SessionList, SessionState,
+    methods, AttentionItem, AttentionList, Project, ProjectList, Rule, RuleList, Session,
+    SessionList, SessionState,
 };
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -41,6 +42,8 @@ enum Mode {
     Answer,
     /// Typing an optional reason for denying the selected permission request.
     Deny,
+    /// CORVX's rules: what it asks you, allows or denies, for the selected project.
+    Rules,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +83,11 @@ struct App {
     /// A session to attach to. The event loop hands it the terminal.
     pending_attach: Option<String>,
     inbox_sel: usize,
+    /// The rules as they apply where the rules view sets them.
+    rules: Vec<Rule>,
+    rules_sel: usize,
+    /// The rules view sets rules for every project, not the selected one.
+    rules_everywhere: bool,
     selected: usize,
     mode: Mode,
     input: String,
@@ -152,6 +160,9 @@ impl App {
             sessions_sel: 0,
             pending_attach: None,
             inbox_sel: 0,
+            rules: Vec::new(),
+            rules_sel: 0,
+            rules_everywhere: false,
         };
         app.daemon_pid = app.client.info().map(|i| i.pid).unwrap_or(0);
         app.refresh()?;
@@ -241,6 +252,7 @@ impl App {
             Mode::Sessions => self.key_sessions(key.code),
             Mode::Answer => self.key_answer(key.code),
             Mode::Deny => self.key_deny(key.code),
+            Mode::Rules => self.key_rules(key.code),
         }
     }
 
@@ -270,6 +282,7 @@ impl App {
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('i') => self.open_inbox(),
             KeyCode::Char('s') => self.open_sessions(),
+            KeyCode::Char('l') => self.open_rules(),
             KeyCode::Char(':') => self.toggle_palette(),
             KeyCode::Esc => self.flash.clear(),
             _ => {}
@@ -323,6 +336,90 @@ impl App {
             }
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
+        }
+    }
+
+    /// The project the rules view sets rules for; None for every project.
+    fn rules_project(&self) -> Option<String> {
+        if self.rules_everywhere {
+            None
+        } else {
+            self.selected_project().map(|p| p.id.clone())
+        }
+    }
+
+    fn open_rules(&mut self) {
+        self.mode = Mode::Rules;
+        self.flash.clear();
+        self.rules_everywhere = self.selected_project().is_none();
+        let r = self.load_rules();
+        self.report(r);
+    }
+
+    fn load_rules(&mut self) -> Result<()> {
+        let list: RuleList = serde_json::from_value(self.rpc(
+            methods::RULES_LIST,
+            json!({"project": self.rules_project()}),
+        )?)?;
+        self.rules = list.rules;
+        self.rules_sel = self.rules_sel.min(self.rules.len().saturating_sub(1));
+        Ok(())
+    }
+
+    /// Sets what a rule does, where the rules view sets rules.
+    fn set_rule(&mut self, id: &str, project: Option<String>, action: &str) -> bool {
+        let r = self.rpc(
+            methods::RULES_SET,
+            json!({"id": id, "project": project, "action": action}),
+        );
+        if self.report(r).is_none() {
+            return false;
+        }
+        let scope = project
+            .map(|p| format!("in {p}"))
+            .unwrap_or_else(|| "everywhere".into());
+        self.flash = format!("{id}: {action} {scope}");
+        true
+    }
+
+    fn key_rules(&mut self, code: KeyCode) {
+        let max = self.rules.len().saturating_sub(1);
+        let action = match code {
+            KeyCode::Esc | KeyCode::Char('l') => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.rules_sel = (self.rules_sel + 1).min(max);
+                self.flash.clear();
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.rules_sel = self.rules_sel.saturating_sub(1);
+                self.flash.clear();
+                return;
+            }
+            KeyCode::Char('g') => {
+                if self.selected_project().is_some() {
+                    self.rules_everywhere = !self.rules_everywhere;
+                }
+                let r = self.load_rules();
+                self.report(r);
+                return;
+            }
+            KeyCode::Char('h') => "ask",
+            KeyCode::Char('y') => "allow",
+            KeyCode::Char('n') => "deny",
+            KeyCode::Char('o') => "off",
+            KeyCode::Char('d') => "default",
+            _ => return,
+        };
+        let Some(rule) = self.rules.get(self.rules_sel).cloned() else {
+            return;
+        };
+        if self.set_rule(&rule.id, self.rules_project(), action) {
+            let r = self.load_rules();
+            self.report(r);
         }
     }
 
@@ -461,9 +558,37 @@ impl App {
                 Some(_) => self.flash = "only permission requests take y / n".into(),
                 None => {}
             },
+            // A CORVX rule sent this to you: allow that rule from now on in this project.
+            KeyCode::Char('L') => {
+                let Some(item) = self.attention.get(self.inbox_sel).cloned() else {
+                    return;
+                };
+                let Some(rule) = rule_of(&item) else {
+                    self.flash = "L is for requests a CORVX rule sent you".into();
+                    return;
+                };
+                if self.set_rule(&rule, Some(item.project.clone()), "allow") {
+                    let flash = self.flash.clone();
+                    self.attention_action(
+                        methods::ATTENTION_DECIDE,
+                        json!({"decision": "allow"}),
+                        "approved",
+                    );
+                    self.flash = format!("approved · {flash} from now on");
+                }
+            }
             // Approve this request and every later one from the same agent.
             KeyCode::Char('A') => match self.attention.get(self.inbox_sel).cloned() {
-                Some(item) if item.kind == "approval" => self.set_autopilot(&item.session_id, true),
+                Some(item) if item.kind == "approval" => {
+                    // You approve this one yourself: autopilot does not decide a request a
+                    // CORVX rule sent to you.
+                    self.attention_action(
+                        methods::ATTENTION_DECIDE,
+                        json!({"decision": "allow"}),
+                        "approved",
+                    );
+                    self.set_autopilot(&item.session_id, true)
+                }
                 Some(_) => self.flash = "A is for permission requests".into(),
                 None => {}
             },
@@ -694,6 +819,7 @@ fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Inbox | Mode::Answer | Mode::Deny => draw_inbox(f, main, app),
         Mode::Sessions => draw_sessions(f, main, app),
+        Mode::Rules => draw_rules(f, main, app),
         _ => draw_main(f, main, app),
     }
     draw_status(f, status, app);
@@ -889,6 +1015,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Sessions => ("SESSIONS", ACCENT),
         Mode::Answer => ("ANSWER", GREEN),
         Mode::Deny => ("DENY", RED),
+        Mode::Rules => ("RULES", ACCENT),
     };
     let hint = if !app.flash.is_empty() {
         app.flash.clone()
@@ -918,6 +1045,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             }
             Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
             Mode::Deny => "why, or what to do instead (optional) · Enter deny · Esc cancel".into(),
+            Mode::Rules => "h ask · y allow · n deny · o off · d default · g this project/everywhere · Esc"
+                .into(),
         }
     };
     let line = Line::from(vec![
@@ -993,7 +1122,7 @@ fn draw_palette(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 66, 16);
+    let rect = centered(area, 66, 17);
     f.render_widget(Clear, rect);
     let rows = [
         ("j / k, ↑ ↓", "move selection"),
@@ -1008,6 +1137,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "y approve · Y always · n deny · A autopilot · z snooze",
         ),
         ("  in sessions", "R resume · a autopilot on/off"),
+        ("l", "rules: what CORVX asks you, allows or denies"),
         ("?", "this help"),
         ("q", "quit the UI (the daemon keeps running)"),
         ("", ""),
@@ -1192,6 +1322,14 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
             "Its orchestrator is deciding · you can still decide it: y / Y / n",
             Style::default().fg(DIM),
         ));
+    } else if let Some(rule) = rule_of(item) {
+        text.push(Line::styled(
+            format!(
+                "y approve · n deny · L allow {rule} in {} from now on · Enter attach",
+                item.project
+            ),
+            Style::default().fg(DIM),
+        ));
     } else if item.kind == "approval" {
         text.push(Line::styled(
             "y approve · Y always · n deny · A autopilot · Enter attach",
@@ -1315,6 +1453,79 @@ fn session_lines(app: &App, project: &str) -> Vec<Line<'static>> {
 }
 
 /// Every session the daemon manages. Enter attaches to the selected one.
+/// The CORVX rule that sent an approval to the human, from its note ("CORVX rule <id>: ...").
+fn rule_of(item: &AttentionItem) -> Option<String> {
+    let rest = item.note.as_deref()?.strip_prefix("CORVX rule ")?;
+    rest.split(':').next().map(str::to_string)
+}
+
+fn action_style(action: &str) -> Style {
+    match action {
+        "allow" => Style::default().fg(GREEN),
+        "deny" => Style::default().fg(RED),
+        "ask" => Style::default().fg(AMBER),
+        _ => Style::default().fg(DIM),
+    }
+}
+
+fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
+    let scope = app
+        .rules_project()
+        .map(|p| format!("for {p}"))
+        .unwrap_or_else(|| "for every project".into());
+    let block = Block::bordered()
+        .title(format!(" rules {scope} "))
+        .border_style(Style::default().fg(BORDER));
+    let mut lines = vec![
+        Line::styled(
+            "Applied to every agent's tool calls, whoever would decide them: ask = you decide,",
+            Style::default().fg(DIM),
+        ),
+        Line::styled(
+            "allow = approved at once, deny = refused at once. The strictest match wins.",
+            Style::default().fg(DIM),
+        ),
+        Line::from(""),
+    ];
+    for (i, r) in app.rules.iter().enumerate() {
+        let selected = i == app.rules_sel;
+        let marker_style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let set_in = match r.set_in.as_str() {
+            "project" => "this project",
+            "everywhere" => "everywhere",
+            _ => "",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "▸ " } else { "  " }, marker_style),
+            Span::raw(format!("{:<18}", r.id)),
+            Span::styled(format!("{:<7}", r.action), action_style(&r.action)),
+            Span::styled(format!("{set_in:<13}"), Style::default().fg(DIM)),
+            Span::raw(r.reason.clone()),
+        ]));
+    }
+    if let Some(r) = app
+        .rules
+        .get(app.rules_sel)
+        .filter(|r| !r.pattern.is_empty())
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("{} /{}/", r.kind, r.pattern),
+            Style::default().fg(DIM),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let running = app
         .sessions

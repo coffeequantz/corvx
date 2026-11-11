@@ -7,13 +7,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use corvx_proto::{
-    codes, methods, AttentionAnswerParams, AttentionDismissParams, AttentionIdParams,
+    codes, methods, rule_actions, AttentionAnswerParams, AttentionDismissParams, AttentionIdParams,
     AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, Project,
-    ProjectAddParams, ProjectList, ProjectRemoveParams, PROTOCOL_VERSION,
+    ProjectAddParams, ProjectList, ProjectRemoveParams, RuleList, RulesAddParams, RulesListParams,
+    RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use crate::policy;
 use crate::scan::scan;
 use crate::store::{now_secs, Store, StoreError};
 
@@ -125,10 +127,110 @@ impl Core {
                 )?;
                 Ok(json!({"ok": true}))
             }
+            methods::RULES_LIST => {
+                let p: RulesListParams = parse(params)?;
+                let rules = policy::rules_for(&self.store, p.project.as_deref())?;
+                Ok(serde_json::to_value(RuleList { rules }).expect("RuleList serializes"))
+            }
+            methods::RULES_ADD => {
+                let p: RulesAddParams = parse(params)?;
+                policy::validate(&p.kind, &p.pattern)
+                    .map_err(|e| ServiceError::rpc(codes::RULE_INVALID, e))?;
+                if p.reason.trim().is_empty() {
+                    return Err(ServiceError::rpc(
+                        codes::RULE_INVALID,
+                        "a rule needs a reason: the inbox shows it",
+                    ));
+                }
+                if p.action == rule_actions::OFF {
+                    return Err(ServiceError::rpc(
+                        codes::RULE_INVALID,
+                        "a new rule asks, allows or denies",
+                    ));
+                }
+                policy::validate_action(&p.action)
+                    .map_err(|e| ServiceError::rpc(codes::RULE_INVALID, e))?;
+                if let Some(project) = &p.project {
+                    self.project_must_exist(project)?;
+                }
+                let id = self.store.add_rule(
+                    p.project.as_deref(),
+                    &p.kind,
+                    &p.pattern,
+                    p.reason.trim(),
+                    &p.action,
+                    now_secs(),
+                )?;
+                self.store.append_event(
+                    "rules.added",
+                    &json!({"id": id, "project": p.project, "kind": p.kind,
+                            "pattern": p.pattern, "reason": p.reason, "action": p.action}),
+                )?;
+                Ok(json!({"id": id}))
+            }
+            methods::RULES_REMOVE => {
+                let p: RulesRemoveParams = parse(params)?;
+                if policy::is_builtin(&p.id) {
+                    return Err(ServiceError::rpc(
+                        codes::RULE_INVALID,
+                        format!("'{}' is built in: set it to off instead", p.id),
+                    ));
+                }
+                if !self.store.remove_rule(&p.id)? {
+                    return Err(ServiceError::rpc(
+                        codes::RULE_NOT_FOUND,
+                        format!("no rule '{}'", p.id),
+                    ));
+                }
+                self.store
+                    .append_event("rules.removed", &json!({"id": p.id}))?;
+                Ok(json!({"ok": true}))
+            }
+            methods::RULES_SET => {
+                let p: RulesSetParams = parse(params)?;
+                let known = policy::is_builtin(&p.id)
+                    || self.store.added_rules()?.iter().any(|r| r.id == p.id);
+                if !known {
+                    return Err(ServiceError::rpc(
+                        codes::RULE_NOT_FOUND,
+                        format!("no rule '{}'", p.id),
+                    ));
+                }
+                let action = match p.action.as_str() {
+                    "default" => None,
+                    a => {
+                        policy::validate_action(a).map_err(|e| {
+                            ServiceError::rpc(codes::RULE_INVALID, format!("{e}, or default"))
+                        })?;
+                        Some(a)
+                    }
+                };
+                if let Some(project) = &p.project {
+                    self.project_must_exist(project)?;
+                }
+                self.store
+                    .set_rule_action(&p.id, p.project.as_deref().unwrap_or(""), action)?;
+                self.store.append_event(
+                    "rules.set",
+                    &json!({"id": p.id, "project": p.project, "action": p.action}),
+                )?;
+                Ok(json!({"ok": true}))
+            }
             other => Err(ServiceError::rpc(
                 codes::METHOD_NOT_FOUND,
                 format!("unknown method: {other}"),
             )),
+        }
+    }
+
+    fn project_must_exist(&self, id: &str) -> Result<(), ServiceError> {
+        if self.store.list_projects()?.iter().any(|p| p.id == id) {
+            Ok(())
+        } else {
+            Err(ServiceError::rpc(
+                codes::PROJECT_NOT_FOUND,
+                format!("no project '{id}'"),
+            ))
         }
     }
 

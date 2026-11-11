@@ -301,7 +301,10 @@ impl Server {
                 let item = self.approval_of(&id)?;
                 if item.severity >= 3 {
                     return Err(anyhow!(
-                        "this request is the human's to decide (escalated, or your agents' approvals go to the human); wait for it"
+                        "this request is the human's to decide ({}); wait for it",
+                        item.note
+                            .as_deref()
+                            .unwrap_or("escalated, or your agents' approvals go to the human")
                     ));
                 }
                 let params = AttentionDecideParams {

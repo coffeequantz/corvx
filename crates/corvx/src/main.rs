@@ -73,6 +73,65 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Rules that send an agent's permission request to you, even when its orchestrator or
+    /// autopilot would decide it. Lists them when given no subcommand.
+    Rules {
+        #[command(subcommand)]
+        command: Option<RulesCommand>,
+        /// Show the rules as they apply to this project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesCommand {
+    /// Add a rule for requests matching a regular expression.
+    Add {
+        /// Match shell commands.
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        command: Option<String>,
+        /// Match the paths file tools use (and shell commands that mention them).
+        #[arg(long)]
+        path: Option<String>,
+        /// What it is about, as the inbox shows it.
+        #[arg(long)]
+        reason: String,
+        /// What happens to a matching request.
+        #[arg(long, value_enum, default_value_t = RuleAction::Ask)]
+        action: RuleAction,
+        /// Only for this project (default: every project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Set what a rule does: ask (you decide), allow (approved at once), deny (refused at
+    /// once), off, or default (drop this setting).
+    Set {
+        id: String,
+        #[arg(value_enum)]
+        action: RuleSetting,
+        /// Only for this project (default: every project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Remove a rule you added.
+    Remove { id: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RuleAction {
+    Ask,
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RuleSetting {
+    Ask,
+    Allow,
+    Deny,
+    Off,
+    Default,
 }
 
 #[derive(Subcommand)]
@@ -240,6 +299,7 @@ fn run() -> Result<()> {
         Command::Project { command } => project(command, &data_dir),
         Command::Session { command } => session(command, &data_dir),
         Command::Attention { command } => attention(command, &data_dir),
+        Command::Rules { command, project } => rules(command, project, &data_dir),
         Command::Orchestrate {
             project,
             goal,
@@ -255,6 +315,117 @@ fn run() -> Result<()> {
             &data_dir,
         ),
         Command::Mcp => unreachable!("handled above"),
+    }
+}
+
+fn rules(
+    command: Option<RulesCommand>,
+    project: Option<String>,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    use corvx_proto::{
+        methods, RuleList, RulesAddParams, RulesListParams, RulesRemoveParams, RulesSetParams,
+    };
+    let mut client = connect(data_dir)?;
+    match command {
+        None => {
+            let params = RulesListParams {
+                project: project.clone(),
+            };
+            let list: RuleList = client.call(methods::RULES_LIST, &params)?;
+            println!(
+                "CORVX applies these rules to agents' tool calls, whoever would decide them{}.",
+                project
+                    .as_deref()
+                    .map(|p| format!(" (as set for {p})"))
+                    .unwrap_or_default()
+            );
+            println!("ask: you decide · allow: approved at once · deny: refused at once");
+            for r in &list.rules {
+                let set = match r.set_in.as_str() {
+                    "project" => "this project",
+                    "everywhere" => "everywhere",
+                    _ => "",
+                };
+                let scope = match &r.project {
+                    Some(p) => format!("only {p}"),
+                    None if r.builtin => "built in".into(),
+                    None => "added".into(),
+                };
+                println!(
+                    "  {:<18} {:<6} {:<12} {:<12} {}",
+                    r.id, r.action, set, scope, r.reason
+                );
+                if !r.pattern.is_empty() {
+                    println!(
+                        "  {:<18} {:<6} {:<12} {:<12} {} /{}/",
+                        "", "", "", "", r.kind, r.pattern
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(RulesCommand::Add {
+            command,
+            path,
+            reason,
+            action,
+            project,
+        }) => {
+            let (kind, pattern) = match (command, path) {
+                (Some(c), _) => ("command", c),
+                (None, Some(p)) => ("path", p),
+                (None, None) => unreachable!("clap requires one"),
+            };
+            let action = match action {
+                RuleAction::Ask => "ask",
+                RuleAction::Allow => "allow",
+                RuleAction::Deny => "deny",
+            };
+            let params = RulesAddParams {
+                project,
+                kind: kind.into(),
+                pattern,
+                reason,
+                action: action.into(),
+            };
+            let reply: serde_json::Value = client.call(methods::RULES_ADD, &params)?;
+            println!(
+                "added rule {} ({action})",
+                reply["id"].as_str().unwrap_or("?")
+            );
+            Ok(())
+        }
+        Some(RulesCommand::Set {
+            id,
+            action,
+            project,
+        }) => {
+            let action = match action {
+                RuleSetting::Ask => "ask",
+                RuleSetting::Allow => "allow",
+                RuleSetting::Deny => "deny",
+                RuleSetting::Off => "off",
+                RuleSetting::Default => "default",
+            };
+            let params = RulesSetParams {
+                id: id.clone(),
+                project: project.clone(),
+                action: action.into(),
+            };
+            let _: serde_json::Value = client.call(methods::RULES_SET, &params)?;
+            let scope = project
+                .map(|p| format!("in {p}"))
+                .unwrap_or_else(|| "everywhere".into());
+            println!("rule {id}: {action} {scope}");
+            Ok(())
+        }
+        Some(RulesCommand::Remove { id }) => {
+            let params = RulesRemoveParams { id: id.clone() };
+            let _: serde_json::Value = client.call(methods::RULES_REMOVE, &params)?;
+            println!("removed rule {id}");
+            Ok(())
+        }
     }
 }
 
@@ -508,13 +679,44 @@ fn forward_hook(data_dir: &std::path::Path, session_id: &str) {
     };
     let reply: Result<serde_json::Value> = client.call(methods::SESSION_HOOK, &params);
     let reply = reply.ok();
-    // Autopilot: the daemon decided at once.
+    // Before a tool runs, a CORVX rule decided: ask (Claude Code must ask even if its settings
+    // allow the call; the permission request that follows comes back here and goes to the
+    // human), allow, or deny.
+    if let Some(pre) = reply.as_ref().and_then(|r| r.get("pre")) {
+        let decision = pre
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ask");
+        let reason = pre
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("CORVX rule");
+        let reason = if decision == "ask" {
+            format!("{reason} · decided in the CORVX inbox")
+        } else {
+            reason.to_string()
+        };
+        println!(
+            "{}",
+            json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": decision,
+                "permissionDecisionReason": reason,
+            }})
+        );
+        return;
+    }
+    // Decided at once: by autopilot, or by a CORVX rule.
     if let Some(decision) = reply
         .as_ref()
         .and_then(|r| r.get("decision"))
         .and_then(|v| v.as_str())
     {
-        println!("{}", permission_output(decision, None, &payload));
+        let message = reply
+            .as_ref()
+            .and_then(|r| r.get("message"))
+            .and_then(|v| v.as_str());
+        println!("{}", permission_output(decision, message, &payload));
         return;
     }
     // A permission request: wait for a decision from the inbox, then hand it to Claude Code.
@@ -1014,7 +1216,11 @@ the project's declared dependencies, git commands on its own branch. Deny (with 
 instead) what does not belong to its task. Escalate to the human anything destructive or irreversible, anything \
 outside the project, touching credentials or secrets, pushing or publishing, or that you are unsure about. \
 When an agent's work is routine and confined to its worktree, you may set_autopilot so it stops asking; \
-turn it off if it drifts.".to_string()
+turn it off if it drifts. CORVX rules decide some requests whatever you or autopilot would: \
+by default pushing, discarding work, deleting directories, publishing, sudo, credentials and writing outside \
+the agent's worktree go to the human, and the human may set rules to allow or deny requests at once. \
+wait_for reports requests sent to the human with decider \"human\" and the rule in note; wait for those, \
+or plan work that does not need them. A request a rule denies fails with the rule's reason: do it another way.".to_string()
     };
     format!("{ORCHESTRATOR_PROMPT}\n\n{models}\n\n{approvals}")
 }

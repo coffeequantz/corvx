@@ -23,7 +23,7 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE projects (
@@ -60,6 +60,27 @@ const SCHEMA_V7: &str = "
 ALTER TABLE sessions ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sessions ADD COLUMN agent_model TEXT;
 ALTER TABLE sessions ADD COLUMN human_approves_agents INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Version 8: rules CORVX applies to agents' tool calls. `rules` holds the ones a human
+/// added; `rule_settings` what a rule does in a project ('' for every project), overriding
+/// its own action.
+const SCHEMA_V8: &str = "
+CREATE TABLE rules (
+    id         TEXT PRIMARY KEY,
+    project    TEXT,
+    kind       TEXT NOT NULL,
+    pattern    TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    action     TEXT NOT NULL DEFAULT 'ask',
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE rule_settings (
+    rule    TEXT NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    action  TEXT NOT NULL,
+    PRIMARY KEY (rule, project)
+);
 ";
 
 /// Version 5: readable session labels.
@@ -162,6 +183,9 @@ impl Store {
         }
         if version < 7 {
             conn.execute_batch(SCHEMA_V7)?;
+        }
+        if version < 8 {
+            conn.execute_batch(SCHEMA_V8)?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -401,6 +425,7 @@ impl Store {
         project: &str,
         summary: &str,
         severity: u8,
+        note: Option<&str>,
         now: i64,
     ) -> Result<String> {
         self.conn.execute(
@@ -411,9 +436,9 @@ impl Store {
         )?;
         let id = new_attention_id(now);
         self.conn.execute(
-            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
-             VALUES (?1, 'approval', ?6, ?2, ?3, ?4, 'open', ?5, ?5)",
-            params![id, project, session_id, summary, now, severity],
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at, note)
+             VALUES (?1, 'approval', ?6, ?2, ?3, ?4, 'open', ?5, ?5, ?7)",
+            params![id, project, session_id, summary, now, severity, note],
         )?;
         Ok(id)
     }
@@ -439,6 +464,87 @@ impl Store {
                 attention_from_row,
             )
             .optional()?)
+    }
+
+    /// Adds a rule; returns its id (`r1`, `r2`, ...).
+    pub fn add_rule(
+        &self,
+        project: Option<&str>,
+        kind: &str,
+        pattern: &str,
+        reason: &str,
+        action: &str,
+        now: i64,
+    ) -> Result<String> {
+        let n: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(rowid), 0) + 1 FROM rules", [], |r| {
+                    r.get(0)
+                })?;
+        let id = format!("r{n}");
+        self.conn.execute(
+            "INSERT INTO rules (id, project, kind, pattern, reason, action, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, project, kind, pattern, reason, action, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Removes a rule a human added, with its settings. Returns false if there is none.
+    pub fn remove_rule(&self, id: &str) -> Result<bool> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM rules WHERE id = ?1", params![id])?
+            > 0;
+        if removed {
+            self.conn
+                .execute("DELETE FROM rule_settings WHERE rule = ?1", params![id])?;
+        }
+        Ok(removed)
+    }
+
+    /// The rules humans added, oldest first, with their own actions.
+    pub fn added_rules(&self) -> Result<Vec<corvx_proto::Rule>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project, kind, pattern, reason, action FROM rules ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(corvx_proto::Rule {
+                id: r.get(0)?,
+                project: r.get(1)?,
+                kind: r.get(2)?,
+                pattern: r.get(3)?,
+                reason: r.get(4)?,
+                action: r.get(5)?,
+                builtin: false,
+                set_in: "default".into(),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Sets what a rule does in a project ('' for every project); None drops the setting.
+    pub fn set_rule_action(&self, rule: &str, project: &str, action: Option<&str>) -> Result<()> {
+        match action {
+            Some(a) => self.conn.execute(
+                "INSERT OR REPLACE INTO rule_settings (rule, project, action) VALUES (?1, ?2, ?3)",
+                params![rule, project, a],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM rule_settings WHERE rule = ?1 AND project = ?2",
+                params![rule, project],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Every rule setting: (rule, project, action), project '' meaning every project.
+    pub fn rule_settings(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rule, project, action FROM rule_settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Passes an open approval to a human: it becomes severity 3, with a note saying why.
@@ -964,7 +1070,7 @@ mod approval_tests {
             .set_session_attention("s1", "app", "waiting", "", 1, 5)
             .unwrap();
         let id = store
-            .open_approval("s1", "app", "Bash: npm test", 3, 10)
+            .open_approval("s1", "app", "Bash: npm test", 3, None, 10)
             .unwrap();
         let open = store.list_attention(false, 11).unwrap();
         assert_eq!(open.len(), 1, "the waiting item is resolved: {open:?}");
@@ -989,8 +1095,12 @@ mod approval_tests {
     #[test]
     fn a_new_request_supersedes_the_old_one_and_moving_on_resolves_it() {
         let store = Store::open_in_memory().unwrap();
-        let first = store.open_approval("s1", "app", "Bash: a", 3, 10).unwrap();
-        let second = store.open_approval("s1", "app", "Bash: b", 3, 11).unwrap();
+        let first = store
+            .open_approval("s1", "app", "Bash: a", 3, None, 10)
+            .unwrap();
+        let second = store
+            .open_approval("s1", "app", "Bash: b", 3, None, 11)
+            .unwrap();
         assert_eq!(store.approval_state(&first).unwrap().unwrap().0, "resolved");
         store
             .set_session_attention("s1", "app", "working", "", 0, 12)
@@ -1005,7 +1115,7 @@ mod approval_tests {
     fn an_orchestrators_approval_can_be_escalated_to_the_human() {
         let store = Store::open_in_memory().unwrap();
         let id = store
-            .open_approval("s1", "app", "Bash: rm -rf build", 1, 10)
+            .open_approval("s1", "app", "Bash: rm -rf build", 1, None, 10)
             .unwrap();
         let item = store.open_approval_for("s1").unwrap().unwrap();
         assert_eq!((item.id.as_str(), item.severity), (id.as_str(), 1));

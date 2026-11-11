@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -140,9 +141,24 @@ class Term:
     def close(self):
         try:
             os.kill(self.pid, signal.SIGKILL)
-            os.waitpid(self.pid, 0)
-        except (ProcessLookupError, ChildProcessError):
+        except ProcessLookupError:
             pass
+        # On macOS a killed process waits for its terminal output to be read before it exits:
+        # closing our end discards it.
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        try:
+            os.waitpid(self.pid, 0)
+        except ChildProcessError:
+            pass
+
+    def key(self, *keys: bytes):
+        """Sends keys one at a time, so Esc followed by a key is not read as Alt+key."""
+        for k in keys:
+            self.send(k)
+            self.pump(0.3)
 
 
 class SkipTest(Exception):
@@ -630,7 +646,7 @@ def orchestrator_decides_approvals(h: Harness):
             t.send(b"y")
             wait_until(lambda: output_of(h, wid).count("allowed by hook") > before, 10,
                        "the approval from the terminal UI:\n" + t.text())
-            t.send(b"\x1bq")
+            t.key(b"\x1b", b"q")
             t.pump(0.5)
         finally:
             t.close()
@@ -647,10 +663,88 @@ def orchestrator_decides_approvals(h: Harness):
         m.close()
 
 
+def rules_reach_the_human(h: Harness):
+    """CORVX's rules ask the human, allow or deny, whoever would decide; set per project."""
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    time.sleep(1.0)
+    h.corvx("session", "autopilot", sid, "on")
+    out = lambda: output_of(h, sid).replace("\r", "")
+    allowed = lambda: out().count("allowed by hook")
+    request = lambda cmd: h.corvx("session", "input", sid, f"request {cmd}", "--enter")
+
+    # A built-in rule asks you: autopilot does not decide a push.
+    request("git push origin main")
+    wait_until(lambda: "pre-tool: ask (CORVX rule git-push" in out(), 10,
+               "the PreToolUse hook to make Claude ask")
+    wait_until(lambda: item_id(h, "approval", "CORVX rule git-push: pushes to a remote") is not None,
+               10, "the push to reach the inbox:\n" + h.attention_text())
+    assert allowed() == 0, out()
+    h.corvx("attention", "approve", item_id(h, "approval", "git push"))
+    wait_until(lambda: allowed() == 1, 10, "the human's approval")
+
+    # Off for this project: autopilot approves it.
+    h.corvx("rules", "set", "git-push", "off", "--project", "e2e")
+    assert re.search(r"git-push\s+off\s+this project", h.corvx("rules", "--project", "e2e"))
+    request("git push origin main")
+    wait_until(lambda: allowed() == 2, 10, "autopilot to approve once the rule is off")
+
+    # Allow and deny decide at once, with autopilot off, before Claude Code would ask.
+    h.corvx("session", "autopilot", sid, "off")
+    h.corvx("rules", "set", "git-push", "allow", "--project", "e2e")
+    request("git push origin main")
+    wait_until(lambda: "allowed before asking" in out(), 10, "the allow rule")
+    h.corvx("rules", "set", "sudo", "deny")  # everywhere
+    request("sudo make install")
+    wait_until(lambda: "denied before asking: CORVX rule sudo: runs as root" in out(), 10,
+               "the deny rule")
+    assert re.search(r"sudo\s+deny\s+everywhere", h.corvx("rules", "--project", "e2e"))
+    h.corvx("rules", "set", "sudo", "default")
+    h.corvx("rules", "set", "git-push", "default", "--project", "e2e")
+    assert re.search(r"git-push\s+ask", h.corvx("rules", "--project", "e2e"))
+
+    # A rule of your own.
+    added = h.corvx("rules", "add", "--command", r"\bterraform\s+apply\b",
+                    "--reason", "changes infrastructure", "--project", "e2e")
+    rule = re.search(r"added rule (\S+)", added).group(1)
+    request("terraform apply -auto-approve")
+    wait_until(lambda: item_id(h, "approval", f"CORVX rule {rule}: changes infrastructure") is not None,
+               10, "your rule to send it to you:\n" + h.attention_text())
+    h.corvx("attention", "deny", item_id(h, "approval", "terraform"), "not", "today")
+    wait_until(lambda: "denied by hook: not today" in out(), 10, "the denial")
+
+    # In the terminal UI: L on such a request allows its rule in the project and approves it;
+    # the rules view changes rules too.
+    t = Term([str(CORVX)], h.env)
+    try:
+        before = allowed()
+        request("terraform apply")
+        wait_until(lambda: item_id(h, "approval", "terraform") is not None, 10, "the request")
+        t.send(b"i")
+        assert t.wait_for(f"L allow {rule} in e2e from now on", 5), "inbox:\n" + t.text()
+        t.send(b"L")
+        wait_until(lambda: allowed() > before, 10, "L to approve it:\n" + t.text())
+        assert re.search(rf"{rule}\s+allow\s+this project", h.corvx("rules", "--project", "e2e"))
+        t.key(b"\x1b", b"l")
+        assert t.wait_for("rules for e2e", 5), "rules view:\n" + t.text()
+        t.send(b"n")  # the first rule, git-push: deny in this project
+        wait_until(lambda: re.search(r"git-push\s+deny\s+this project",
+                                     h.corvx("rules", "--project", "e2e")), 5, "n in the rules view")
+        t.send(b"d")
+        wait_until(lambda: re.search(r"git-push\s+ask", h.corvx("rules", "--project", "e2e")), 5,
+                   "d in the rules view")
+        t.key(b"\x1b", b"q")
+        t.pump(0.5)
+    finally:
+        t.close()
+    h.corvx("rules", "remove", rule)
+    assert rule not in h.corvx("rules")
+
+
 SCENARIOS = [
     attach_and_detach_pty,
     orchestration_through_mcp,
     orchestrator_decides_approvals,
+    rules_reach_the_human,
     attach_from_the_terminal_ui,
     attach_and_detach_tmux,
     sessions_survive_a_daemon_restart,

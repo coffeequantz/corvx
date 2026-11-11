@@ -9,8 +9,11 @@ Prompts, typed or given as the first argument:
 
   work   a turn that finishes            (UserPromptSubmit, PreToolUse, Stop)
   ask    asks permission                  (Notification); the next line answers it
-  request  asks permission the way Claude Code 2 does: runs the PermissionRequest hook and
-         waits for its decision, while the next line typed answers it "in the session"
+  request [command]  asks permission the way Claude Code 2 does: runs the PreToolUse hook
+         (printing "pre-tool: <decision>" when a CORVX rule decides; allow runs the tool and deny
+         refuses it without asking), then the PermissionRequest
+         hook, and waits for its decision, while the next line typed answers it "in the
+         session". The command defaults to "make test".
   exit   quits with status 3
 
 With --resume <id> it prints "resumed conversation <id>" first.
@@ -45,7 +48,8 @@ permission_cmd = hooks.get("PermissionRequest", [{"hooks": [{}]}])[0]["hooks"][0
 
 def hook(event, **fields):
     payload = {"hook_event_name": event, "session_id": "fake-claude", **fields}
-    subprocess.run(hook_cmd, shell=True, input=json.dumps(payload).encode())
+    return subprocess.run(hook_cmd, shell=True, input=json.dumps(payload).encode(),
+                          capture_output=True).stdout.decode().strip()
 
 
 pending = False
@@ -66,11 +70,11 @@ def finish_tool(how):
     hook("Stop")
 
 
-def ask_hook():
+def ask_hook(command):
     """Runs the PermissionRequest hook, as Claude Code does, and acts on its decision."""
     payload = {"hook_event_name": "PermissionRequest", "session_id": "fake-claude",
                "tool_name": "Bash",
-               "tool_input": {"command": "make test", "description": "Run the tests"},
+               "tool_input": {"command": command, "description": "Run the tests"},
                "permission_suggestions": SUGGESTIONS}
     out = subprocess.run(permission_cmd, shell=True, input=json.dumps(payload).encode(),
                          capture_output=True).stdout.decode().strip()
@@ -94,11 +98,24 @@ def handle(text):
     global pending
     if request_open.is_set():
         finish_tool("permission granted in session")
-    elif text == "request":
-        hook("UserPromptSubmit", prompt="request")
-        hook("PreToolUse", tool_name="Bash")
+    elif text == "request" or text.startswith("request "):
+        command = text[len("request"):].strip() or "make test"
+        hook("UserPromptSubmit", prompt=text)
+        out = hook("PreToolUse", tool_name="Bash", tool_input={"command": command})
+        if out:
+            decision = json.loads(out)["hookSpecificOutput"]
+            verdict, reason = decision["permissionDecision"], decision["permissionDecisionReason"]
+            print(f"pre-tool: {verdict} ({reason})", flush=True)
+            # As Claude Code does: allow runs the tool without asking, deny refuses it.
+            if verdict == "allow":
+                finish_tool("allowed before asking")
+                return
+            if verdict == "deny":
+                print(f"denied before asking: {reason}", flush=True)
+                hook("Stop")
+                return
         request_open.set()
-        threading.Thread(target=ask_hook, daemon=True).start()
+        threading.Thread(target=ask_hook, args=(command,), daemon=True).start()
         print("permission dialog shown", flush=True)
         # Claude Code also notifies when its dialog has waited a few seconds.
         hook("Notification", notification_type="permission_prompt",

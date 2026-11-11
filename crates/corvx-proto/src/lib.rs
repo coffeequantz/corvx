@@ -41,6 +41,14 @@ pub mod methods {
     pub const ATTENTION_DECIDE: &str = "attention.decide";
     /// Turns a session's autopilot on or off: CORVX approves its permission requests itself.
     pub const SESSION_AUTOPILOT: &str = "session.autopilot";
+    /// The rules that send a permission request to the human, whoever would decide it.
+    pub const RULES_LIST: &str = "rules.list";
+    /// Adds a rule of your own, for one project or everywhere.
+    pub const RULES_ADD: &str = "rules.add";
+    /// Removes a rule you added.
+    pub const RULES_REMOVE: &str = "rules.remove";
+    /// Sets what a rule does (ask, allow, deny, off), for one project or everywhere.
+    pub const RULES_SET: &str = "rules.set";
 }
 
 /// Error codes. JSON-RPC reserved range plus CORVX codes from 1000.
@@ -66,6 +74,9 @@ pub mod codes {
     pub const NOT_RESUMABLE: i64 = 1011;
     /// An orchestrator acted on a session it does not supervise.
     pub const NOT_SUPERVISOR: i64 = 1012;
+    pub const RULE_NOT_FOUND: i64 = 1013;
+    /// A rule's pattern is not a valid regular expression, or its kind is unknown.
+    pub const RULE_INVALID: i64 = 1014;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -289,6 +300,95 @@ pub struct SessionAutopilotParams {
     pub by: Option<String>,
 }
 
+/// A rule CORVX applies to an agent's tool calls, whoever would otherwise decide them (its
+/// orchestrator, autopilot, or Claude Code's own settings).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Rule {
+    pub id: String,
+    /// "command": a regular expression on shell commands. "path": a regular expression on the
+    /// paths file tools use, and on shell commands. "outside": writes outside the agent's
+    /// working directory (no pattern).
+    pub kind: String,
+    #[serde(default)]
+    pub pattern: String,
+    /// What it is about, as shown in the inbox.
+    pub reason: String,
+    /// Built into CORVX (can be set to off, not removed).
+    #[serde(default)]
+    pub builtin: bool,
+    /// The project a rule you added applies to; None for every project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// What happens to a matching request (for the project asked about, if any): one of
+    /// `rule_actions`.
+    #[serde(default = "ask")]
+    pub action: String,
+    /// Where the action comes from: "project" (set for this project), "everywhere" (set for
+    /// every project), or "default" (the rule's own).
+    #[serde(default)]
+    pub set_in: String,
+}
+
+/// What a rule does with a matching request.
+pub mod rule_actions {
+    /// The human decides it.
+    pub const ASK: &str = "ask";
+    /// Approved at once, without asking anyone; logged.
+    pub const ALLOW: &str = "allow";
+    /// Refused at once; the agent is told the rule's reason.
+    pub const DENY: &str = "deny";
+    /// The rule does not apply.
+    pub const OFF: &str = "off";
+    pub const ALL: &[&str] = &[ASK, ALLOW, DENY, OFF];
+}
+
+fn ask() -> String {
+    rule_actions::ASK.into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RuleList {
+    pub rules: Vec<Rule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RulesListParams {
+    /// Show the rules as they apply to this project. None: as set for every project, with
+    /// every rule you added.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RulesAddParams {
+    /// None for every project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// "command" or "path".
+    pub kind: String,
+    pub pattern: String,
+    pub reason: String,
+    /// "ask" (default), "allow" or "deny".
+    #[serde(default = "ask")]
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RulesRemoveParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RulesSetParams {
+    pub id: String,
+    /// None for every project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// One of `rule_actions`, or "default" to drop this setting (a project then follows
+    /// the setting for every project, and that follows the rule's own).
+    pub action: String,
+}
+
 /// A question from an agent to a human. It appears in the inbox until answered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AttentionAskParams {
@@ -444,7 +544,7 @@ pub struct AttentionItem {
     /// For questions: the answer, once given. For approvals: the decision.
     #[serde(default)]
     pub answer: Option<String>,
-    /// For an escalated approval: why the orchestrator passed it to you.
+    /// For an approval that needs you: why (the orchestrator escalated it, or a rule matched).
     #[serde(default)]
     pub note: Option<String>,
 }

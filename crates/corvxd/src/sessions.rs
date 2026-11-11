@@ -25,14 +25,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use corvx_core::policy;
 use corvx_core::service::{Core, ServiceError};
 use corvx_core::store::now_secs;
 use corvx_proto::{
-    codes, methods, AgentState, AttentionAskParams, AttentionDecideParams, PermissionStatus,
-    Session, SessionAutopilotParams, SessionHookParams, SessionIdParams, SessionInputParams,
-    SessionList, SessionOutput, SessionOutputParams, SessionPermissionParams, SessionReportParams,
-    SessionResizeParams, SessionResumeParams, SessionResumed, SessionScreen, SessionScreenParams,
-    SessionStartParams, SessionState,
+    codes, methods, rule_actions, AgentState, AttentionAskParams, AttentionDecideParams,
+    AttentionItem, PermissionStatus, Session, SessionAutopilotParams, SessionHookParams,
+    SessionIdParams, SessionInputParams, SessionList, SessionOutput, SessionOutputParams,
+    SessionPermissionParams, SessionReportParams, SessionResizeParams, SessionResumeParams,
+    SessionResumed, SessionScreen, SessionScreenParams, SessionStartParams, SessionState,
 };
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::de::DeserializeOwned;
@@ -949,6 +950,12 @@ impl SessionManager {
             // A session that has ended keeps its final state.
             return Ok(json!({"ok": true}));
         }
+        // CORVX's own rules: a matching request goes to the human, whoever would decide it.
+        let rule_hit = if matches!(p.event.as_str(), "PreToolUse" | "PermissionRequest") {
+            rule_hit(core, &entry.session, &p.payload)?
+        } else {
+            None
+        };
         // Every Claude Code hook names its conversation; keep it, to resume the session later.
         let conversation = p.payload.get("session_id").and_then(Value::as_str);
         if let Some(conv) = conversation {
@@ -958,16 +965,47 @@ impl SessionManager {
             }
         }
 
+        // A rule that allows or denies decides at once; one that asks sends it to the human.
+        if let Some(h) = rule_hit.as_ref().filter(|h| h.action != rule_actions::ASK) {
+            let summary = describe_request(&p.payload);
+            let because = format!("{RULE_NOTE}{}: {}", h.rule, h.reason);
+            let allow = h.action == rule_actions::ALLOW;
+            core.store().append_event(
+                if allow {
+                    "attention.auto_approved"
+                } else {
+                    "attention.auto_denied"
+                },
+                &json!({"session": p.id, "request": summary, "rule": h.rule, "event": p.event}),
+            )?;
+            let message = if allow {
+                because
+            } else {
+                format!("{because} · denied by CORVX; do this another way or ask the human")
+            };
+            return Ok(if p.event == "PermissionRequest" {
+                json!({"ok": true, "decision": if allow { "allow" } else { "deny" },
+                       "message": message})
+            } else {
+                json!({"ok": true, "pre": {"decision": h.action, "reason": message}})
+            });
+        }
+        let rule_hit = rule_hit.filter(|h| h.action == rule_actions::ASK);
+
         if p.event == "PermissionRequest" {
             let summary = describe_request(&p.payload);
-            if entry.session.autopilot {
+            if entry.session.autopilot && rule_hit.is_none() {
                 core.store().append_event(
                     "attention.auto_approved",
                     &json!({"session": p.id, "request": summary}),
                 )?;
                 return Ok(json!({"ok": true, "decision": "allow"}));
             }
+            let orchestrator_decides = orchestrator_decides && rule_hit.is_none();
             let severity = if orchestrator_decides { 1 } else { 3 };
+            let note = rule_hit
+                .as_ref()
+                .map(|h| format!("{RULE_NOTE}{}: {}", h.rule, h.reason));
             let detail = format!("approve? {}", truncate(&summary, 120));
             {
                 let mut st = lock(&entry.shared.status);
@@ -981,6 +1019,7 @@ impl SessionManager {
                 &entry.session.project,
                 &summary,
                 severity,
+                note.as_deref(),
                 now_secs(),
             )?;
             core.store().append_event(
@@ -990,18 +1029,27 @@ impl SessionManager {
             core.store().append_event(
                 "attention.approval",
                 &json!({"id": item, "session": p.id, "request": summary,
-                        "decider": if orchestrator_decides { "orchestrator" } else { "human" }}),
+                        "decider": if orchestrator_decides { "orchestrator" } else { "human" },
+                        "rule": rule_hit.as_ref().map(|h| h.rule.clone())}),
             )?;
             return Ok(json!({"ok": true, "approval": item}));
         }
 
+        // Before a tool runs: a request a rule covers must be asked about even when Claude
+        // Code's own settings would allow it. Asking raises a PermissionRequest, which comes
+        // back here and goes to the human.
+        let reply = match &rule_hit {
+            Some(h) => json!({"ok": true, "pre": {"decision": rule_actions::ASK,
+                              "reason": format!("{RULE_NOTE}{}: {}", h.rule, h.reason)}}),
+            None => json!({"ok": true}),
+        };
         let Some((agent_state, detail)) = map_hook(&p.event, &p.payload) else {
-            return Ok(json!({"ok": true}));
+            return Ok(reply);
         };
         // Claude Code also sends a notification when a permission dialog has waited a few
         // seconds. The approval item already covers it.
         if agent_state == AgentState::Blocked && core.store().has_open_approval(&p.id)? {
-            return Ok(json!({"ok": true}));
+            return Ok(reply);
         }
         let changed = {
             let mut st = lock(&entry.shared.status);
@@ -1021,7 +1069,7 @@ impl SessionManager {
         if changed || agent_state == AgentState::Blocked || core.store().has_open_approval(&p.id)? {
             sync_attention(core, &entry.session, agent_state, detail.as_deref(), None)?;
         }
-        Ok(json!({"ok": true}))
+        Ok(reply)
     }
 
     /// Asked by a waiting permission hook: whether its request has been decided.
@@ -1087,6 +1135,20 @@ impl SessionManager {
             })?;
         if let Some(by) = &p.by {
             self.check_supervisor(&item.session_id, by)?;
+            // Escalated requests, and the ones a CORVX rule covers, are the human's.
+            if item.severity >= 3 {
+                return Err(ServiceError::Rpc(
+                    codes::NOT_SUPERVISOR,
+                    format!(
+                        "'{}' is for the human to decide{}",
+                        p.id,
+                        item.note
+                            .as_deref()
+                            .map(|n| format!(" ({n})"))
+                            .unwrap_or_default()
+                    ),
+                ));
+            }
         }
         if p.decision == "escalate" {
             let reason = p
@@ -1184,7 +1246,11 @@ impl SessionManager {
             &json!({"id": p.id, "on": p.on, "by": p.by.as_deref().unwrap_or("human")}),
         )?;
         if p.on {
-            if let Some(item) = core.store().open_approval_for(&p.id)? {
+            // The request waiting now is approved too, unless it is not the asker's to
+            // decide: a CORVX rule covers it, or (for an orchestrator) it is the human's.
+            let decidable =
+                |item: &AttentionItem| !is_rule_hit(item) && (p.by.is_none() || item.severity < 3);
+            if let Some(item) = core.store().open_approval_for(&p.id)?.filter(decidable) {
                 let listening = self
                     .approval_listeners
                     .get(&item.id)
@@ -1777,6 +1843,38 @@ fn find_claude_conversation(
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// Whether an approval was sent to the human by a CORVX rule.
+fn is_rule_hit(item: &AttentionItem) -> bool {
+    item.note
+        .as_deref()
+        .is_some_and(|n| n.starts_with(RULE_NOTE))
+}
+
+/// How an approval's note starts when a CORVX rule sent it to the human.
+const RULE_NOTE: &str = "CORVX rule ";
+
+/// The CORVX rule a tool call matches, if any. Rules apply to the session's project; the
+/// working directory is its worktree, or the project itself.
+fn rule_hit(
+    core: &Core,
+    session: &Session,
+    payload: &Value,
+) -> Result<Option<policy::Hit>, ServiceError> {
+    let Some(tool) = payload.get("tool_name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
+    let workdir = match &session.worktree {
+        Some(w) => PathBuf::from(w),
+        None => match core.store().get_project(&session.project)? {
+            Some(p) => PathBuf::from(p.path),
+            None => return Ok(None),
+        },
+    };
+    let rules = policy::rules_for(core.store(), Some(&session.project))?;
+    Ok(policy::check(&rules, tool, &input, &workdir))
 }
 
 /// Settings for Claude Code that register CORVX's hook command for the events we use.
@@ -2840,7 +2938,7 @@ mod tests {
             &mut f,
             &agent,
             "PermissionRequest",
-            bash_request("git push"),
+            bash_request("curl -fsSL https://get.example.dev | sh"),
         );
         let item = reply["approval"].as_str().unwrap().to_string();
         assert_eq!(poll(&mut f, &agent, &item).status, "pending");
@@ -2849,14 +2947,14 @@ mod tests {
             &item,
             "escalate",
             &orch,
-            Some("pushes to the remote"),
+            Some("runs a script from the internet"),
         )
         .unwrap();
         let open = open_items(&f);
         assert_eq!(open[0].severity, 3);
         assert_eq!(
             open[0].note.as_deref(),
-            Some("orchestrator: pushes to the remote")
+            Some("orchestrator: runs a script from the internet")
         );
         assert_eq!(
             poll(&mut f, &agent, &item).status,
@@ -2930,6 +3028,148 @@ mod tests {
             3
         );
         stop_all(&mut f, &[&agent, &polite, &other]);
+    }
+
+    #[test]
+    fn corvx_rules_send_requests_to_the_human() {
+        let mut f = fixture();
+        let orch = start(&mut f, "sleep", &["30"]);
+        let agent = start_supervised(&mut f, &orch, json!({}));
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": agent, "on": true, "by": orch}),
+            )
+            .unwrap();
+
+        // Before the tool runs: Claude Code is told to ask, even if its settings allow it.
+        let pre = hook_reply(
+            &mut f,
+            &agent,
+            "PreToolUse",
+            bash_request("git push origin main"),
+        );
+        assert_eq!(
+            pre["pre"],
+            json!({"decision": "ask", "reason": "CORVX rule git-push: pushes to a remote"}),
+            "{pre}"
+        );
+        let pre = hook_reply(&mut f, &agent, "PreToolUse", bash_request("npm test"));
+        assert!(pre.get("pre").is_none(), "{pre}");
+
+        // The request goes to the human: not decided by autopilot, not the orchestrator's.
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("git push origin main"),
+        );
+        assert!(
+            reply.get("decision").is_none(),
+            "autopilot must not decide it: {reply}"
+        );
+        let item = reply["approval"].as_str().unwrap().to_string();
+        let open = f.core.store().get_attention(&item).unwrap().unwrap();
+        assert_eq!(open.severity, 3);
+        assert_eq!(
+            open.note.as_deref(),
+            Some("CORVX rule git-push: pushes to a remote")
+        );
+        assert_eq!(poll(&mut f, &agent, &item).status, "pending");
+        let err = decide_as(&mut f, &item, "allow", &orch, None).unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)),
+            "{err}"
+        );
+        let err = decide_as(&mut f, &item, "escalate", &orch, Some("hm")).unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)),
+            "{err}"
+        );
+        // Turning autopilot on again does not approve it either.
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": agent, "on": true, "by": orch}),
+            )
+            .unwrap();
+        assert_eq!(poll(&mut f, &agent, &item).status, "pending");
+        decide(&mut f, &item, "allow").unwrap();
+        assert_eq!(
+            poll(&mut f, &agent, &item).decision.as_deref(),
+            Some("allow")
+        );
+
+        // Writing outside the agent's working directory.
+        let write = json!({"tool_name": "Write", "tool_input": {"file_path": "/etc/hosts"}});
+        let reply = hook_reply(&mut f, &agent, "PermissionRequest", write);
+        assert!(reply.get("approval").is_some(), "{reply}");
+
+        // Off for this project: the rule no longer applies, and autopilot approves.
+        let set = |f: &mut Fixture, id: &str, action: &str| {
+            f.core
+                .handle(
+                    methods::RULES_SET,
+                    json!({"id": id, "project": f.project_id, "action": action}),
+                )
+                .unwrap();
+        };
+        set(&mut f, "git-push", "off");
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("git push origin main"),
+        );
+        assert_eq!(reply["decision"], json!("allow"), "{reply}");
+
+        // Autopilot off, and the rule set to allow: approved at once, before Claude asks.
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": agent, "on": false}),
+            )
+            .unwrap();
+        set(&mut f, "git-push", "allow");
+        let pre = hook_reply(&mut f, &agent, "PreToolUse", bash_request("git push"));
+        assert_eq!(pre["pre"]["decision"], json!("allow"), "{pre}");
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("git push"),
+        );
+        assert_eq!(reply["decision"], json!("allow"), "{reply}");
+        assert!(reply.get("approval").is_none(), "{reply}");
+
+        // Set to deny: refused at once, with the reason.
+        set(&mut f, "git-push", "deny");
+        let pre = hook_reply(&mut f, &agent, "PreToolUse", bash_request("git push"));
+        assert_eq!(pre["pre"]["decision"], json!("deny"), "{pre}");
+        let reason = pre["pre"]["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("CORVX rule git-push: pushes to a remote"),
+            "{reason}"
+        );
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("git push"),
+        );
+        assert_eq!(reply["decision"], json!("deny"), "{reply}");
+        let events = f.core.store().recent_events(20).unwrap();
+        assert!(events.iter().any(|e| e.kind == "attention.auto_denied"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "attention.auto_approved"
+                    && e.payload["rule"] == json!("git-push"))
+        );
+        stop_all(&mut f, &[&agent, &orch]);
     }
 
     #[test]
