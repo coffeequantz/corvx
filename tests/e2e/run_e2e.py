@@ -10,6 +10,7 @@ and removes everything it created when it finishes. Your real CORVX data is not 
 Agents are the stand-in in fake_claude.py, so no model is called.
 """
 import fcntl
+import json
 import os
 import pty
 import select
@@ -90,11 +91,19 @@ class Harness:
         shutil.rmtree(self.base, ignore_errors=True)
 
 
+class _Screen(pyte.Screen):
+    """pyte's screen, tolerant of the private status queries tmux sends (e.g. CSI ? 6 n)."""
+
+    def report_device_status(self, mode, private=False, **kwargs):
+        if not private:
+            super().report_device_status(mode)
+
+
 class Term:
     """A program running in a pseudo-terminal, with its screen read by a terminal emulator."""
 
     def __init__(self, argv, env, cols=110, rows=30):
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = _Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.raw = b""
         self.pid, self.fd = pty.fork()
@@ -248,17 +257,19 @@ def inbox_in_the_terminal_ui(h: Harness):
 
 
 def real_claude_attention(h: Harness):
-    """Real Claude: a permission request is blocked in the queue, approving it finishes the turn.
+    """Real Claude: a permission request becomes an approval item; approving it from the inbox
+    (not in the session) lets the action happen and finishes the turn.
 
     Uses your Claude account for one short prompt. Opt in with CORVX_E2E_REAL_CLAUDE=1.
     """
     if os.environ.get("CORVX_E2E_REAL_CLAUDE") != "1":
         raise SkipTest("set CORVX_E2E_REAL_CLAUDE=1 to run against real Claude (uses your account)")
     # Manual permission mode, so the request below always asks, whatever your own defaults are.
-    sid = h.start(runtime="claude", command=["claude", "--permission-mode", "manual"])
+    sid = h.start(runtime="claude", command=["claude", "--permission-mode", "manual", "--model", "haiku"])
     t = Term([str(CORVX), "session", "attach", sid], h.env)
     try:
-        assert t.wait_for("attached to", 15), "attach did not start"
+        # Both backends show the detach hint: the native attach prints it, tmux's status bar shows it.
+        assert t.wait_for("then d to detach", 15), "attach did not start"
         # First run in a new folder: Claude asks whether to trust it. "Yes" is the second option.
         if t.wait_for("trust this folder", 60):
             # Let the question finish drawing, then move to "Yes" and confirm the highlight
@@ -277,11 +288,12 @@ def real_claude_attention(h: Harness):
 
         t.send(b"create a file named corvx_probe.txt containing the word ok\r")
         assert t.wait_for("Do you want to", 180), "Claude did not ask permission. Screen was:\n" + t.text()
-        wait_until(lambda: item_for_session(h, sid, "blocked"), 30, "blocked item for the permission request")
-        assert "Claude needs your permission" in h.attention_text(), h.attention_text()
-
-        t.send(b"\r")  # approve the default option
-        wait_until(lambda: not item_for_session(h, sid, "blocked"), 60, "blocked item to clear after approval")
+        wait_until(lambda: item_for_session(h, sid, "approval"), 30, "approval item for the permission request")
+        t.pump(8.0)  # past Claude's own reminder notification, which must not replace the item
+        assert item_for_session(h, sid, "approval"), h.attention_text()
+        approval = next(l.split()[0] for l in h.attention_text().splitlines() if " approval " in l)
+        h.corvx("attention", "approve", approval)  # from the inbox, not the session
+        wait_until(lambda: not item_for_session(h, sid, "approval"), 60, "approval item to close")
         wait_until(lambda: item_for_session(h, sid, "waiting"), 240, "waiting item once the turn finishes")
         assert (h.project / "corvx_probe.txt").exists(), "the approved action did not happen"
 
@@ -295,6 +307,98 @@ def real_claude_attention(h: Harness):
     finally:
         t.close()
         h.corvx("session", "stop", sid, check=False)
+
+
+def output_of(h: Harness, sid: str):
+    return h.corvx("session", "output", sid)
+
+
+def approvals_from_the_inbox(h: Harness):
+    """A permission request becomes an approval item; approving or denying it reaches the agent."""
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    time.sleep(1.0)
+    h.corvx("session", "input", sid, "request", "--enter")
+    wait_until(lambda: item_id(h, "approval", "Bash: make test") is not None, 10, "approval item")
+    time.sleep(1.0)
+    # Claude's own reminder does not add a second item.
+    assert not item_for_session(h, sid, "blocked"), h.attention_text()
+    h.corvx("attention", "approve", item_id(h, "approval", "Bash: make test"))
+    wait_until(lambda: "allowed by hook" in output_of(h, sid), 10, "the agent to get the approval")
+    wait_until(lambda: item_for_session(h, sid, "waiting"), 10, "waiting item after the turn")
+
+    h.corvx("session", "input", sid, "request", "--enter")
+    wait_until(lambda: item_id(h, "approval", "Bash: make test") is not None, 10, "second approval item")
+    h.corvx("attention", "deny", item_id(h, "approval", "Bash: make test"), "use", "the", "Makefile")
+    wait_until(lambda: "denied by hook: use the Makefile" in output_of(h, sid), 10, "the denial and its reason")
+
+
+def answering_in_the_session_clears_the_approval(h: Harness):
+    """The dialog stays usable: answering in the session closes the item and ends the wait."""
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    time.sleep(1.0)
+    h.corvx("session", "input", sid, "request", "--enter")
+    wait_until(lambda: item_id(h, "approval", "make test") is not None, 10, "approval item")
+    h.corvx("session", "input", sid, "yes", "--enter")
+    wait_until(lambda: "permission granted in session" in output_of(h, sid), 10, "the in-session answer")
+    wait_until(lambda: item_id(h, "approval", "make test") is None, 10, "the approval item to close")
+    wait_until(lambda: "hook returned after the dialog was answered" in output_of(h, sid), 10,
+               "the waiting hook to return")
+
+
+def approve_in_the_terminal_ui(h: Harness):
+    """In the inbox, y approves; Y approves and passes Claude's own 'don't ask again' rules."""
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    time.sleep(1.0)
+    t = Term([str(CORVX)], h.env)
+    try:
+        for key, expected in ((b"y", "allowed by hook\n"), (b"Y", "allowed by hook with 1 rule(s)")):
+            h.corvx("session", "input", sid, "request", "--enter")
+            wait_until(lambda: item_id(h, "approval", "make test") is not None, 10, "approval item")
+            assert t.wait_for("1 to approve", 10), "top bar does not count the approval:\n" + t.text()
+            t.send(b"i")
+            assert t.wait_for("asks to run", 5), "inbox does not show the request:\n" + t.text()
+            assert "y approve" in t.text(), t.text()
+            t.send(key)
+            wait_until(lambda: expected in output_of(h, sid).replace("\r", ""), 10, f"{key!r} to reach the agent")
+            t.send(b"\x1b")
+            wait_until(lambda: item_id(h, "approval", "make test") is None, 10, "item to close")
+        t.send(b"q")
+        t.pump(0.5)
+    finally:
+        t.close()
+
+
+def resume_after_a_restart(h: Harness):
+    """tmux vanishing (a reboot) leaves the agent lost; resuming continues its conversation."""
+    if not tmux_available():
+        raise SkipTest("tmux is not installed")
+    sid = h.start(runtime="claude", backend="tmux", command=[str(FAKE_CLAUDE), "--model", "haiku", "work"])
+    wait_until(lambda: item_for_session(h, sid, "waiting"), 10, "the first turn")
+    # What a reboot does to the agents: their tmux server is gone.
+    subprocess.run(["tmux", "-S", str(h.home / "tmux.sock"), "kill-server"], capture_output=True)
+    wait_until(lambda: " lost " in h.session_line(sid), 10, "the session to be marked lost")
+    assert not item_for_session(h, sid, "waiting"), "a lost session's items are cleared"
+
+    t = Term([str(CORVX)], h.env)
+    try:
+        assert t.wait_for("interrupted session", 10), "the TUI does not mention the lost session:\n" + t.text()
+        t.send(b"s")
+        assert t.wait_for("R resume", 5), t.text()
+        for _ in range(40):  # ended sessions are listed last, in start order: ours is the last
+            t.send(b"j")
+        t.pump(0.5)
+        selected = next((l for l in t.text().splitlines() if f"▸ " in l.split("││")[-1]), "")
+        assert sid in selected and "lost" in selected, "the lost session is not selected:\n" + t.text()
+        t.send(b"R")
+        assert t.wait_for("resumed", 10), "no confirmation:\n" + t.text()
+        t.send(b"q")
+        t.pump(0.5)
+    finally:
+        t.close()
+    wait_until(lambda: "running" in h.session_line(sid), 10, "the session to run again")
+    wait_until(lambda: "resumed conversation fake-claude" in output_of(h, sid), 10, "--resume with the conversation")
+    h.corvx("session", "input", sid, "work", "--enter")
+    wait_until(lambda: item_for_session(h, sid, "waiting"), 10, "hooks to work after resuming")
 
 
 def tmux_available():
@@ -369,8 +473,163 @@ def attach_from_the_terminal_ui(h: Harness):
         t.close()
 
 
+class Mcp:
+    """`corvx mcp` over stdio, driven the way Claude Code drives an MCP server."""
+
+    def __init__(self, env):
+        self.proc = subprocess.Popen([str(CORVX), "mcp"], env=env, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, text=True)
+        self.next_id = 1
+
+    def request(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params or {}}
+        self.next_id += 1
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        reply = json.loads(self.proc.stdout.readline())
+        if "error" in reply:
+            raise AssertionError(f"{method}: {reply['error']}")
+        return reply["result"]
+
+    def notify(self, method):
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method}) + "\n")
+        self.proc.stdin.flush()
+
+    def tool(self, name, args=None):
+        result = self.request("tools/call", {"name": name, "arguments": args or {}})
+        text = result["content"][0]["text"]
+        if result.get("isError"):
+            raise AssertionError(f"{name} failed: {text}")
+        return json.loads(text)
+
+    def wait_event(self, matches, what, attempts=4):
+        """Calls wait_for until an event satisfies `matches`."""
+        for _ in range(attempts):
+            for ev in self.tool("wait_for", {"timeout_seconds": 20})["events"]:
+                if matches(ev):
+                    return ev
+        raise AssertionError(f"wait_for never reported {what}")
+
+    def close(self):
+        self.proc.stdin.close()
+        self.proc.wait(timeout=10)
+
+
+def orchestration_through_mcp(h: Harness):
+    """An orchestrator's MCP tools: delegate into a worktree, wait, route attention, ask the human."""
+    git = lambda *a: subprocess.run(["git", "-C", str(h.project), "-c", "user.name=e2e",
+                                     "-c", "user.email=e2e@e2e", *a], check=True, capture_output=True)
+    if not (h.project / ".git").exists():
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-q", "-m", "init")
+
+    orch = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])  # stands in for the orchestrator
+    env = {**h.env, "CORVX_SESSION_ID": orch, "CORVX_AGENT_COMMAND": str(FAKE_CLAUDE)}
+    m = Mcp(env)
+    try:
+        init = m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                        "clientInfo": {"name": "e2e", "version": "0"}})
+        assert init["serverInfo"]["name"] == "corvx"
+        m.notify("notifications/initialized")
+        names = {t["name"] for t in m.request("tools/list")["tools"]}
+        expected = {"list_projects", "start_agent", "list_agents", "read_screen", "send_message",
+                    "wait_for", "stop_agent", "ask_human", "report_done"}
+        assert expected <= names, names
+
+        started = m.tool("start_agent", {"project": "e2e", "prompt": "work"})
+        wid = started["id"]
+        h.sessions.append(wid)
+        assert started["worktree"] and Path(started["worktree"]).is_dir(), started
+
+        ev = m.wait_event(lambda e: e["type"] == "agent" and e["agent"]["id"] == wid, "the worker's first turn")
+        assert ev["agent"]["state"] == "waiting", ev
+        assert not item_for_session(h, wid, "waiting"), "a supervised agent's waiting must not reach the inbox"
+
+        m.tool("send_message", {"id": wid, "text": "ask"})
+        ev = m.wait_event(lambda e: e["type"] == "agent" and e["agent"]["state"] == "blocked", "the permission request")
+        assert item_for_session(h, wid, "blocked"), "permission requests must still reach the human"
+
+        m.tool("send_message", {"id": wid, "text": "yes"})
+        m.wait_event(lambda e: e["type"] == "agent" and e["agent"]["state"] == "waiting", "the worker to finish")
+
+        qid = m.tool("ask_human", {"question": "Which accent colour?"})["question_id"]
+        assert item_id(h, "question", "Which accent colour?") == qid
+        h.corvx("attention", "answer", qid, "electric", "blue")
+        ev = m.wait_event(lambda e: e["type"] == "answer", "the human's answer")
+        assert ev["answer"] == "electric blue", ev
+
+        screen = m.tool("read_screen", {"id": wid})["screen"]
+        assert "permission granted" in screen, screen
+        assert any(a["id"] == wid for a in m.tool("list_agents"))
+
+        m.tool("report_done", {"summary": "worker finished on its branch"})
+        assert item_for_session(h, orch, "done"), "the orchestrator's report should reach the human"
+        m.tool("stop_agent", {"id": wid})
+    finally:
+        m.close()
+
+
+def orchestrator_decides_approvals(h: Harness):
+    """An orchestrator decides its agents' permission requests, escalates one, and uses autopilot."""
+    git = lambda *a: subprocess.run(["git", "-C", str(h.project), "-c", "user.name=e2e",
+                                     "-c", "user.email=e2e@e2e", *a], check=True, capture_output=True)
+    if not (h.project / ".git").exists():
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-q", "-m", "init")
+
+    orch = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    env = {**h.env, "CORVX_SESSION_ID": orch, "CORVX_AGENT_COMMAND": str(FAKE_CLAUDE)}
+    m = Mcp(env)
+    try:
+        m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "e2e", "version": "0"}})
+        m.notify("notifications/initialized")
+        names = {t["name"] for t in m.request("tools/list")["tools"]}
+        assert {"decide_approval", "set_autopilot"} <= names, names
+
+        started = m.tool("start_agent", {"project": "e2e", "name": "worker", "prompt": "work"})
+        wid = started["id"]
+        h.sessions.append(wid)
+        assert started["model"] == "sonnet", started  # cheaper model by default
+        m.wait_event(lambda e: e["type"] == "agent" and e["agent"]["id"] == wid, "the worker's first turn")
+
+        # 1. The orchestrator approves.
+        m.tool("send_message", {"id": wid, "text": "request"})
+        ev = m.wait_event(lambda e: e["type"] == "approval", "the permission request")
+        assert ev["decider"] == "you" and ev["request"].startswith("Bash: make test"), ev
+        assert ev["agent"]["model"] == "sonnet", ev
+        assert "(orchestrator deciding) Bash: make test" in h.attention_text(), h.attention_text()
+        m.tool("decide_approval", {"id": wid, "decision": "allow"})
+        wait_until(lambda: "allowed by hook" in output_of(h, wid), 10, "the orchestrator's approval")
+        m.wait_event(lambda e: e["type"] == "agent" and e["agent"]["state"] == "waiting", "the turn to end")
+
+        # 2. It escalates; the human decides.
+        m.tool("send_message", {"id": wid, "text": "request"})
+        m.wait_event(lambda e: e["type"] == "approval", "the second request")
+        m.tool("decide_approval", {"id": wid, "decision": "escalate", "message": "not sure about this one"})
+        wait_until(lambda: item_id(h, "approval", "orchestrator: not sure about this one") is not None,
+                   10, "the escalated item")
+        h.corvx("attention", "deny", item_id(h, "approval", "not sure about this one"), "not", "now")
+        wait_until(lambda: "denied by hook: not now" in output_of(h, wid), 10, "the human's denial")
+
+        # 3. Autopilot: no one is asked.
+        m.tool("set_autopilot", {"id": wid, "on": True})
+        before = output_of(h, wid).count("allowed by hook")
+        m.tool("send_message", {"id": wid, "text": "request"})
+        wait_until(lambda: output_of(h, wid).count("allowed by hook") > before, 10, "autopilot's approval")
+        assert item_id(h, "approval", "Bash: make test") is None, h.attention_text()
+        assert "[autopilot]" in h.corvx("session", "list")
+        m.tool("stop_agent", {"id": wid})
+    finally:
+        m.close()
+
+
 SCENARIOS = [
     attach_and_detach_pty,
+    orchestration_through_mcp,
+    orchestrator_decides_approvals,
     attach_from_the_terminal_ui,
     attach_and_detach_tmux,
     sessions_survive_a_daemon_restart,
@@ -378,6 +637,10 @@ SCENARIOS = [
     agent_states_reach_the_queue,
     failed_exit_raises_an_item,
     inbox_in_the_terminal_ui,
+    approvals_from_the_inbox,
+    answering_in_the_session_clears_the_approval,
+    approve_in_the_terminal_ui,
+    resume_after_a_restart,
     real_claude_attention,
 ]
 

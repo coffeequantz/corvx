@@ -7,9 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use corvx_proto::{
-    codes, methods, AttentionDismissParams, AttentionIdParams, AttentionList, AttentionListParams,
-    AttentionSnoozeParams, DaemonInfo, Project, ProjectAddParams, ProjectList, ProjectRemoveParams,
-    PROTOCOL_VERSION,
+    codes, methods, AttentionAnswerParams, AttentionDismissParams, AttentionIdParams,
+    AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, Project,
+    ProjectAddParams, ProjectList, ProjectRemoveParams, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -89,6 +89,28 @@ impl Core {
                     &json!({"id": p.id, "minutes": p.minutes}),
                 )?;
                 Ok(json!({"snoozed_until": until}))
+            }
+            methods::ATTENTION_ANSWER => {
+                let p: AttentionAnswerParams = parse(params)?;
+                if !self.store.answer_question(&p.id, &p.answer, now_secs())? {
+                    return Err(ServiceError::rpc(
+                        codes::ATTENTION_NOT_FOUND,
+                        format!("no open question '{}'", p.id),
+                    ));
+                }
+                self.store
+                    .append_event("attention.answered", &json!({"id": p.id}))?;
+                Ok(json!({"ok": true}))
+            }
+            methods::ATTENTION_GET => {
+                let p: AttentionIdParams = parse(params)?;
+                let item = self.store.get_attention(&p.id)?.ok_or_else(|| {
+                    ServiceError::rpc(
+                        codes::ATTENTION_NOT_FOUND,
+                        format!("no attention item '{}'", p.id),
+                    )
+                })?;
+                Ok(serde_json::to_value(item).expect("AttentionItem serializes"))
             }
             methods::ATTENTION_DISMISS => {
                 let p: AttentionDismissParams = parse(params)?;

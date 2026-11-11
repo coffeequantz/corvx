@@ -23,7 +23,7 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE projects (
@@ -47,6 +47,31 @@ CREATE INDEX events_kind ON events(kind);
 ";
 
 /// Version 2: the attention queue.
+/// Version 6: the runtime's conversation id, so an interrupted agent can be resumed. Tmux
+/// sessions that vanished without an exit status (the machine restarted) are marked lost.
+const SCHEMA_V6: &str = "
+ALTER TABLE sessions ADD COLUMN runtime_session TEXT;
+UPDATE sessions SET state = 'lost' WHERE state = 'exited' AND exit_code IS NULL AND backend = 'tmux';
+";
+
+/// Version 7: autopilot, and an orchestrator's settings for its agents (default model, who
+/// approves their permission requests).
+const SCHEMA_V7: &str = "
+ALTER TABLE sessions ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN agent_model TEXT;
+ALTER TABLE sessions ADD COLUMN human_approves_agents INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Version 5: readable session labels.
+const SCHEMA_V5: &str = "ALTER TABLE sessions ADD COLUMN label TEXT;";
+
+/// Version 4: supervision and worktrees on sessions; answers on attention items (questions).
+const SCHEMA_V4: &str = "
+ALTER TABLE sessions ADD COLUMN supervisor TEXT;
+ALTER TABLE sessions ADD COLUMN worktree TEXT;
+ALTER TABLE attention ADD COLUMN answer TEXT;
+";
+
 /// Version 3: sessions, so a restarted daemon can find and adopt the ones still running.
 const SCHEMA_V3: &str = "
 CREATE TABLE sessions (
@@ -86,6 +111,9 @@ CREATE TABLE attention (
 CREATE INDEX attention_session ON attention(session_id, status);
 ";
 
+/// An approval item's status, decision and (for a denial) message.
+pub type ApprovalState = (String, Option<String>, Option<String>);
+
 /// One entry of the event log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredEvent {
@@ -122,6 +150,18 @@ impl Store {
         }
         if version < 3 {
             conn.execute_batch(SCHEMA_V3)?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+        }
+        if version < 5 {
+            conn.execute_batch(SCHEMA_V5)?;
+        }
+        if version < 6 {
+            conn.execute_batch(SCHEMA_V6)?;
+        }
+        if version < 7 {
+            conn.execute_batch(SCHEMA_V7)?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -219,7 +259,7 @@ impl Store {
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2, note = 'agent moved on'
-             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != ?3",
+             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != ?3 AND kind != 'question'",
             params![session_id, now, state],
         )?;
         if !matches!(state, "blocked" | "waiting" | "done" | "failed") {
@@ -325,6 +365,120 @@ impl Store {
         )? > 0)
     }
 
+    /// Records a question from a session for a human. Returns the new item's id.
+    pub fn ask_question(
+        &self,
+        session_id: &str,
+        project: &str,
+        question: &str,
+        now: i64,
+    ) -> Result<String> {
+        let id = new_attention_id(now);
+        self.conn.execute(
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
+             VALUES (?1, 'question', 3, ?2, ?3, ?4, 'open', ?5, ?5)",
+            params![id, project, session_id, question, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Answers an open question. Returns false if there is no such open question.
+    pub fn answer_question(&self, id: &str, answer: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attention SET status = 'answered', answer = ?2, resolved_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND kind = 'question' AND status IN ('open', 'snoozed')",
+            params![id, answer, now],
+        )? > 0)
+    }
+
+    /// Records a permission request from a session as an inbox item of kind "approval".
+    /// Severity 3 is for a human to decide; severity 1, for the session's orchestrator.
+    /// Other items for the session are resolved (it has moved on), questions excepted. An
+    /// older approval still open for the session is superseded. Returns the new item's id.
+    pub fn open_approval(
+        &self,
+        session_id: &str,
+        project: &str,
+        summary: &str,
+        severity: u8,
+        now: i64,
+    ) -> Result<String> {
+        self.conn.execute(
+            "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2,
+                    note = CASE kind WHEN 'approval' THEN 'superseded' ELSE 'agent moved on' END
+             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != 'question'",
+            params![session_id, now],
+        )?;
+        let id = new_attention_id(now);
+        self.conn.execute(
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
+             VALUES (?1, 'approval', ?6, ?2, ?3, ?4, 'open', ?5, ?5)",
+            params![id, project, session_id, summary, now, severity],
+        )?;
+        Ok(id)
+    }
+
+    /// Whether a session has a permission request open in the inbox.
+    pub fn has_open_approval(&self, session_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attention WHERE session_id = ?1 AND kind = 'approval'
+                           AND status IN ('open', 'snoozed'))",
+            params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The open approval of a session, if any.
+    pub fn open_approval_for(&self, session_id: &str) -> Result<Option<AttentionItem>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM attention WHERE session_id = ?1 AND kind = 'approval'
+                 AND status IN ('open', 'snoozed') ORDER BY created_at DESC LIMIT 1",
+                params![session_id],
+                attention_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Passes an open approval to a human: it becomes severity 3, with a note saying why.
+    /// Returns false if there is no such open approval.
+    pub fn escalate_approval(&self, id: &str, note: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attention SET severity = 3, note = ?2, updated_at = ?3
+             WHERE id = ?1 AND kind = 'approval' AND status IN ('open', 'snoozed')",
+            params![id, note, now],
+        )? > 0)
+    }
+
+    /// Decides an open approval. `message` is kept for a denial. Returns false if there is no
+    /// such open approval.
+    pub fn decide_approval(
+        &self,
+        id: &str,
+        decision: &str,
+        message: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attention SET status = 'answered', answer = ?2, note = ?3, resolved_at = ?4, updated_at = ?4
+             WHERE id = ?1 AND kind = 'approval' AND status IN ('open', 'snoozed')",
+            params![id, decision, message, now],
+        )? > 0)
+    }
+
+    /// The status, decision and message of an approval item.
+    pub fn approval_state(&self, id: &str) -> Result<Option<ApprovalState>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT status, answer, note FROM attention WHERE id = ?1 AND kind = 'approval'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
     pub fn dismiss_attention(&self, id: &str, reason: &str, now: i64) -> Result<bool> {
         Ok(self.conn.execute(
             "UPDATE attention SET status = 'dismissed', resolved_at = ?2, updated_at = ?2, note = ?3
@@ -338,8 +492,10 @@ impl Store {
         self.conn.execute(
             "INSERT OR REPLACE INTO sessions
              (id, project, command, runtime, backend, one_shot, state, pid, started_at, ended_at,
-              exit_code, agent_state, agent_detail, agent_source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              exit_code, agent_state, agent_detail, agent_source, supervisor, worktree, label,
+              runtime_session, autopilot, agent_model, human_approves_agents)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                     ?19, ?20, ?21)",
             params![
                 s.id,
                 s.project,
@@ -355,6 +511,13 @@ impl Store {
                 enum_name(&s.agent_state)?,
                 s.agent_detail,
                 s.agent_source,
+                s.supervisor,
+                s.worktree,
+                s.label,
+                s.runtime_session,
+                s.autopilot,
+                s.agent_model,
+                s.human_approves_agents,
             ],
         )?;
         Ok(())
@@ -362,12 +525,39 @@ impl Store {
 
     /// Sessions recorded as running, with their one-shot flag. Used to adopt them after a restart.
     pub fn running_sessions(&self) -> Result<Vec<(Session, bool)>> {
-        let mut stmt = self.conn.prepare(
+        self.load_sessions("state = 'running'", params![])
+    }
+
+    /// Sessions lost since `since` (their terminal disappeared), oldest first.
+    pub fn lost_sessions(&self, since: i64) -> Result<Vec<(Session, bool)>> {
+        self.load_sessions(
+            "state = 'lost' AND COALESCE(ended_at, started_at) >= ?1",
+            params![since],
+        )
+    }
+
+    /// One session record, whatever its state.
+    pub fn get_session(&self, id: &str) -> Result<Option<(Session, bool)>> {
+        Ok(self.load_sessions("id = ?1", params![id])?.pop())
+    }
+
+    /// The sessions a session supervises, whatever their state.
+    pub fn supervised_by(&self, id: &str) -> Result<Vec<(Session, bool)>> {
+        self.load_sessions("supervisor = ?1", params![id])
+    }
+
+    fn load_sessions(
+        &self,
+        filter: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<(Session, bool)>> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, project, command, runtime, backend, one_shot, state, pid, started_at, ended_at,
-                    exit_code, agent_state, agent_detail, agent_source
-             FROM sessions WHERE state = 'running' ORDER BY started_at, id",
-        )?;
-        let rows = stmt.query_map([], |r| {
+                    exit_code, agent_state, agent_detail, agent_source, supervisor, worktree, label,
+                    runtime_session, autopilot, agent_model, human_approves_agents
+             FROM sessions WHERE {filter} ORDER BY started_at, id"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
             let command: String = r.get(2)?;
             let state: String = r.get(6)?;
             let agent_state: String = r.get(11)?;
@@ -378,7 +568,7 @@ impl Store {
                     command: serde_json::from_str(&command).unwrap_or_default(),
                     runtime: r.get(3)?,
                     backend: r.get(4)?,
-                    state: from_name(&state).unwrap_or(SessionState::Running),
+                    state: from_name(&state).unwrap_or(SessionState::Stopped),
                     pid: r.get(7)?,
                     started_at: r.get(8)?,
                     ended_at: r.get(9)?,
@@ -386,6 +576,13 @@ impl Store {
                     agent_state: from_name(&agent_state).unwrap_or(AgentState::Unknown),
                     agent_detail: r.get(12)?,
                     agent_source: r.get(13)?,
+                    supervisor: r.get(14)?,
+                    worktree: r.get(15)?,
+                    label: r.get(16)?,
+                    runtime_session: r.get(17)?,
+                    autopilot: r.get(18)?,
+                    agent_model: r.get(19)?,
+                    human_approves_agents: r.get(20)?,
                 },
                 r.get::<_, bool>(5)?,
             ))
@@ -422,6 +619,8 @@ fn attention_from_row(row: &Row<'_>) -> rusqlite::Result<AttentionItem> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         snooze_until: row.get("snooze_until")?,
+        answer: row.get("answer")?,
+        note: row.get("note")?,
     })
 }
 
@@ -667,13 +866,16 @@ mod attention_tests {
 mod session_tests {
     use super::*;
 
-    fn session(id: &str, state: SessionState) -> Session {
+    pub(super) fn session(id: &str, state: SessionState) -> Session {
         Session {
             id: id.into(),
             project: "app".into(),
             command: vec!["claude".into()],
             runtime: Some("claude".into()),
             backend: "tmux".into(),
+            supervisor: Some("s0".into()),
+            worktree: Some("/tmp/wt".into()),
+            label: Some("agent · test".into()),
             state,
             pid: Some(42),
             started_at: 1,
@@ -682,6 +884,10 @@ mod session_tests {
             agent_state: AgentState::Waiting,
             agent_detail: Some("detail".into()),
             agent_source: Some("hooks".into()),
+            runtime_session: Some("conv-1".into()),
+            autopilot: true,
+            agent_model: Some("sonnet".into()),
+            human_approves_agents: true,
         }
     }
 
@@ -702,6 +908,16 @@ mod session_tests {
     }
 
     #[test]
+    fn lost_is_stored_and_read_back() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_session(&session("s1", SessionState::Lost), false)
+            .unwrap();
+        let (s, _) = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.state, SessionState::Lost);
+    }
+
+    #[test]
     fn saving_again_updates_the_session() {
         let store = Store::open_in_memory().unwrap();
         store
@@ -711,5 +927,126 @@ mod session_tests {
             .save_session(&session("s1", SessionState::Exited), false)
             .unwrap();
         assert!(store.running_sessions().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lost_session_tests {
+    use super::*;
+
+    #[test]
+    fn lost_sessions_and_supervised_ones_are_found() {
+        let store = Store::open_in_memory().unwrap();
+        let mut s = super::session_tests::session("s1", SessionState::Lost);
+        s.ended_at = Some(100);
+        store.save_session(&s, false).unwrap();
+        let mut old = super::session_tests::session("s0", SessionState::Lost);
+        old.ended_at = Some(10);
+        store.save_session(&old, false).unwrap();
+        let lost = store.lost_sessions(50).unwrap();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].0.id, "s1");
+        assert_eq!(lost[0].0.runtime_session.as_deref(), Some("conv-1"));
+        // Both fixtures answer to s0.
+        assert_eq!(store.supervised_by("s0").unwrap().len(), 2);
+        assert!(store.get_session("nope").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    #[test]
+    fn an_approval_is_decided_once() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_session_attention("s1", "app", "waiting", "", 1, 5)
+            .unwrap();
+        let id = store
+            .open_approval("s1", "app", "Bash: npm test", 3, 10)
+            .unwrap();
+        let open = store.list_attention(false, 11).unwrap();
+        assert_eq!(open.len(), 1, "the waiting item is resolved: {open:?}");
+        assert_eq!(open[0].kind, "approval");
+        assert!(store.has_open_approval("s1").unwrap());
+
+        assert!(store
+            .decide_approval(&id, "deny", Some("use make test"), 12)
+            .unwrap());
+        assert!(!store.decide_approval(&id, "allow", None, 13).unwrap());
+        assert_eq!(
+            store.approval_state(&id).unwrap(),
+            Some((
+                "answered".into(),
+                Some("deny".into()),
+                Some("use make test".into())
+            ))
+        );
+        assert!(!store.has_open_approval("s1").unwrap());
+    }
+
+    #[test]
+    fn a_new_request_supersedes_the_old_one_and_moving_on_resolves_it() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.open_approval("s1", "app", "Bash: a", 3, 10).unwrap();
+        let second = store.open_approval("s1", "app", "Bash: b", 3, 11).unwrap();
+        assert_eq!(store.approval_state(&first).unwrap().unwrap().0, "resolved");
+        store
+            .set_session_attention("s1", "app", "working", "", 0, 12)
+            .unwrap();
+        assert_eq!(
+            store.approval_state(&second).unwrap().unwrap().0,
+            "resolved"
+        );
+    }
+
+    #[test]
+    fn an_orchestrators_approval_can_be_escalated_to_the_human() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .open_approval("s1", "app", "Bash: rm -rf build", 1, 10)
+            .unwrap();
+        let item = store.open_approval_for("s1").unwrap().unwrap();
+        assert_eq!((item.id.as_str(), item.severity), (id.as_str(), 1));
+        assert!(store.escalate_approval(&id, "deletes files", 11).unwrap());
+        let item = store.get_attention(&id).unwrap().unwrap();
+        assert_eq!(item.severity, 3);
+        assert_eq!(item.note.as_deref(), Some("deletes files"));
+        assert_eq!(item.status, "open", "escalating does not decide it");
+        store.decide_approval(&id, "allow", None, 12).unwrap();
+        assert!(!store.escalate_approval(&id, "too late", 13).unwrap());
+        assert!(store.open_approval_for("s1").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+
+    #[test]
+    fn questions_are_answered_once_and_survive_state_changes() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .ask_question("s1", "app", "Which database?", 10)
+            .unwrap();
+        // The asking agent moving on does not resolve its question.
+        store
+            .set_session_attention("s1", "app", "working", "", 0, 11)
+            .unwrap();
+        let open = store.list_attention(false, 12).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, "question");
+        assert_eq!(open[0].summary, "Which database?");
+
+        assert!(store.answer_question(&id, "SQLite", 13).unwrap());
+        assert!(
+            !store.answer_question(&id, "Postgres", 14).unwrap(),
+            "answered only once"
+        );
+        assert!(store.list_attention(true, 15).unwrap().is_empty());
+        let item = store.get_attention(&id).unwrap().unwrap();
+        assert_eq!(item.status, "answered");
+        assert_eq!(item.answer.as_deref(), Some("SQLite"));
     }
 }

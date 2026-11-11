@@ -37,6 +37,10 @@ enum Mode {
     Help,
     Inbox,
     Sessions,
+    /// Typing an answer to the selected question in the inbox.
+    Answer,
+    /// Typing an optional reason for denying the selected permission request.
+    Deny,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +74,8 @@ struct App {
     attention: Vec<AttentionItem>,
     /// Every session the daemon manages, in start order.
     sessions: Vec<Session>,
+    /// How deep each session sits under its orchestrator, parallel to `sessions`.
+    session_depths: Vec<usize>,
     sessions_sel: usize,
     /// A session to attach to. The event loop hands it the terminal.
     pending_attach: Option<String>,
@@ -142,12 +148,22 @@ impl App {
             last_refresh: Instant::now(),
             attention: Vec::new(),
             sessions: Vec::new(),
+            session_depths: Vec::new(),
             sessions_sel: 0,
             pending_attach: None,
             inbox_sel: 0,
         };
         app.daemon_pid = app.client.info().map(|i| i.pid).unwrap_or(0);
         app.refresh()?;
+        let lost = app
+            .sessions
+            .iter()
+            .filter(|s| s.state == SessionState::Lost && s.supervisor.is_none())
+            .count();
+        if lost > 0 {
+            app.flash =
+                format!("{lost} interrupted session(s) · press s, then R on one to resume it");
+        }
         Ok(app)
     }
 
@@ -176,10 +192,9 @@ impl App {
         self.attention = att.items;
         let list: SessionList =
             serde_json::from_value(self.rpc(methods::SESSION_LIST, json!({}))?)?;
-        self.sessions = list.sessions;
-        // Running sessions first (the ones you can attach to), then ended ones; start order within each.
-        self.sessions
-            .sort_by_key(|s| s.state != SessionState::Running);
+        let (sessions, depths) = session_tree(list.sessions);
+        self.sessions = sessions;
+        self.session_depths = depths;
         if self.sessions_sel >= self.sessions.len() {
             self.sessions_sel = self.sessions.len().saturating_sub(1);
         }
@@ -218,6 +233,8 @@ impl App {
             Mode::Help => self.mode = Mode::Normal,
             Mode::Inbox => self.key_inbox(key.code),
             Mode::Sessions => self.key_sessions(key.code),
+            Mode::Answer => self.key_answer(key.code),
+            Mode::Deny => self.key_deny(key.code),
         }
     }
 
@@ -253,9 +270,84 @@ impl App {
         }
     }
 
+    fn key_answer(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Inbox;
+                self.input.clear();
+            }
+            KeyCode::Enter => {
+                let answer = std::mem::take(&mut self.input);
+                self.mode = Mode::Inbox;
+                if answer.trim().is_empty() {
+                    self.flash = "empty answer not sent".into();
+                    return;
+                }
+                self.attention_action(
+                    methods::ATTENTION_ANSWER,
+                    json!({"answer": answer.trim()}),
+                    "answered",
+                );
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    fn key_deny(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Inbox;
+                self.input.clear();
+            }
+            KeyCode::Enter => {
+                let reason = std::mem::take(&mut self.input);
+                self.mode = Mode::Inbox;
+                let mut params = json!({"decision": "deny"});
+                if !reason.trim().is_empty() {
+                    params["message"] = json!(reason.trim());
+                }
+                self.attention_action(methods::ATTENTION_DECIDE, params, "denied");
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            _ => {}
+        }
+    }
+
     fn open_sessions(&mut self) {
         self.mode = Mode::Sessions;
         self.flash.clear();
+    }
+
+    /// Resumes the selected session, and the lost agents under it.
+    fn resume_selected(&mut self) {
+        let Some(s) = self.sessions.get(self.sessions_sel).cloned() else {
+            return;
+        };
+        if s.state == SessionState::Running {
+            self.flash = format!("{} is running", crate::display_name(&s));
+            return;
+        }
+        let r = self.rpc(methods::SESSION_RESUME, json!({"id": s.id}));
+        if let Some(v) = self.report(r) {
+            let n = v["sessions"].as_array().map(Vec::len).unwrap_or(0);
+            self.flash = match n {
+                0 | 1 => format!("resumed {}", crate::display_name(&s)),
+                n => format!(
+                    "resumed {} and {} agent(s) under it",
+                    crate::display_name(&s),
+                    n - 1
+                ),
+            };
+            let r = self.refresh();
+            self.report(r);
+        }
     }
 
     fn key_sessions(&mut self, code: KeyCode) {
@@ -272,10 +364,39 @@ impl App {
                 Some(s) if s.state == SessionState::Running => {
                     self.pending_attach = Some(s.id.clone());
                 }
+                Some(s) if s.state == SessionState::Lost => {
+                    self.flash = format!("{} was interrupted · R resumes it", s.id)
+                }
                 Some(s) => self.flash = format!("{} has ended; nothing to attach to", s.id),
                 None => {}
             },
+            KeyCode::Char('R') => self.resume_selected(),
+            KeyCode::Char('a') => {
+                if let Some(s) = self.sessions.get(self.sessions_sel).cloned() {
+                    self.set_autopilot(&s.id, !s.autopilot);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Turns a session's autopilot on or off.
+    fn set_autopilot(&mut self, id: &str, on: bool) {
+        let name = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(crate::display_name)
+            .unwrap_or_else(|| id.to_string());
+        let r = self.rpc(methods::SESSION_AUTOPILOT, json!({"id": id, "on": on}));
+        if self.report(r).is_some() {
+            self.flash = if on {
+                format!("autopilot on · {name} no longer asks for permission")
+            } else {
+                format!("autopilot off · {name} asks again")
+            };
+            let r = self.refresh();
+            self.report(r);
         }
     }
 
@@ -298,12 +419,60 @@ impl App {
                 json!({"minutes": 15}),
                 "snoozed for 15 minutes",
             ),
+            KeyCode::Char('r') => match self.attention.get(self.inbox_sel) {
+                Some(item) if item.kind == "question" => {
+                    self.mode = Mode::Answer;
+                    self.input.clear();
+                }
+                Some(_) => self.flash = "only questions take an answer".into(),
+                None => {}
+            },
+            KeyCode::Char(c @ ('y' | 'Y' | 'n')) => match self.attention.get(self.inbox_sel) {
+                Some(item) if item.kind == "approval" => match c {
+                    'y' => self.attention_action(
+                        methods::ATTENTION_DECIDE,
+                        json!({"decision": "allow"}),
+                        "approved",
+                    ),
+                    'Y' => self.attention_action(
+                        methods::ATTENTION_DECIDE,
+                        json!({"decision": "always"}),
+                        "approved, and won't ask again",
+                    ),
+                    _ => {
+                        self.mode = Mode::Deny;
+                        self.input.clear();
+                    }
+                },
+                Some(_) => self.flash = "only permission requests take y / n".into(),
+                None => {}
+            },
+            // Approve this request and every later one from the same agent.
+            KeyCode::Char('A') => match self.attention.get(self.inbox_sel).cloned() {
+                Some(item) if item.kind == "approval" => self.set_autopilot(&item.session_id, true),
+                Some(_) => self.flash = "A is for permission requests".into(),
+                None => {}
+            },
             KeyCode::Char('x') => self.attention_action(
                 methods::ATTENTION_DISMISS,
                 json!({"reason": "dismissed in the terminal UI"}),
                 "dismissed",
             ),
+            // Enter attaches to the agent the item is about, e.g. to approve a request.
             KeyCode::Enter => {
+                if let Some(item) = self.attention.get(self.inbox_sel) {
+                    let running = self
+                        .sessions
+                        .iter()
+                        .any(|s| s.id == item.session_id && s.state == SessionState::Running);
+                    if running {
+                        self.pending_attach = Some(item.session_id.clone());
+                    } else {
+                        self.flash = format!("{} has ended; nothing to attach to", item.session_id);
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
                 if let Some(item) = self.attention.get(self.inbox_sel) {
                     let project = item.project.clone();
                     if let Some(i) = self.projects.iter().position(|p| p.id == project) {
@@ -509,7 +678,7 @@ fn draw(f: &mut Frame, app: &App) {
     let [rail, main] = Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body);
     draw_rail(f, rail, app);
     match app.mode {
-        Mode::Inbox => draw_inbox(f, main, app),
+        Mode::Inbox | Mode::Answer | Mode::Deny => draw_inbox(f, main, app),
         Mode::Sessions => draw_sessions(f, main, app),
         _ => draw_main(f, main, app),
     }
@@ -545,7 +714,21 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         ),
         Span::styled(
-            format!("{} blocked  ", count_kind(app, "blocked")),
+            format!("{} to approve  ", count_yours_to_approve(app)),
+            Style::default().fg(AMBER),
+        ),
+        Span::styled(
+            match count_kind(app, "approval") - count_yours_to_approve(app) {
+                0 => String::new(),
+                n => format!("({n} with orchestrators)  "),
+            },
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            format!(
+                "{} blocked  ",
+                count_kind(app, "blocked") + count_kind(app, "question")
+            ),
             Style::default().fg(AMBER),
         ),
         Span::styled(
@@ -690,6 +873,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Help => ("HELP", ACCENT),
         Mode::Inbox => ("INBOX", ACCENT),
         Mode::Sessions => ("SESSIONS", ACCENT),
+        Mode::Answer => ("ANSWER", GREEN),
+        Mode::Deny => ("DENY", RED),
     };
     let hint = if !app.flash.is_empty() {
         app.flash.clone()
@@ -702,12 +887,23 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Mode::Palette => "type to filter · ↑↓ select · Enter run · Esc close".into(),
             Mode::ConfirmRemove => "y remove from CORVX · any other key cancels".into(),
             Mode::Help => "any key closes".into(),
-            Mode::Inbox => {
-                "j/k move · a ack · s snooze · x dismiss · Enter project · Esc close".into()
-            }
+            Mode::Inbox => match app.attention.get(app.inbox_sel).map(|i| i.kind.as_str()) {
+                Some("approval") => {
+                    "y approve · Y always · n deny · A autopilot · Enter attach · j/k move · Esc"
+                        .into()
+                }
+                Some("question") => {
+                    "r answer · Enter attach · a ack · s snooze · x dismiss · j/k move · Esc".into()
+                }
+                _ => "j/k move · Enter attach · a ack · s snooze · x dismiss · p project · Esc"
+                    .into(),
+            },
             Mode::Sessions => {
-                "j/k move · Enter attach (Ctrl+\\ then d to come back) · Esc close".into()
+                "j/k move · Enter attach (Ctrl+\\ then d to come back) · R resume · a autopilot · Esc"
+                    .into()
             }
+            Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
+            Mode::Deny => "why, or what to do instead (optional) · Enter deny · Esc cancel".into(),
         }
     };
     let line = Line::from(vec![
@@ -728,6 +924,14 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.mode {
         Mode::AddPath => Line::from(vec![
             Span::styled("path › ", Style::default().fg(GREEN)),
+            Span::raw(format!("{}█", app.input)),
+        ]),
+        Mode::Answer => Line::from(vec![
+            Span::styled("answer › ", Style::default().fg(GREEN)),
+            Span::raw(format!("{}█", app.input)),
+        ]),
+        Mode::Deny => Line::from(vec![
+            Span::styled("deny › ", Style::default().fg(RED)),
             Span::raw(format!("{}█", app.input)),
         ]),
         Mode::ConfirmRemove => Line::styled(
@@ -775,7 +979,7 @@ fn draw_palette(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 62, 14);
+    let rect = centered(area, 66, 16);
     f.render_widget(Clear, rect);
     let rows = [
         ("j / k, ↑ ↓", "move selection"),
@@ -785,6 +989,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (": or Ctrl+K", "command palette"),
         ("i", "attention inbox: what needs you"),
         ("s", "sessions: Enter attaches, Ctrl+\\ then d returns"),
+        ("  in inbox", "y approve · Y always · n deny · A autopilot"),
+        ("  in sessions", "R resume · a autopilot on/off"),
         ("?", "this help"),
         ("q", "quit the UI (the daemon keeps running)"),
         ("", ""),
@@ -824,6 +1030,19 @@ fn count_kind(app: &App, kind: &str) -> usize {
     app.attention.iter().filter(|i| i.kind == kind).count()
 }
 
+/// A permission request its agent's orchestrator decides. You may still decide it.
+fn orchestrators(item: &AttentionItem) -> bool {
+    item.kind == "approval" && item.severity < 3
+}
+
+/// Permission requests waiting on you, not on an orchestrator.
+fn count_yours_to_approve(app: &App) -> usize {
+    app.attention
+        .iter()
+        .filter(|i| i.kind == "approval" && !orchestrators(i))
+        .count()
+}
+
 /// The attention items for one project, shown in the project view.
 fn attention_lines(app: &App, project: &str) -> Vec<Line<'static>> {
     let mut out = vec![Line::styled("ATTENTION", Style::default().fg(ACCENT))];
@@ -854,6 +1073,8 @@ fn kind_label(kind: &str) -> &'static str {
     match kind {
         "blocked" => "BLOCKED",
         "waiting" => "WAITING",
+        "question" => "QUESTION",
+        "approval" => "APPROVE?",
         "done" => "DONE",
         "failed" => "FAILED",
         _ => "?",
@@ -864,6 +1085,8 @@ fn kind_style(kind: &str) -> Style {
     let color = match kind {
         "blocked" => AMBER,
         "waiting" => ACCENT,
+        "question" => AMBER,
+        "approval" => AMBER,
         "done" => GREEN,
         "failed" => RED,
         _ => DIM,
@@ -897,21 +1120,70 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default()
         };
+        let (label_style, summary) = if orchestrators(item) {
+            (
+                Style::default().fg(DIM),
+                Span::styled(
+                    format!("orchestrator deciding · {}", item.summary),
+                    Style::default().fg(DIM),
+                ),
+            )
+        } else {
+            (kind_style(&item.kind), Span::raw(item.summary.clone()))
+        };
         lines.push(Line::from(vec![
             Span::styled(marker, row_style),
-            Span::styled(
-                format!("{:<8}", kind_label(&item.kind)),
-                kind_style(&item.kind),
-            ),
+            Span::styled(format!("{:<8}", kind_label(&item.kind)), label_style),
             Span::styled(format!("{:<16}", item.project), Style::default().fg(ACCENT)),
             Span::styled(
                 format!("{:>5}  ", age_label(now - item.created_at)),
                 Style::default().fg(DIM),
             ),
-            Span::raw(item.summary.clone()),
+            summary,
         ]));
     }
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    // The selected item in full: a long command or question does not fit on its row.
+    let detail = app.attention.get(app.inbox_sel).filter(|i| {
+        matches!(i.kind.as_str(), "approval" | "question" | "blocked") || i.summary.len() > 60
+    });
+    let Some(item) = detail else {
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    };
+    let [list_area, detail_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(7)]).areas(area);
+    f.render_widget(Paragraph::new(lines).block(block), list_area);
+    let agent = app
+        .sessions
+        .iter()
+        .find(|s| s.id == item.session_id)
+        .map(crate::display_name)
+        .unwrap_or_else(|| item.session_id.clone());
+    let title = match item.kind.as_str() {
+        "approval" if orchestrators(item) => format!(" {agent} asks its orchestrator to run "),
+        "approval" => format!(" {agent} asks to run "),
+        "question" => format!(" {agent} asks "),
+        _ => format!(" {agent} "),
+    };
+    let mut text = Vec::new();
+    if let Some(note) = item.note.as_deref().filter(|_| item.kind == "approval") {
+        text.push(Line::styled(note.to_string(), Style::default().fg(AMBER)));
+    }
+    text.push(Line::raw(item.summary.clone()));
+    if orchestrators(item) {
+        text.push(Line::styled(
+            "Its orchestrator is deciding · you can still decide it: y / Y / n",
+            Style::default().fg(DIM),
+        ));
+    }
+    let detail = Paragraph::new(text)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(
+            Block::bordered()
+                .title(title)
+                .border_style(kind_style(&item.kind)),
+        );
+    f.render_widget(detail, detail_area);
 }
 
 fn age_label(secs: i64) -> String {
@@ -929,11 +1201,52 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Orders sessions as a tree: each orchestrator followed by the agents it supervises,
+/// running sessions before ended ones at each level. Returns the sessions and their depths.
+fn session_tree(sessions: Vec<Session>) -> (Vec<Session>, Vec<usize>) {
+    use std::collections::HashSet;
+    fn visit(
+        parent: Option<&str>,
+        depth: usize,
+        all: &[Session],
+        ids: &HashSet<String>,
+        order: &mut Vec<Session>,
+        depths: &mut Vec<usize>,
+    ) {
+        let mut level: Vec<&Session> = all
+            .iter()
+            .filter(|s| match (parent, s.supervisor.as_deref()) {
+                (None, None) => true,
+                // A supervisor that is not in the list (e.g. long gone) makes this a root.
+                (None, Some(sup)) => !ids.contains(sup),
+                (Some(p), Some(sup)) => p == sup,
+                _ => false,
+            })
+            .collect();
+        level.sort_by_key(|s| s.state != SessionState::Running);
+        for s in level {
+            order.push(s.clone());
+            depths.push(depth);
+            visit(Some(&s.id), depth + 1, all, ids, order, depths);
+        }
+    }
+    let ids: HashSet<String> = sessions.iter().map(|s| s.id.clone()).collect();
+    let mut order = Vec::with_capacity(sessions.len());
+    let mut depths = Vec::with_capacity(sessions.len());
+    visit(None, 0, &sessions, &ids, &mut order, &mut depths);
+    (order, depths)
+}
+
 fn agent_label(s: &Session) -> String {
     let state = if s.state == SessionState::Running {
         format!("{:?}", s.agent_state).to_lowercase()
     } else {
         format!("{:?}", s.state).to_lowercase()
+    };
+    let state = if s.autopilot && s.state == SessionState::Running {
+        format!("auto·{state}")
+    } else {
+        state
     };
     match &s.agent_detail {
         Some(d) => format!("{state}: {d}"),
@@ -1014,13 +1327,22 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default()
             };
+            let depth = app.session_depths.get(i).copied().unwrap_or(0);
+            let branch = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}└ ", "  ".repeat(depth - 1))
+            };
+            let name = crate::display_name(s);
+            let name: String = format!("{branch}{name}").chars().take(28).collect();
+            let state: String = agent_label(s).chars().take(20).collect();
+            let project: String = s.project.chars().take(10).collect();
             Line::from(vec![
                 Span::styled(if selected { "▸ " } else { "  " }, marker_style),
-                Span::raw(format!("{:<16}", s.id)),
-                Span::styled(format!("{:<14}", s.project), Style::default().fg(ACCENT)),
-                Span::styled(format!("{:<34}", agent_label(s)), agent_style(s)),
-                Span::styled(format!("{:<6}", s.backend), Style::default().fg(DIM)),
-                Span::raw(s.command.join(" ")),
+                Span::raw(format!("{name:<29}")),
+                Span::styled(format!("{project:<11}"), Style::default().fg(ACCENT)),
+                Span::styled(format!("{state:<21}"), agent_style(s)),
+                Span::styled(s.id.clone(), Style::default().fg(DIM)),
             ])
         })
         .collect();
@@ -1045,6 +1367,52 @@ mod tests {
         let area = Rect::new(0, 0, 50, 10);
         let r = centered(area, 100, 100);
         assert!(r.x + r.width <= area.width && r.y + r.height <= area.height);
+    }
+
+    #[test]
+    fn sessions_are_listed_as_a_tree() {
+        use corvx_proto::{AgentState, Session};
+        let mk = |id: &str, sup: Option<&str>, running: bool| Session {
+            id: id.into(),
+            project: "p".into(),
+            command: vec!["claude".into()],
+            runtime: None,
+            backend: "tmux".into(),
+            supervisor: sup.map(String::from),
+            worktree: None,
+            label: None,
+            state: if running {
+                SessionState::Running
+            } else {
+                SessionState::Stopped
+            },
+            pid: None,
+            started_at: 0,
+            ended_at: None,
+            exit_code: None,
+            agent_state: AgentState::Unknown,
+            agent_detail: None,
+            agent_source: None,
+            runtime_session: None,
+            autopilot: false,
+            agent_model: None,
+            human_approves_agents: false,
+        };
+        let input = vec![
+            mk("old", None, false),
+            mk("orch", None, true),
+            mk("backend", Some("orch"), true),
+            mk("frontend", Some("orch"), true),
+            mk("orphan", Some("gone"), true),
+            mk("sub", Some("backend"), true),
+        ];
+        let (order, depths) = session_tree(input);
+        let ids: Vec<&str> = order.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["orch", "backend", "sub", "frontend", "orphan", "old"]
+        );
+        assert_eq!(depths, vec![0, 1, 2, 1, 0, 0]);
     }
 
     #[test]

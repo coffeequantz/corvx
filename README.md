@@ -33,8 +33,17 @@ python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no mode
 ./target/debug/corvx session start my-app --runtime claude -- claude
 ./target/debug/corvx session attach <id>      # Ctrl+\ then d to detach
 ./target/debug/corvx attention                 # what needs you
-./target/debug/corvx                           # terminal UI; press i for the inbox
+./target/debug/corvx attention approve <item>  # approve a permission request (--always: don't ask again)
+./target/debug/corvx attention deny <item> use make test   # deny, telling the agent what to do instead
+./target/debug/corvx session resume <id>       # continue an agent interrupted by a restart
+./target/debug/corvx session autopilot <id> on # approve its permission requests without asking
+./target/debug/corvx orchestrate my-app "add CSV export"   # orchestrator on opus, agents on sonnet
+./target/debug/corvx                           # terminal UI; press i for the inbox (y/Y/n/A on requests)
 ```
+
+Permission requests from Claude Code agents reach the inbox as approvals. You can decide them there, or attach and answer the dialog in the session; whichever answer comes first applies. When the machine restarts, agent sessions are marked lost. Resuming one starts Claude Code again with its conversation, and resuming an orchestrator also resumes the lost agents under it.
+
+An orchestrator runs on a strong model (`--model`, default opus) and starts its agents on a cheaper one (`--agent-model`, default sonnet), picking another per task when it needs to. Its agents' permission requests go to it first. It allows, denies or escalates each one, and escalated ones reach your inbox. You see the rest there too, marked "orchestrator deciding", and can decide any of them yourself. `--approvals human` sends them all to you instead. An agent on autopilot is not asked at all, though each approval is still logged. The orchestrator can turn autopilot on for its agents (`set_autopilot`), and you can turn it on for any session (`a` in the sessions view, `A` on a request in the inbox). When an orchestrator ends, its agents' open requests come to you.
 
 `CORVX_E2E_REAL_CLAUDE=1 python3 tests/e2e/run_e2e.py` also runs one scenario against real Claude Code. It uses your Claude account.
 

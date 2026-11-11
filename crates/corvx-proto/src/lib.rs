@@ -28,6 +28,19 @@ pub mod methods {
     pub const ATTENTION_ACK: &str = "attention.ack";
     pub const ATTENTION_SNOOZE: &str = "attention.snooze";
     pub const ATTENTION_DISMISS: &str = "attention.dismiss";
+    pub const ATTENTION_ASK: &str = "attention.ask";
+    pub const ATTENTION_ANSWER: &str = "attention.answer";
+    pub const ATTENTION_GET: &str = "attention.get";
+    pub const SESSION_SCREEN: &str = "session.screen";
+    pub const SESSION_REPORT: &str = "session.report";
+    /// Asked by a waiting permission hook: has the human decided yet?
+    pub const SESSION_PERMISSION: &str = "session.permission";
+    /// Starts an interrupted session again, continuing its conversation.
+    pub const SESSION_RESUME: &str = "session.resume";
+    /// Approves or denies an agent's permission request from the inbox.
+    pub const ATTENTION_DECIDE: &str = "attention.decide";
+    /// Turns a session's autopilot on or off: CORVX approves its permission requests itself.
+    pub const SESSION_AUTOPILOT: &str = "session.autopilot";
 }
 
 /// Error codes. JSON-RPC reserved range plus CORVX codes from 1000.
@@ -45,6 +58,14 @@ pub mod codes {
     pub const SESSION_NOT_RUNNING: i64 = 1005;
     pub const SESSION_START_FAILED: i64 = 1006;
     pub const ATTENTION_NOT_FOUND: i64 = 1007;
+    pub const DEPTH_LIMIT: i64 = 1008;
+    pub const WORKTREE_FAILED: i64 = 1009;
+    /// The agent is no longer waiting on this permission request.
+    pub const APPROVAL_GONE: i64 = 1010;
+    /// The session cannot be resumed (still running, not an agent, or no conversation found).
+    pub const NOT_RESUMABLE: i64 = 1011;
+    /// An orchestrator acted on a session it does not supervise.
+    pub const NOT_SUPERVISOR: i64 = 1012;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +178,9 @@ pub enum SessionState {
     Exited,
     /// Stopped on request via `session.stop`.
     Stopped,
+    /// Ended from outside: its terminal disappeared, e.g. because the machine restarted.
+    /// An agent session that was lost can be resumed.
+    Lost,
 }
 
 /// What the agent is doing, as the status model in CORVX_SPEC.md section 8.2 defines it.
@@ -188,6 +212,15 @@ pub struct Session {
     /// What owns the session's terminal: "tmux" (durable) or "pty" (ends with the daemon).
     #[serde(default)]
     pub backend: String,
+    /// The session this one answers to (an orchestrator), or None when it answers to you.
+    #[serde(default)]
+    pub supervisor: Option<String>,
+    /// The git worktree the session works in, when it has its own.
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// A readable label, e.g. "orchestrator · Build Snip". Shown in session lists.
+    #[serde(default)]
+    pub label: Option<String>,
     /// Whether the process is running, has exited, or was stopped.
     pub state: SessionState,
     pub pid: Option<u32>,
@@ -200,6 +233,18 @@ pub struct Session {
     pub agent_detail: Option<String>,
     /// Where `agent_state` came from: "hooks", or None when unknown.
     pub agent_source: Option<String>,
+    /// The runtime's own id for the conversation, e.g. Claude Code's session id. Used to resume.
+    #[serde(default)]
+    pub runtime_session: Option<String>,
+    /// CORVX approves the session's permission requests itself, without asking anyone.
+    #[serde(default)]
+    pub autopilot: bool,
+    /// For an orchestrator: the model its agents get unless it picks another.
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    /// For an orchestrator: its agents' permission requests go to you instead of to it.
+    #[serde(default)]
+    pub human_approves_agents: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,6 +259,115 @@ pub struct SessionStartParams {
     /// "tmux" or "pty". Omit for the node's default (tmux when it is installed).
     #[serde(default)]
     pub backend: Option<String>,
+    /// The session this one answers to. Its waiting, done and failed states go to the
+    /// supervisor instead of your inbox. Omit when you are the supervisor.
+    #[serde(default)]
+    pub supervisor: Option<String>,
+    /// Work in a new git worktree on its own branch, so parallel agents don't collide.
+    #[serde(default)]
+    pub worktree: bool,
+    /// A readable label for session lists, e.g. "agent · Backend API".
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Approve the session's permission requests without asking anyone.
+    #[serde(default)]
+    pub autopilot: bool,
+    /// For an orchestrator: the model its agents get unless it picks another.
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    /// For an orchestrator: send its agents' permission requests to you instead of to it.
+    #[serde(default)]
+    pub human_approves_agents: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionAutopilotParams {
+    pub id: String,
+    pub on: bool,
+    /// The orchestrator asking, which must supervise the session. None for a human.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// A question from an agent to a human. It appears in the inbox until answered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttentionAskParams {
+    /// The session asking.
+    pub session_id: String,
+    pub question: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttentionAnswerParams {
+    pub id: String,
+    pub answer: String,
+}
+
+/// A decision on an agent's permission request (an inbox item of kind "approval").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttentionDecideParams {
+    pub id: String,
+    /// "allow" (this once), "always" (and don't ask again for this kind of request), "deny",
+    /// or, for an orchestrator, "escalate" (pass it to the human).
+    pub decision: String,
+    /// For "deny": tells the agent why, or what to do instead. For "escalate": why the human
+    /// should decide.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The orchestrator deciding, which must supervise the session. None for a human.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionPermissionParams {
+    /// The session whose hook is waiting.
+    pub id: String,
+    /// The approval item the hook is waiting on.
+    pub item: String,
+}
+
+/// Where a permission request stands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PermissionStatus {
+    /// "pending", "decided", or "gone" (answered in the session, dismissed, or the agent moved on).
+    pub status: String,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionResumeParams {
+    pub id: String,
+}
+
+/// The sessions a resume started: the one asked for, and any lost agents it supervised.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SessionResumed {
+    pub sessions: Vec<Session>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionScreenParams {
+    pub id: String,
+}
+
+/// The visible screen of a session, as plain text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionScreen {
+    pub text: String,
+    pub state: SessionState,
+}
+
+/// An agent reporting on its own task, e.g. through the `report_done` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionReportParams {
+    pub id: String,
+    /// "done" or "failed".
+    pub outcome: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -273,18 +427,26 @@ pub struct SessionInputParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AttentionItem {
     pub id: String,
-    /// The agent state that raised it: "blocked", "waiting", "done" or "failed".
+    /// What raised it: an agent state ("blocked", "waiting", "done", "failed"), "question",
+    /// or "approval" (a permission request you can decide from the inbox).
     pub kind: String,
-    /// 3 = act now (blocked, failed); 2 = review (done); 1 = your move (waiting).
+    /// 3 = act now (blocked, failed); 2 = review (done); 1 = your move (waiting). An approval
+    /// at severity 1 is its agent's orchestrator's to decide; you may still decide it.
     pub severity: u8,
     pub project: String,
     pub session_id: String,
     pub summary: String,
-    /// "open", "snoozed", "resolved" or "dismissed".
+    /// "open", "snoozed", "answered", "resolved" or "dismissed".
     pub status: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub snooze_until: Option<i64>,
+    /// For questions: the answer, once given. For approvals: the decision.
+    #[serde(default)]
+    pub answer: Option<String>,
+    /// For an escalated approval: why the orchestrator passed it to you.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

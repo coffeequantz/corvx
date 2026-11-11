@@ -22,14 +22,17 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use corvx_core::service::{Core, ServiceError};
 use corvx_core::store::now_secs;
 use corvx_proto::{
-    codes, methods, AgentState, Session, SessionHookParams, SessionIdParams, SessionInputParams,
-    SessionList, SessionOutput, SessionOutputParams, SessionResizeParams, SessionStartParams,
-    SessionState,
+    codes, methods, AgentState, AttentionAskParams, AttentionDecideParams, PermissionStatus,
+    Session, SessionAutopilotParams, SessionHookParams, SessionIdParams, SessionInputParams,
+    SessionList, SessionOutput, SessionOutputParams, SessionPermissionParams, SessionReportParams,
+    SessionResizeParams, SessionResumeParams, SessionResumed, SessionScreen, SessionScreenParams,
+    SessionStartParams, SessionState,
 };
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::de::DeserializeOwned;
@@ -44,6 +47,16 @@ const SCROLLBACK_BYTES: usize = 256 * 1024;
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 const INITIAL_COLS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
+/// How deep delegation may go: you → orchestrator → agent → sub-agent.
+const MAX_DEPTH: usize = 3;
+/// How long Claude Code waits for a decision from the inbox before its permission hook gives
+/// up. The dialog in the session is shown all along, so answering there works at any time.
+const APPROVAL_HOOK_TIMEOUT_SECS: u64 = 86_400;
+/// A waiting permission hook asks for its decision twice a second. One that has not asked for
+/// this long is gone, and a decision would reach no one.
+const APPROVAL_LISTENER_GRACE: Duration = Duration::from_secs(5);
+/// Lost sessions from this far back are listed after a restart, so they can be resumed.
+const LOST_SESSIONS_SHOWN_SECS: i64 = 7 * 24 * 3600;
 
 /// Which backend owns a session's terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +185,10 @@ pub struct SessionManager {
     counter: u64,
     tmux: Option<Tmux>,
     default_backend: BackendKind,
+    /// When the permission hook waiting on each approval item last asked for its decision.
+    approval_listeners: HashMap<String, Instant>,
+    /// Where Claude Code keeps its conversations (`~/.claude/projects`), for resuming.
+    claude_projects: Option<PathBuf>,
 }
 
 impl SessionManager {
@@ -209,6 +226,8 @@ impl SessionManager {
             counter: 0,
             tmux,
             default_backend,
+            approval_listeners: HashMap::new(),
+            claude_projects: claude_projects_dir(),
         }
     }
 
@@ -252,7 +271,7 @@ impl SessionManager {
                     .append_event("session.adopted", &json!({"id": id}))?;
                 report.adopted += 1;
             } else {
-                session.state = SessionState::Stopped;
+                session.state = SessionState::Lost;
                 session.ended_at = Some(now_secs());
                 session.agent_state = AgentState::Stopped;
                 session.agent_detail = None;
@@ -265,9 +284,24 @@ impl SessionManager {
                 report.lost += 1;
             }
         }
-        // Items for sessions this daemon does not manage are stale.
+        // Recently lost sessions are listed, so they can be resumed.
+        for (session, one_shot) in core
+            .store()
+            .lost_sessions(now_secs() - LOST_SESSIONS_SHOWN_SECS)?
+        {
+            if self.entries.contains_key(&session.id) {
+                continue;
+            }
+            self.insert_ended(&logs, session, one_shot);
+        }
+        // Items for sessions this daemon does not run are stale. Questions stay: a resumed
+        // session can still take the answer.
         for item in core.store().list_attention(true, now_secs())? {
-            if !self.entries.contains_key(&item.session_id) {
+            let running = self
+                .entries
+                .get(&item.session_id)
+                .is_some_and(Entry::is_running);
+            if !running {
                 core.store().set_session_attention(
                     &item.session_id,
                     &item.project,
@@ -279,6 +313,31 @@ impl SessionManager {
             }
         }
         Ok(report)
+    }
+
+    /// Lists an ended session without running it.
+    fn insert_ended(&mut self, logs: &Path, session: Session, one_shot: bool) {
+        let id = session.id.clone();
+        let status = Status {
+            state: session.state,
+            exit_code: session.exit_code,
+            ended_at: session.ended_at,
+            agent_state: session.agent_state,
+            agent_detail: session.agent_detail.clone(),
+            agent_source: session.agent_source.clone(),
+        };
+        self.order.push(id.clone());
+        self.entries.insert(
+            id.clone(),
+            Entry {
+                transcript: logs.join(format!("{id}.log")),
+                session,
+                shared: new_shared(status),
+                backend: Backend::Tmux,
+                end_logged: true,
+                one_shot,
+            },
+        );
     }
 
     /// Notices sessions that ended on their own, so their status is current even when no
@@ -305,19 +364,19 @@ impl SessionManager {
             if !matches!(entry.backend, Backend::Tmux) || !entry.is_running() {
                 continue;
             }
-            let ended = match panes.get(id) {
+            let (state, code) = match panes.get(id) {
                 Some(pane) if !pane.dead => continue,
                 Some(pane) => {
                     let code = pane.exit_status;
                     let _ = tmux.kill(id);
-                    code
+                    (SessionState::Exited, code)
                 }
-                // Killed outside CORVX: the exit status is unknown.
-                None => None,
+                // Gone from outside CORVX, e.g. the machine is shutting down: lost, resumable.
+                None => (SessionState::Lost, None),
             };
             let mut st = lock(&entry.shared.status);
-            st.state = SessionState::Exited;
-            st.exit_code = ended;
+            st.state = state;
+            st.exit_code = code;
             st.ended_at = Some(now_secs());
         }
     }
@@ -364,10 +423,40 @@ impl SessionManager {
                 self.resize(&p)?;
                 Ok(json!({"ok": true}))
             }
+            methods::SESSION_SCREEN => {
+                let p: SessionScreenParams = parse(params)?;
+                to_value(self.screen(&p.id)?)
+            }
+            methods::SESSION_REPORT => {
+                let p: SessionReportParams = parse(params)?;
+                self.report(core, &p)?;
+                Ok(json!({"ok": true}))
+            }
+            methods::ATTENTION_ASK => {
+                let p: AttentionAskParams = parse(params)?;
+                let id = self.ask(core, &p)?;
+                Ok(json!({"id": id}))
+            }
             methods::SESSION_HOOK => {
                 let p: SessionHookParams = parse(params)?;
-                self.hook(core, &p)?;
+                self.hook(core, &p)
+            }
+            methods::SESSION_PERMISSION => {
+                let p: SessionPermissionParams = parse(params)?;
+                to_value(self.permission(core, &p)?)
+            }
+            methods::ATTENTION_DECIDE => {
+                let p: AttentionDecideParams = parse(params)?;
+                self.decide(core, &p)?;
                 Ok(json!({"ok": true}))
+            }
+            methods::SESSION_AUTOPILOT => {
+                let p: SessionAutopilotParams = parse(params)?;
+                to_value(self.autopilot(core, &p)?)
+            }
+            methods::SESSION_RESUME => {
+                let p: SessionResumeParams = parse(params)?;
+                to_value(self.resume(core, &p.id)?)
             }
             other => Err(ServiceError::Rpc(
                 codes::METHOD_NOT_FOUND,
@@ -403,128 +492,45 @@ impl SessionManager {
             })?,
         };
 
-        let id = self.new_id();
-        let start_failed = |e: &dyn Display| {
-            ServiceError::Rpc(
-                codes::SESSION_START_FAILED,
-                format!("cannot start '{}': {e}", p.command),
-            )
-        };
-
-        let logs = self.data_dir.join("sessions");
-        create_private_dir(&logs).map_err(internal)?;
-        let transcript_path = logs.join(format!("{id}.log"));
-        // Created owner-only before anything writes to it.
-        let transcript = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&transcript_path)
-            .map_err(internal)?;
-
-        // Runtime-specific setup. For Claude Code, register CORVX's hooks through a settings file.
-        let mut args = p.args.clone();
-        if p.runtime.as_deref() == Some("claude") {
-            let settings_path = logs.join(format!("{id}.settings.json"));
-            let hook_cmd = hook_command(&self.data_dir, &id);
-            write_private(
-                &settings_path,
-                claude_settings(&hook_cmd).to_string().as_bytes(),
-            )
-            .map_err(internal)?;
-            let mut with_settings = vec![
-                "--settings".to_string(),
-                settings_path.display().to_string(),
-            ];
-            with_settings.extend(args);
-            args = with_settings;
+        if let Some(supervisor) = &p.supervisor {
+            let depth = self.depth_of(supervisor)?;
+            if depth >= MAX_DEPTH {
+                return Err(ServiceError::Rpc(
+                    codes::DEPTH_LIMIT,
+                    format!("delegation is limited to {MAX_DEPTH} levels; '{supervisor}' is already at level {depth}"),
+                ));
+            }
         }
-        let env = vec![
-            ("CORVX_SESSION_ID".to_string(), id.clone()),
-            ("CORVX_PROJECT".to_string(), project.id.clone()),
-        ];
-        let cwd = PathBuf::from(&project.path);
 
-        let shared = new_shared(Status {
-            state: SessionState::Running,
-            exit_code: None,
-            ended_at: None,
-            agent_state: AgentState::Unknown,
-            agent_detail: None,
-            agent_source: None,
-        });
-
-        let (backend, pid) = match backend_kind {
-            BackendKind::Tmux => {
-                let tmux = self.tmux.as_ref().ok_or_else(|| {
-                    start_failed(&"tmux is not installed; install it, or use --backend pty")
-                })?;
-                drop(transcript); // tmux appends to it through pipe-pane
-                let mut argv = vec![p.command.clone()];
-                argv.extend(args);
-                let pid = tmux
-                    .start(
-                        &id,
-                        &cwd,
-                        INITIAL_COLS,
-                        INITIAL_ROWS,
-                        &env,
-                        &argv,
-                        &transcript_path,
-                    )
-                    .map_err(|e| start_failed(&e))?;
-                (Backend::Tmux, pid)
-            }
-            BackendKind::Pty => {
-                let pair = native_pty_system()
-                    .openpty(PtySize {
-                        rows: INITIAL_ROWS,
-                        cols: INITIAL_COLS,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .map_err(|e| start_failed(&e))?;
-                let mut cmd = CommandBuilder::new(&p.command);
-                cmd.args(&args);
-                cmd.cwd(&cwd);
-                for (k, v) in &env {
-                    cmd.env(k, v);
-                }
-                // Agents draw their interface from TERM. Without it some CLIs fall back to a plain mode.
-                cmd.env("TERM", "xterm-256color");
-                // Do not pass on variables that belong to whatever started the daemon. A parent
-                // Claude Code session's markers, for example, make the agent think it is a child session.
-                for (key, _) in std::env::vars_os() {
-                    if let Some(key) = key.to_str() {
-                        if is_inherited_agent_var(key) {
-                            cmd.env_remove(key);
-                        }
-                    }
-                }
-                let child = pair
-                    .slave
-                    .spawn_command(cmd)
-                    .map_err(|e| start_failed(&e))?;
-                drop(pair.slave);
-                let pid = child.process_id();
-                let killer = child.clone_killer();
-                let reader = pair
-                    .master
-                    .try_clone_reader()
-                    .map_err(|e| start_failed(&e))?;
-                let writer = pair.master.take_writer().map_err(|e| start_failed(&e))?;
-                spawn_reader(reader, transcript, Arc::clone(&shared));
-                spawn_waiter(child, Arc::clone(&shared));
-                (
-                    Backend::Pty {
-                        writer,
-                        master: pair.master,
-                        killer,
-                    },
-                    pid,
-                )
-            }
+        let id = self.new_id();
+        let args = self.runtime_args(&id, p.runtime.as_deref(), p.args.clone())?;
+        let worktree = if p.worktree {
+            Some(
+                create_worktree(Path::new(&project.path), &id)
+                    .map_err(|e| ServiceError::Rpc(codes::WORKTREE_FAILED, e))?,
+            )
+        } else {
+            None
         };
+        let cwd = worktree
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&project.path));
+        let (backend, pid, shared, transcript_path) = self
+            .spawn(
+                &id,
+                &project.id,
+                backend_kind,
+                &cwd,
+                &p.command,
+                args,
+                p.label.as_deref(),
+            )
+            .map_err(|e| {
+                ServiceError::Rpc(
+                    codes::SESSION_START_FAILED,
+                    format!("cannot start '{}': {e}", p.command),
+                )
+            })?;
 
         let mut command = vec![p.command.clone()];
         command.extend(p.args.iter().cloned());
@@ -534,6 +540,9 @@ impl SessionManager {
             command,
             runtime: p.runtime.clone(),
             backend: backend_kind.name().to_string(),
+            supervisor: p.supervisor.clone(),
+            worktree: worktree.as_ref().map(|w| w.display().to_string()),
+            label: p.label.clone(),
             state: SessionState::Running,
             pid,
             started_at: now_secs(),
@@ -542,6 +551,10 @@ impl SessionManager {
             agent_state: AgentState::Unknown,
             agent_detail: None,
             agent_source: None,
+            runtime_session: None,
+            autopilot: p.autopilot,
+            agent_model: p.agent_model.clone(),
+            human_approves_agents: p.human_approves_agents,
         };
         let entry = Entry {
             session: session.clone(),
@@ -560,6 +573,150 @@ impl SessionManager {
         self.order.push(id.clone());
         self.entries.insert(id, entry);
         Ok(session)
+    }
+
+    /// Arguments for a runtime, with CORVX's integration added. For Claude Code: a settings
+    /// file that registers CORVX's hooks, and an MCP config that gives it CORVX's tools.
+    fn runtime_args(
+        &self,
+        id: &str,
+        runtime: Option<&str>,
+        args: Vec<String>,
+    ) -> Result<Vec<String>, ServiceError> {
+        if runtime != Some("claude") {
+            return Ok(args);
+        }
+        let logs = self.data_dir.join("sessions");
+        create_private_dir(&logs).map_err(internal)?;
+        let settings_path = logs.join(format!("{id}.settings.json"));
+        let hook_cmd = hook_command(&self.data_dir, id);
+        write_private(
+            &settings_path,
+            claude_settings(&hook_cmd).to_string().as_bytes(),
+        )
+        .map_err(internal)?;
+        let mcp_path = logs.join(format!("{id}.mcp.json"));
+        write_private(
+            &mcp_path,
+            mcp_config(&self.data_dir, id).to_string().as_bytes(),
+        )
+        .map_err(internal)?;
+        // `--mcp-config` takes several values; `--settings` after it ends that list, so the
+        // agent's own arguments (such as a first prompt) are not taken as config files.
+        let mut with_settings = vec![
+            "--mcp-config".to_string(),
+            mcp_path.display().to_string(),
+            "--settings".to_string(),
+            settings_path.display().to_string(),
+        ];
+        with_settings.extend(args);
+        Ok(with_settings)
+    }
+
+    /// Starts a session's process in a terminal. Its transcript is appended to, so a resumed
+    /// session keeps one transcript.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &self,
+        id: &str,
+        project: &str,
+        backend_kind: BackendKind,
+        cwd: &Path,
+        program: &str,
+        args: Vec<String>,
+        label: Option<&str>,
+    ) -> Result<(Backend, Option<u32>, Arc<Shared>, PathBuf), String> {
+        let logs = self.data_dir.join("sessions");
+        create_private_dir(&logs).map_err(|e| e.to_string())?;
+        let transcript_path = logs.join(format!("{id}.log"));
+        // Created owner-only before anything writes to it.
+        let transcript = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&transcript_path)
+            .map_err(|e| e.to_string())?;
+        let env = vec![
+            ("CORVX_SESSION_ID".to_string(), id.to_string()),
+            ("CORVX_PROJECT".to_string(), project.to_string()),
+        ];
+        let shared = new_shared(Status {
+            state: SessionState::Running,
+            exit_code: None,
+            ended_at: None,
+            agent_state: AgentState::Unknown,
+            agent_detail: None,
+            agent_source: None,
+        });
+
+        let (backend, pid) = match backend_kind {
+            BackendKind::Tmux => {
+                let tmux = self
+                    .tmux
+                    .as_ref()
+                    .ok_or("tmux is not installed; install it, or use --backend pty")?;
+                drop(transcript); // tmux appends to it through pipe-pane
+                let mut argv = vec![program.to_string()];
+                argv.extend(args);
+                let pid = tmux.start(
+                    id,
+                    cwd,
+                    INITIAL_COLS,
+                    INITIAL_ROWS,
+                    &env,
+                    &argv,
+                    &transcript_path,
+                )?;
+                if let Some(label) = label {
+                    let _ = tmux.set_label(id, label);
+                }
+                (Backend::Tmux, pid)
+            }
+            BackendKind::Pty => {
+                let pair = native_pty_system()
+                    .openpty(PtySize {
+                        rows: INITIAL_ROWS,
+                        cols: INITIAL_COLS,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut cmd = CommandBuilder::new(program);
+                cmd.args(&args);
+                cmd.cwd(cwd);
+                for (k, v) in &env {
+                    cmd.env(k, v);
+                }
+                // Agents draw their interface from TERM. Without it some CLIs fall back to a plain mode.
+                cmd.env("TERM", "xterm-256color");
+                // Do not pass on variables that belong to whatever started the daemon. A parent
+                // Claude Code session's markers, for example, make the agent think it is a child session.
+                for (key, _) in std::env::vars_os() {
+                    if let Some(key) = key.to_str() {
+                        if is_inherited_agent_var(key) {
+                            cmd.env_remove(key);
+                        }
+                    }
+                }
+                let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+                drop(pair.slave);
+                let pid = child.process_id();
+                let killer = child.clone_killer();
+                let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+                let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+                spawn_reader(reader, transcript, Arc::clone(&shared));
+                spawn_waiter(child, Arc::clone(&shared));
+                (
+                    Backend::Pty {
+                        writer,
+                        master: pair.master,
+                        killer,
+                    },
+                    pid,
+                )
+            }
+        };
+        Ok((backend, pid, shared, transcript_path))
     }
 
     fn output(&self, id: &str, since: u64) -> Result<SessionOutput, ServiceError> {
@@ -589,6 +746,103 @@ impl SessionManager {
                 })
             }
         }
+    }
+
+    /// How many levels of supervision a session sits at: 1 when you supervise it directly.
+    fn depth_of(&self, id: &str) -> Result<usize, ServiceError> {
+        let mut depth = 0;
+        let mut current = Some(id.to_string());
+        while let Some(cur) = current {
+            let entry = self.entries.get(&cur).ok_or_else(|| not_found(&cur))?;
+            depth += 1;
+            if depth > MAX_DEPTH + 1 {
+                break; // a cycle would be a bug; stop rather than loop
+            }
+            current = entry.session.supervisor.clone();
+        }
+        Ok(depth)
+    }
+
+    /// The visible screen of a session as plain text.
+    fn screen(&self, id: &str) -> Result<SessionScreen, ServiceError> {
+        let entry = self.entries.get(id).ok_or_else(|| not_found(id))?;
+        let state = lock(&entry.shared.status).state;
+        let live = match &entry.backend {
+            Backend::Tmux if state == SessionState::Running => {
+                self.tmux.as_ref().and_then(|t| t.capture(id).ok())
+            }
+            Backend::Pty { .. } => {
+                let buf = lock(&entry.shared.output);
+                let from = buf.data.len().saturating_sub(16 * 1024);
+                Some(strip_ansi(&String::from_utf8_lossy(&buf.data[from..])))
+            }
+            _ => None,
+        };
+        // An ended tmux session has no screen; show the end of its transcript instead.
+        let text = match live {
+            Some(text) => text,
+            None => {
+                let len = fs::metadata(&entry.transcript)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let (bytes, _) = read_from(&entry.transcript, len.saturating_sub(16 * 1024))
+                    .map_err(internal)?;
+                strip_ansi(&String::from_utf8_lossy(&bytes))
+            }
+        };
+        Ok(SessionScreen { text, state })
+    }
+
+    /// An agent reports the outcome of its task (the `report_done` tool).
+    fn report(&mut self, core: &Core, p: &SessionReportParams) -> Result<(), ServiceError> {
+        let state = match p.outcome.as_str() {
+            "done" => AgentState::Done,
+            "failed" => AgentState::Failed,
+            other => {
+                return Err(ServiceError::Rpc(
+                    codes::INVALID_PARAMS,
+                    format!("unknown outcome '{other}': use done or failed"),
+                ))
+            }
+        };
+        let entry = self.entries.get(&p.id).ok_or_else(|| not_found(&p.id))?;
+        {
+            let mut st = lock(&entry.shared.status);
+            if st.state != SessionState::Running {
+                return Err(ServiceError::Rpc(
+                    codes::SESSION_NOT_RUNNING,
+                    format!("session '{}' is not running", p.id),
+                ));
+            }
+            st.agent_state = state;
+            st.agent_detail = Some(p.summary.clone());
+            st.agent_source = Some("self-report".into());
+        }
+        entry.persist(core)?;
+        core.store().append_event(
+            "session.reported",
+            &json!({"id": p.id, "outcome": p.outcome, "summary": p.summary}),
+        )?;
+        sync_attention(core, &entry.session, state, Some(&p.summary), None)
+    }
+
+    /// A session asks a human a question. Returns the question's attention item id.
+    fn ask(&self, core: &Core, p: &AttentionAskParams) -> Result<String, ServiceError> {
+        let entry = self
+            .entries
+            .get(&p.session_id)
+            .ok_or_else(|| not_found(&p.session_id))?;
+        let id = core.store().ask_question(
+            &p.session_id,
+            &entry.session.project,
+            &p.question,
+            now_secs(),
+        )?;
+        core.store().append_event(
+            "attention.asked",
+            &json!({"id": id, "session": p.session_id, "question": p.question}),
+        )?;
+        Ok(id)
     }
 
     fn resize(&self, p: &SessionResizeParams) -> Result<(), ServiceError> {
@@ -672,21 +926,85 @@ impl SessionManager {
         sync_attention(core, &entry.session, AgentState::Stopped, None, None)?;
         core.store()
             .append_event("session.stopped", &json!({"id": id}))?;
+        self.escalate_orphans(core, id)?;
         Ok(())
     }
 
-    /// Applies one runtime hook event to the agent's status.
-    fn hook(&mut self, core: &Core, p: &SessionHookParams) -> Result<(), ServiceError> {
-        let entry = self.entries.get(&p.id).ok_or_else(|| not_found(&p.id))?;
+    /// Applies one runtime hook event to the agent's status. A permission request also opens
+    /// an approval item; its id is returned so the waiting hook can ask for the decision.
+    fn hook(&mut self, core: &Core, p: &SessionHookParams) -> Result<Value, ServiceError> {
+        // Who decides this session's permission requests: its orchestrator, when one is running
+        // and has not left its agents' approvals to the human.
+        let orchestrator_decides = self
+            .entries
+            .get(&p.id)
+            .and_then(|e| e.session.supervisor.as_ref())
+            .and_then(|sup| self.entries.get(sup))
+            .is_some_and(|sup| sup.is_running() && !sup.session.human_approves_agents);
+        let entry = self
+            .entries
+            .get_mut(&p.id)
+            .ok_or_else(|| not_found(&p.id))?;
+        if lock(&entry.shared.status).state != SessionState::Running {
+            // A session that has ended keeps its final state.
+            return Ok(json!({"ok": true}));
+        }
+        // Every Claude Code hook names its conversation; keep it, to resume the session later.
+        let conversation = p.payload.get("session_id").and_then(Value::as_str);
+        if let Some(conv) = conversation {
+            if entry.session.runtime_session.as_deref() != Some(conv) {
+                entry.session.runtime_session = Some(conv.to_string());
+                entry.persist(core)?;
+            }
+        }
+
+        if p.event == "PermissionRequest" {
+            let summary = describe_request(&p.payload);
+            if entry.session.autopilot {
+                core.store().append_event(
+                    "attention.auto_approved",
+                    &json!({"session": p.id, "request": summary}),
+                )?;
+                return Ok(json!({"ok": true, "decision": "allow"}));
+            }
+            let severity = if orchestrator_decides { 1 } else { 3 };
+            let detail = format!("approve? {}", truncate(&summary, 120));
+            {
+                let mut st = lock(&entry.shared.status);
+                st.agent_state = AgentState::Blocked;
+                st.agent_detail = Some(detail.clone());
+                st.agent_source = Some("hooks".into());
+            }
+            entry.persist(core)?;
+            let item = core.store().open_approval(
+                &p.id,
+                &entry.session.project,
+                &summary,
+                severity,
+                now_secs(),
+            )?;
+            core.store().append_event(
+                "session.status",
+                &json!({"id": p.id, "agent_state": AgentState::Blocked, "detail": detail}),
+            )?;
+            core.store().append_event(
+                "attention.approval",
+                &json!({"id": item, "session": p.id, "request": summary,
+                        "decider": if orchestrator_decides { "orchestrator" } else { "human" }}),
+            )?;
+            return Ok(json!({"ok": true, "approval": item}));
+        }
+
         let Some((agent_state, detail)) = map_hook(&p.event, &p.payload) else {
-            return Ok(());
+            return Ok(json!({"ok": true}));
         };
+        // Claude Code also sends a notification when a permission dialog has waited a few
+        // seconds. The approval item already covers it.
+        if agent_state == AgentState::Blocked && core.store().has_open_approval(&p.id)? {
+            return Ok(json!({"ok": true}));
+        }
         let changed = {
             let mut st = lock(&entry.shared.status);
-            // A session that has ended keeps its final state.
-            if st.state != SessionState::Running {
-                return Ok(());
-            }
             let changed = st.agent_state != agent_state;
             st.agent_state = agent_state;
             st.agent_detail = detail.clone();
@@ -700,36 +1018,431 @@ impl SessionManager {
                 &json!({"id": p.id, "agent_state": agent_state, "detail": detail}),
             )?;
         }
-        if changed || agent_state == AgentState::Blocked {
+        if changed || agent_state == AgentState::Blocked || core.store().has_open_approval(&p.id)? {
             sync_attention(core, &entry.session, agent_state, detail.as_deref(), None)?;
+        }
+        Ok(json!({"ok": true}))
+    }
+
+    /// Asked by a waiting permission hook: whether its request has been decided.
+    fn permission(
+        &mut self,
+        core: &Core,
+        p: &SessionPermissionParams,
+    ) -> Result<PermissionStatus, ServiceError> {
+        let running = self.entries.get(&p.id).is_some_and(Entry::is_running);
+        let state = core.store().approval_state(&p.item)?;
+        let status = match state {
+            Some((status, decision, message)) if status == "answered" => PermissionStatus {
+                status: "decided".into(),
+                decision,
+                message,
+            },
+            Some((status, _, _)) if running && (status == "open" || status == "snoozed") => {
+                self.approval_listeners
+                    .insert(p.item.clone(), Instant::now());
+                return Ok(PermissionStatus {
+                    status: "pending".into(),
+                    decision: None,
+                    message: None,
+                });
+            }
+            _ => PermissionStatus {
+                status: "gone".into(),
+                decision: None,
+                message: None,
+            },
+        };
+        self.approval_listeners.remove(&p.item);
+        Ok(status)
+    }
+
+    /// Approves or denies a permission request from the inbox.
+    fn decide(&mut self, core: &Core, p: &AttentionDecideParams) -> Result<(), ServiceError> {
+        let valid = match p.decision.as_str() {
+            "allow" | "always" | "deny" => true,
+            // Only an orchestrator passes a request on; a human simply decides it.
+            "escalate" => p.by.is_some(),
+            _ => false,
+        };
+        if !valid {
+            return Err(ServiceError::Rpc(
+                codes::INVALID_PARAMS,
+                format!(
+                    "unknown decision '{}': use allow, always or deny{}",
+                    p.decision,
+                    if p.by.is_some() { ", or escalate" } else { "" }
+                ),
+            ));
+        }
+        let item = core
+            .store()
+            .get_attention(&p.id)?
+            .filter(|i| i.kind == "approval" && (i.status == "open" || i.status == "snoozed"))
+            .ok_or_else(|| {
+                ServiceError::Rpc(
+                    codes::ATTENTION_NOT_FOUND,
+                    format!("no open approval '{}'", p.id),
+                )
+            })?;
+        if let Some(by) = &p.by {
+            self.check_supervisor(&item.session_id, by)?;
+        }
+        if p.decision == "escalate" {
+            let reason = p
+                .message
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("wants you to decide");
+            core.store().escalate_approval(
+                &p.id,
+                &format!("orchestrator: {}", truncate(reason, 300)),
+                now_secs(),
+            )?;
+            core.store().append_event(
+                "attention.escalated",
+                &json!({"id": p.id, "session": item.session_id, "by": p.by, "reason": reason}),
+            )?;
+            return Ok(());
+        }
+        let running = self
+            .entries
+            .get(&item.session_id)
+            .is_some_and(Entry::is_running);
+        let listening = self
+            .approval_listeners
+            .get(&p.id)
+            .is_some_and(|t| t.elapsed() < APPROVAL_LISTENER_GRACE);
+        if !running || !listening {
+            // The hook stopped waiting (it timed out, or the daemon restarted meanwhile). The
+            // dialog in the session is the only way left to answer.
+            core.store()
+                .dismiss_attention(&p.id, "no longer waiting", now_secs())?;
+            if running {
+                core.store().set_session_attention(
+                    &item.session_id,
+                    &item.project,
+                    "blocked",
+                    &format!("{} · answer it in the session", item.summary),
+                    3,
+                    now_secs(),
+                )?;
+            }
+            return Err(ServiceError::Rpc(
+                codes::APPROVAL_GONE,
+                "the agent is no longer waiting for this decision; attach to its session to answer"
+                    .into(),
+            ));
+        }
+        core.store()
+            .decide_approval(&p.id, &p.decision, p.message.as_deref(), now_secs())?;
+        core.store().append_event(
+            "attention.decided",
+            &json!({"id": p.id, "session": item.session_id, "decision": p.decision,
+                    "by": p.by.as_deref().unwrap_or("human")}),
+        )?;
+        Ok(())
+    }
+
+    /// An orchestrator may only act on the sessions it supervises.
+    fn check_supervisor(&self, id: &str, by: &str) -> Result<(), ServiceError> {
+        let supervisor = self
+            .entries
+            .get(id)
+            .ok_or_else(|| not_found(id))?
+            .session
+            .supervisor
+            .as_deref();
+        if supervisor != Some(by) {
+            return Err(ServiceError::Rpc(
+                codes::NOT_SUPERVISOR,
+                format!("'{by}' does not supervise '{id}'"),
+            ));
         }
         Ok(())
     }
 
+    /// Turns a session's autopilot on or off. Turning it on also approves the request it is
+    /// waiting on, if any.
+    fn autopilot(
+        &mut self,
+        core: &Core,
+        p: &SessionAutopilotParams,
+    ) -> Result<Session, ServiceError> {
+        if let Some(by) = &p.by {
+            self.check_supervisor(&p.id, by)?;
+        }
+        let entry = self
+            .entries
+            .get_mut(&p.id)
+            .ok_or_else(|| not_found(&p.id))?;
+        entry.session.autopilot = p.on;
+        entry.persist(core)?;
+        let snapshot = entry.snapshot();
+        core.store().append_event(
+            "session.autopilot",
+            &json!({"id": p.id, "on": p.on, "by": p.by.as_deref().unwrap_or("human")}),
+        )?;
+        if p.on {
+            if let Some(item) = core.store().open_approval_for(&p.id)? {
+                let listening = self
+                    .approval_listeners
+                    .get(&item.id)
+                    .is_some_and(|t| t.elapsed() < APPROVAL_LISTENER_GRACE);
+                if listening {
+                    core.store()
+                        .decide_approval(&item.id, "allow", None, now_secs())?;
+                    core.store().append_event(
+                        "attention.auto_approved",
+                        &json!({"session": p.id, "request": item.summary}),
+                    )?;
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// When an orchestrator ends, the requests its agents are waiting on go to the human.
+    fn escalate_orphans(&self, core: &Core, ended: &str) -> Result<(), ServiceError> {
+        for entry in self.entries.values() {
+            if entry.session.supervisor.as_deref() != Some(ended) || !entry.is_running() {
+                continue;
+            }
+            if let Some(item) = core.store().open_approval_for(&entry.session.id)? {
+                if item.severity < 3 {
+                    core.store().escalate_approval(
+                        &item.id,
+                        "its orchestrator has ended",
+                        now_secs(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts an interrupted agent session again, continuing its conversation, together with
+    /// the lost agents it supervised. Agents in an orchestration are told what happened.
+    fn resume(&mut self, core: &Core, id: &str) -> Result<SessionResumed, ServiceError> {
+        let (root, _) = self.ended_record(core, id)?;
+        // The lost agents under it, whole tree. Agents stopped on purpose stay stopped.
+        let mut agents: Vec<Session> = Vec::new();
+        let mut stopped: Vec<Session> = Vec::new();
+        let mut queue = vec![root.id.clone()];
+        while let Some(parent) = queue.pop() {
+            for (child, _) in core.store().supervised_by(&parent)? {
+                let live = self.entries.get(&child.id).map(Entry::snapshot);
+                let child = live.unwrap_or(child);
+                match child.state {
+                    SessionState::Lost => {
+                        queue.push(child.id.clone());
+                        agents.push(child);
+                    }
+                    SessionState::Running => {}
+                    _ => stopped.push(child),
+                }
+            }
+        }
+
+        let mut resumed = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for agent in &agents {
+            let nudge = "[CORVX] This session was interrupted (the machine or CORVX restarted) and \
+                         has been resumed. Continue your task where you left off. If you had already \
+                         finished, say so in one line."
+                .to_string();
+            match self.resume_one(core, &agent.id, Some(nudge)) {
+                Ok(s) => resumed.push(s),
+                Err(e) => {
+                    failed.push(format!("{} ({})", agent.id, error_text(&e)));
+                    core.store().append_event(
+                        "session.resume_failed",
+                        &json!({"id": agent.id, "error": error_text(&e)}),
+                    )?;
+                }
+            }
+        }
+        let in_orchestration =
+            root.supervisor.is_some() || !agents.is_empty() || !stopped.is_empty();
+        let nudge = in_orchestration.then(|| {
+            let mut text = "[CORVX] This session was interrupted (the machine or CORVX restarted) \
+                            and has been resumed. Any tool call in progress, such as wait_for, was cut off."
+                .to_string();
+            let names = |list: &[Session]| {
+                list.iter()
+                    .map(|s| format!("{} ({})", s.id, s.label.as_deref().unwrap_or("agent")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if !resumed.is_empty() {
+                text.push_str(&format!(" Resumed with you: {}.", names(&resumed)));
+            }
+            if !failed.is_empty() {
+                text.push_str(&format!(" Could not be resumed: {}.", failed.join(", ")));
+            }
+            if !stopped.is_empty() {
+                text.push_str(&format!(" Already stopped before: {}.", names(&stopped)));
+            }
+            text.push_str(" Check with list_agents, then continue.");
+            text
+        });
+        let root_session = self.resume_one(core, &root.id, nudge)?;
+        let mut sessions = vec![root_session];
+        sessions.extend(resumed);
+        Ok(SessionResumed { sessions })
+    }
+
+    /// The record of an ended session, from this daemon or the store.
+    fn ended_record(&self, core: &Core, id: &str) -> Result<(Session, bool), ServiceError> {
+        if let Some(entry) = self.entries.get(id) {
+            return Ok((entry.snapshot(), entry.one_shot));
+        }
+        core.store().get_session(id)?.ok_or_else(|| not_found(id))
+    }
+
+    /// Resumes one session under its old id, so its supervisor, hooks and tools still match.
+    fn resume_one(
+        &mut self,
+        core: &Core,
+        id: &str,
+        prompt: Option<String>,
+    ) -> Result<Session, ServiceError> {
+        let not_resumable = |why: String| ServiceError::Rpc(codes::NOT_RESUMABLE, why);
+        let (mut session, one_shot) = self.ended_record(core, id)?;
+        if session.state == SessionState::Running {
+            return Err(not_resumable(format!("session '{id}' is still running")));
+        }
+        if session.runtime.as_deref() != Some("claude") || one_shot {
+            return Err(not_resumable(format!(
+                "session '{id}' is not an interactive Claude Code session; only those can be resumed"
+            )));
+        }
+        let project = core.store().get_project(&session.project)?.ok_or_else(|| {
+            not_resumable(format!(
+                "its project '{}' is no longer registered",
+                session.project
+            ))
+        })?;
+        let cwd = session
+            .worktree
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&project.path));
+        if !cwd.is_dir() {
+            return Err(not_resumable(format!(
+                "its directory {} is gone",
+                cwd.display()
+            )));
+        }
+        let conversation = session
+            .runtime_session
+            .clone()
+            .or_else(|| {
+                let dir = self.claude_projects.as_ref()?;
+                find_claude_conversation(dir, &cwd, session.started_at, session.ended_at)
+            })
+            .ok_or_else(|| {
+                not_resumable(format!(
+                    "no Claude Code conversation found for session '{id}'"
+                ))
+            })?;
+
+        let mut args = resume_args(session.command.get(1..).unwrap_or_default());
+        args.push("--resume".into());
+        args.push(conversation.clone());
+        if let Some(prompt) = prompt {
+            args.push(prompt);
+        }
+        let args = self.runtime_args(id, Some("claude"), args)?;
+        let backend_kind = match BackendKind::parse(&session.backend) {
+            Some(BackendKind::Tmux) if self.tmux.is_some() => BackendKind::Tmux,
+            _ => self.default_backend,
+        };
+        let program = session
+            .command
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "claude".into());
+        let (backend, pid, shared, transcript) = self
+            .spawn(
+                id,
+                &session.project,
+                backend_kind,
+                &cwd,
+                &program,
+                args,
+                session.label.as_deref(),
+            )
+            .map_err(|e| {
+                ServiceError::Rpc(
+                    codes::SESSION_START_FAILED,
+                    format!("cannot resume '{id}': {e}"),
+                )
+            })?;
+        session.state = SessionState::Running;
+        session.backend = backend_kind.name().to_string();
+        session.pid = pid;
+        session.ended_at = None;
+        session.exit_code = None;
+        session.agent_state = AgentState::Unknown;
+        session.agent_detail = None;
+        session.agent_source = None;
+        session.runtime_session = Some(conversation.clone());
+        let entry = Entry {
+            session: session.clone(),
+            shared,
+            backend,
+            transcript,
+            end_logged: false,
+            one_shot,
+        };
+        entry.persist(core)?;
+        core.store().append_event(
+            "session.resumed",
+            &json!({"id": id, "conversation": conversation}),
+        )?;
+        if !self.order.iter().any(|o| o == id) {
+            self.order.push(id.to_string());
+        }
+        self.entries.insert(id.to_string(), entry);
+        Ok(session)
+    }
+
     /// Records how sessions that ended on their own finished, and sets their agent state.
     fn record_ends(&mut self, core: &Core) -> Result<(), ServiceError> {
+        let mut ended = Vec::new();
         for (id, entry) in self.entries.iter_mut() {
             if entry.end_logged {
                 continue;
             }
             let st = lock(&entry.shared.status).clone();
-            if st.state == SessionState::Exited {
+            if matches!(st.state, SessionState::Exited | SessionState::Lost) {
                 entry.end_logged = true;
                 {
                     let mut live = lock(&entry.shared.status);
                     // The process is gone, so a detail from its last turn no longer applies.
                     live.agent_detail = None;
-                    live.agent_state =
-                        final_agent_state(st.exit_code, live.agent_state, entry.one_shot);
+                    live.agent_state = if st.state == SessionState::Lost {
+                        AgentState::Stopped
+                    } else {
+                        final_agent_state(st.exit_code, live.agent_state, entry.one_shot)
+                    };
                 }
                 entry.persist(core)?;
                 let final_state = lock(&entry.shared.status).agent_state;
                 sync_attention(core, &entry.session, final_state, None, st.exit_code)?;
-                core.store().append_event(
-                    "session.exited",
-                    &json!({"id": id, "exit_code": st.exit_code}),
-                )?;
+                let kind = if st.state == SessionState::Lost {
+                    "session.lost"
+                } else {
+                    "session.exited"
+                };
+                core.store()
+                    .append_event(kind, &json!({"id": id, "exit_code": st.exit_code}))?;
+                ended.push(id.clone());
             }
+        }
+        for id in ended {
+            self.escalate_orphans(core, &id)?;
         }
         Ok(())
     }
@@ -766,6 +1479,24 @@ fn sync_attention(
     detail: Option<&str>,
     exit_code: Option<i32>,
 ) -> Result<(), ServiceError> {
+    if session.supervisor.is_some()
+        && matches!(
+            state,
+            AgentState::Waiting | AgentState::Done | AgentState::Failed
+        )
+    {
+        // Its supervisor sees these through `wait_for`. Your inbox only gets what needs a
+        // human: permission requests (blocked) and questions.
+        core.store().set_session_attention(
+            &session.id,
+            &session.project,
+            "supervised",
+            "",
+            0,
+            now_secs(),
+        )?;
+        return Ok(());
+    }
     let (kind, severity, summary) = match state {
         AgentState::Blocked => (
             "blocked",
@@ -777,7 +1508,11 @@ fn sync_attention(
             1,
             "waiting for your next instruction".to_string(),
         ),
-        AgentState::Done => ("done", 2, "finished · ready for review".to_string()),
+        AgentState::Done => (
+            "done",
+            2,
+            detail.unwrap_or("finished · ready for review").to_string(),
+        ),
         AgentState::Failed => (
             "failed",
             3,
@@ -886,12 +1621,176 @@ fn is_idle_notification(payload: &Value, message: &str) -> bool {
     }
 }
 
+/// A permission request in one line, e.g. "Bash: npm test · Run the tests".
+fn describe_request(payload: &Value) -> String {
+    let tool = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("a tool");
+    let input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
+    let field = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
+    let main = [
+        "command",
+        "file_path",
+        "notebook_path",
+        "url",
+        "query",
+        "pattern",
+        "path",
+    ]
+    .iter()
+    .find_map(|k| field(k))
+    .unwrap_or_else(|| match &input {
+        Value::Null => String::new(),
+        other => other.to_string(),
+    });
+    let mut text = if main.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{tool}: {main}")
+    };
+    if let Some(desc) = field("description") {
+        text.push_str(" · ");
+        text.push_str(&desc);
+    }
+    truncate(&text.replace('\n', " ⏎ "), 400)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn error_text(e: &ServiceError) -> String {
+    e.to_string()
+}
+
+/// The original arguments of a Claude Code session without its first prompt, to resume it with
+/// the same model, permission mode and system prompt. CORVX's own config flags are left out;
+/// they are added again.
+fn resume_args(args: &[String]) -> Vec<String> {
+    const WITH_VALUE: &[&str] = &[
+        "--model",
+        "--permission-mode",
+        "--append-system-prompt",
+        "--system-prompt",
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--agent",
+        "--effort",
+        "--fallback-model",
+        "--name",
+        "-n",
+    ];
+    const CORVX_OWN: &[&str] = &["--mcp-config", "--settings"];
+    const DROP_FLAGS: &[&str] = &["--resume", "-r", "--continue", "-c", "--session-id"];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let flag = arg.split('=').next().unwrap_or(arg);
+        let has_inline = arg.contains('=');
+        if CORVX_OWN.contains(&flag) || DROP_FLAGS.contains(&flag) {
+            // Skip the flag and its value. `--resume`/`--session-id` take one; `-c` none.
+            let takes_value = !has_inline && !matches!(flag, "--continue" | "-c");
+            i += if takes_value { 2 } else { 1 };
+            continue;
+        }
+        if WITH_VALUE.contains(&flag) {
+            out.push(arg.clone());
+            if !has_inline {
+                if let Some(v) = args.get(i + 1) {
+                    out.push(v.clone());
+                }
+                i += 1;
+            }
+        } else if arg.starts_with('-') {
+            out.push(arg.clone()); // a switch, e.g. --verbose
+        }
+        // Anything else is the first prompt: the conversation already has it.
+        i += 1;
+    }
+    out
+}
+
+/// Where Claude Code keeps its conversations.
+fn claude_projects_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
+    };
+    Some(base.join("projects"))
+}
+
+/// Finds the conversation a Claude Code session started in `cwd` at `started_at`, for sessions
+/// recorded before CORVX kept the conversation id: the first conversation file created there
+/// after the session started (and before it ended).
+fn find_claude_conversation(
+    projects: &Path,
+    cwd: &Path,
+    started_at: i64,
+    ended_at: Option<i64>,
+) -> Option<String> {
+    let slug: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let latest = ended_at.unwrap_or(i64::MAX).min(started_at + 3600);
+    let mut best: Option<(i64, String)> = None;
+    for entry in fs::read_dir(projects.join(slug)).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Some(created) = meta
+            .created()
+            .or_else(|_| meta.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+        else {
+            continue;
+        };
+        if created < started_at - 5 || created > latest {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !best.as_ref().is_some_and(|(t, _)| *t <= created) {
+            best = Some((created, stem.to_string()));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// Settings for Claude Code that register CORVX's hook command for the events we use.
 fn claude_settings(hook_cmd: &str) -> Value {
     // A short timeout: if the daemon is slow or gone, the agent must not stall on our hook.
     let entry = json!([{"hooks": [{"type": "command", "command": hook_cmd, "timeout": 5}]}]);
+    // Waits for your decision from the inbox. The dialog shows in the session meanwhile, and
+    // whichever answer comes first applies.
+    let permission = json!([{"hooks": [{"type": "command", "command": hook_cmd,
+                                         "timeout": APPROVAL_HOOK_TIMEOUT_SECS}]}]);
     json!({
+        "permissions": {"allow": ["mcp__corvx"]},
         "hooks": {
+            "PermissionRequest": permission,
             "UserPromptSubmit": entry,
             "PreToolUse": entry,
             "PostToolUse": entry,
@@ -899,6 +1798,121 @@ fn claude_settings(hook_cmd: &str) -> Value {
             "Stop": entry,
         }
     })
+}
+
+/// MCP config that gives a Claude Code session CORVX's tools (`corvx mcp`).
+fn mcp_config(data_dir: &Path, session_id: &str) -> Value {
+    json!({
+        "mcpServers": {
+            "corvx": {
+                "type": "stdio",
+                "command": corvx_bin().display().to_string(),
+                "args": ["--data-dir", data_dir.display().to_string(), "mcp"],
+                "env": {"CORVX_SESSION_ID": session_id}
+            }
+        }
+    })
+}
+
+/// Creates `<repo>/.corvx/worktrees/<id>` on a new branch `corvx/<id>`, and keeps the
+/// worktrees folder out of `git status`.
+fn create_worktree(repo: &Path, id: &str) -> Result<PathBuf, String> {
+    let git = |dir: &Path, args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    };
+    let top = git(repo, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| format!("{} is not a git repository", repo.display()))?;
+    let top = PathBuf::from(top);
+    git(&top, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|_| "the repository has no commits yet; make a first commit".to_string())?;
+    let path = top.join(".corvx").join("worktrees").join(id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let branch = format!("corvx/{id}");
+    git(
+        &top,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &path.to_string_lossy(),
+            "HEAD",
+        ],
+    )?;
+    if let Ok(common) = git(&top, &["rev-parse", "--git-common-dir"]) {
+        let common = if Path::new(&common).is_absolute() {
+            PathBuf::from(common)
+        } else {
+            top.join(common)
+        };
+        let exclude = common.join("info").join("exclude");
+        let current = fs::read_to_string(&exclude).unwrap_or_default();
+        if !current.lines().any(|l| l.trim() == ".corvx/worktrees/") {
+            let sep = if current.is_empty() || current.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            if let Some(parent) = exclude.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&exclude, format!("{current}{sep}.corvx/worktrees/\n"));
+        }
+    }
+    Ok(path)
+}
+
+/// Removes terminal escape sequences, leaving readable text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one final byte in @..~
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: until BEL or ESC \
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Two-character sequences, e.g. ESC ( B
+                Some('(') | Some(')') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\r' => {}
+            c if (c as u32) < 0x20 && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The command Claude Code runs for each hook. It forwards the event to the daemon.
@@ -963,6 +1977,7 @@ fn describe(state: SessionState) -> &'static str {
         SessionState::Running => "running",
         SessionState::Exited => "exited",
         SessionState::Stopped => "stopped",
+        SessionState::Lost => "lost",
     }
 }
 
@@ -1701,5 +2716,809 @@ mod tests {
         );
         assert!(open_kinds(&f, &id).is_empty(), "stale items are cleared");
         assert!(f.core.store().running_sessions().unwrap().is_empty());
+        // Still listed, as lost, so it can be resumed.
+        assert_eq!(session_state(&mut f, &id).state, SessionState::Lost);
+    }
+
+    fn hook_reply(f: &mut Fixture, id: &str, event: &str, payload: Value) -> Value {
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_HOOK,
+                json!({"id": id, "event": event, "payload": payload}),
+            )
+            .unwrap()
+    }
+
+    fn poll(f: &mut Fixture, id: &str, item: &str) -> PermissionStatus {
+        serde_json::from_value(
+            f.mgr
+                .handle(
+                    &f.core,
+                    methods::SESSION_PERMISSION,
+                    json!({"id": id, "item": item}),
+                )
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn decide(f: &mut Fixture, item: &str, decision: &str) -> Result<Value, ServiceError> {
+        f.mgr.handle(
+            &f.core,
+            methods::ATTENTION_DECIDE,
+            json!({"id": item, "decision": decision}),
+        )
+    }
+
+    fn bash_request(command: &str) -> Value {
+        json!({"session_id": "conv-1", "tool_name": "Bash",
+               "tool_input": {"command": command, "description": "Run the tests"},
+               "permission_suggestions": []})
+    }
+
+    fn start_supervised(f: &mut Fixture, supervisor: &str, extra: Value) -> String {
+        let mut params = json!({"project": f.project_id, "command": "sleep", "args": ["30"],
+                                "supervisor": supervisor});
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        let v = f
+            .mgr
+            .handle(&f.core, methods::SESSION_START, params)
+            .unwrap();
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    fn decide_as(
+        f: &mut Fixture,
+        item: &str,
+        decision: &str,
+        by: &str,
+        message: Option<&str>,
+    ) -> Result<Value, ServiceError> {
+        f.mgr.handle(
+            &f.core,
+            methods::ATTENTION_DECIDE,
+            json!({"id": item, "decision": decision, "by": by, "message": message}),
+        )
+    }
+
+    fn stop_all(f: &mut Fixture, ids: &[&str]) {
+        for id in ids {
+            let _ = f
+                .mgr
+                .handle(&f.core, methods::SESSION_STOP, json!({"id": id}));
+        }
+    }
+
+    #[test]
+    fn an_orchestrator_decides_its_agents_requests() {
+        let mut f = fixture();
+        let orch = start(&mut f, "sleep", &["30"]);
+        let agent = start_supervised(&mut f, &orch, json!({}));
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm test"),
+        );
+        let item = reply["approval"].as_str().unwrap().to_string();
+        let open = open_items(&f);
+        assert_eq!(open.len(), 1);
+        assert_eq!(
+            open[0].severity, 1,
+            "the orchestrator's to decide, not yours"
+        );
+        assert_eq!(poll(&mut f, &agent, &item).status, "pending");
+
+        // Only its own supervisor may decide it.
+        let stranger = start(&mut f, "sleep", &["30"]);
+        let err = decide_as(&mut f, &item, "allow", &stranger, None).unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)),
+            "{err:?}"
+        );
+
+        decide_as(&mut f, &item, "deny", &orch, Some("use make test")).unwrap();
+        let status = poll(&mut f, &agent, &item);
+        assert_eq!(status.decision.as_deref(), Some("deny"));
+        assert_eq!(status.message.as_deref(), Some("use make test"));
+        let decided = f.core.store().recent_events(5).unwrap();
+        assert!(decided
+            .iter()
+            .any(|e| e.kind == "attention.decided" && e.payload["by"] == json!(orch)));
+        stop_all(&mut f, &[&agent, &orch, &stranger]);
+    }
+
+    #[test]
+    fn an_orchestrator_escalates_what_it_should_not_decide() {
+        let mut f = fixture();
+        let orch = start(&mut f, "sleep", &["30"]);
+        let agent = start_supervised(&mut f, &orch, json!({}));
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("git push"),
+        );
+        let item = reply["approval"].as_str().unwrap().to_string();
+        assert_eq!(poll(&mut f, &agent, &item).status, "pending");
+        decide_as(
+            &mut f,
+            &item,
+            "escalate",
+            &orch,
+            Some("pushes to the remote"),
+        )
+        .unwrap();
+        let open = open_items(&f);
+        assert_eq!(open[0].severity, 3);
+        assert_eq!(
+            open[0].note.as_deref(),
+            Some("orchestrator: pushes to the remote")
+        );
+        assert_eq!(
+            poll(&mut f, &agent, &item).status,
+            "pending",
+            "still waiting, now on you"
+        );
+        // Humans decide; they do not escalate.
+        assert!(decide(&mut f, &item, "escalate").is_err());
+        decide(&mut f, &item, "allow").unwrap();
+        assert_eq!(
+            poll(&mut f, &agent, &item).decision.as_deref(),
+            Some("allow")
+        );
+        stop_all(&mut f, &[&agent, &orch]);
+    }
+
+    #[test]
+    fn requests_go_to_the_human_when_the_orchestrator_leaves_them_or_is_gone() {
+        let mut f = fixture();
+        let polite = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::SESSION_START,
+                json!({"project": f.project_id, "command": "sleep", "args": ["30"],
+                       "human_approves_agents": true}),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let agent = start_supervised(&mut f, &polite, json!({}));
+        hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm test"),
+        );
+        assert_eq!(open_items(&f)[0].severity, 3);
+
+        // An orchestrator that ends passes its agents' open requests to you.
+        let orch = start(&mut f, "sleep", &["30"]);
+        let other = start_supervised(&mut f, &orch, json!({}));
+        let reply = hook_reply(&mut f, &other, "PermissionRequest", bash_request("ls"));
+        let item = reply["approval"].as_str().unwrap().to_string();
+        assert_eq!(
+            f.core
+                .store()
+                .get_attention(&item)
+                .unwrap()
+                .unwrap()
+                .severity,
+            1
+        );
+        stop_all(&mut f, &[&orch]);
+        let escalated = f.core.store().get_attention(&item).unwrap().unwrap();
+        assert_eq!(escalated.severity, 3);
+        assert_eq!(
+            escalated.note.as_deref(),
+            Some("its orchestrator has ended")
+        );
+        // Later requests go straight to you.
+        hook_reply(&mut f, &other, "PermissionRequest", bash_request("ls -la"));
+        assert_eq!(
+            f.core
+                .store()
+                .open_approval_for(&other)
+                .unwrap()
+                .unwrap()
+                .severity,
+            3
+        );
+        stop_all(&mut f, &[&agent, &polite, &other]);
+    }
+
+    #[test]
+    fn autopilot_approves_without_asking() {
+        let mut f = fixture();
+        let orch = start(&mut f, "sleep", &["30"]);
+        let agent = start_supervised(&mut f, &orch, json!({}));
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm test"),
+        );
+        let item = reply["approval"].as_str().unwrap().to_string();
+        assert_eq!(poll(&mut f, &agent, &item).status, "pending");
+
+        // Turning it on approves the request the agent is waiting on.
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": agent, "on": true, "by": orch}),
+            )
+            .unwrap();
+        assert_eq!(
+            poll(&mut f, &agent, &item).decision.as_deref(),
+            Some("allow")
+        );
+        assert!(session_state(&mut f, &agent).autopilot);
+
+        let reply = hook_reply(
+            &mut f,
+            &agent,
+            "PermissionRequest",
+            bash_request("npm run build"),
+        );
+        assert_eq!(reply["decision"], json!("allow"));
+        assert!(reply.get("approval").is_none());
+        assert!(open_items(&f).is_empty(), "nothing to decide");
+        let events = f.core.store().recent_events(10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "attention.auto_approved"
+            && e.payload["request"] == json!("Bash: npm run build · Run the tests")));
+
+        // An orchestrator cannot put itself on autopilot; you can.
+        let err = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": orch, "on": true, "by": orch}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(codes::NOT_SUPERVISOR, _)));
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_AUTOPILOT,
+                json!({"id": agent, "on": false}),
+            )
+            .unwrap();
+        let reply = hook_reply(&mut f, &agent, "PermissionRequest", bash_request("rm x"));
+        assert!(reply.get("approval").is_some(), "asks again: {reply}");
+        stop_all(&mut f, &[&agent, &orch]);
+    }
+
+    #[test]
+    fn permission_requests_are_decided_from_the_inbox() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        let reply = hook_reply(&mut f, &id, "PermissionRequest", bash_request("npm test"));
+        let item = reply["approval"].as_str().unwrap().to_string();
+        let open = open_items(&f);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, "approval");
+        assert_eq!(open[0].summary, "Bash: npm test · Run the tests");
+        assert_eq!(session_state(&mut f, &id).agent_state, AgentState::Blocked);
+        assert_eq!(poll(&mut f, &id, &item).status, "pending");
+
+        // Claude Code's own reminder a few seconds later does not replace the approval.
+        send_hook(
+            &mut f,
+            &id,
+            "Notification",
+            json!({"message": "Claude needs your permission to use Bash",
+                   "notification_type": "permission_prompt"}),
+        );
+        assert_eq!(open_kinds(&f, &id), vec!["approval"]);
+
+        decide(&mut f, &item, "allow").unwrap();
+        let status = poll(&mut f, &id, &item);
+        assert_eq!(status.status, "decided");
+        assert_eq!(status.decision.as_deref(), Some("allow"));
+        assert!(open_kinds(&f, &id).is_empty());
+        // Hooks name the conversation, which is kept for resuming.
+        assert_eq!(
+            session_state(&mut f, &id).runtime_session.as_deref(),
+            Some("conv-1")
+        );
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_approval_answered_in_the_session_goes_away() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        let reply = hook_reply(&mut f, &id, "PermissionRequest", bash_request("make"));
+        let item = reply["approval"].as_str().unwrap().to_string();
+        assert_eq!(poll(&mut f, &id, &item).status, "pending");
+        // The human answered the dialog in the session; the tool ran.
+        send_hook(&mut f, &id, "PostToolUse", json!({"tool_name": "Bash"}));
+        assert!(open_kinds(&f, &id).is_empty());
+        assert_eq!(poll(&mut f, &id, &item).status, "gone");
+        assert!(decide(&mut f, &item, "allow").is_err());
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_decision_nobody_waits_for_falls_back_to_the_session() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        let reply = hook_reply(&mut f, &id, "PermissionRequest", bash_request("make"));
+        let item = reply["approval"].as_str().unwrap().to_string();
+        // No hook is polling for it (it timed out, or the daemon restarted).
+        match decide(&mut f, &item, "allow") {
+            Err(ServiceError::Rpc(code, _)) => assert_eq!(code, codes::APPROVAL_GONE),
+            other => panic!("expected APPROVAL_GONE, got {other:?}"),
+        }
+        let open = open_items(&f);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, "blocked");
+        assert!(open[0].summary.ends_with("answer it in the session"));
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn claude_sessions_register_the_permission_hook_with_a_long_timeout() {
+        let settings = claude_settings("corvx session hook s1");
+        let hook = &settings["hooks"]["PermissionRequest"][0]["hooks"][0];
+        assert_eq!(hook["command"], "corvx session hook s1");
+        assert!(hook["timeout"].as_u64().unwrap() >= 3600);
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["timeout"], 5);
+    }
+
+    /// A stand-in agent that records its arguments, one per line, then waits.
+    fn recording_agent(f: &Fixture) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = f.data.path().join("agent.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.$CORVX_SESSION_ID.args\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn recorded_args(script: &Path, id: &str) -> String {
+        fs::read_to_string(format!("{}.{id}.args", script.display())).unwrap_or_default()
+    }
+
+    #[test]
+    fn lost_sessions_resume_their_conversation_with_their_lost_agents() {
+        let mut f = fixture();
+        let agent = recording_agent(&f);
+        let root = start_with(
+            &mut f,
+            json!({"command": agent, "args": ["--model", "sonnet", "the goal"],
+                   "runtime": "claude", "label": "orchestrator · goal"}),
+        )
+        .unwrap();
+        let worker = start_with(
+            &mut f,
+            json!({"command": agent, "args": ["--permission-mode", "acceptEdits", "do x"],
+                   "runtime": "claude", "supervisor": root}),
+        )
+        .unwrap();
+        let stopped = start_with(
+            &mut f,
+            json!({"command": agent, "args": ["review"], "runtime": "claude", "supervisor": root}),
+        )
+        .unwrap();
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": stopped}))
+            .unwrap();
+        send_hook(
+            &mut f,
+            &root,
+            "UserPromptSubmit",
+            json!({"session_id": "conv-root"}),
+        );
+        send_hook(
+            &mut f,
+            &worker,
+            "UserPromptSubmit",
+            json!({"session_id": "conv-worker"}),
+        );
+        wait_until(|| recorded_args(&agent, &root).contains("the goal"));
+        wait_until(|| recorded_args(&agent, &worker).contains("do x"));
+
+        // The machine restarts: the pty sessions are gone.
+        f.mgr = SessionManager::with_backend(f.data.path().to_path_buf(), BackendKind::Pty);
+        f.mgr.recover(&f.core).unwrap();
+        assert_eq!(session_state(&mut f, &root).state, SessionState::Lost);
+
+        let v = f
+            .mgr
+            .handle(&f.core, methods::SESSION_RESUME, json!({"id": root}))
+            .unwrap();
+        let resumed: SessionResumed = serde_json::from_value(v).unwrap();
+        let ids: Vec<&str> = resumed.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![root.as_str(), worker.as_str()],
+            "the stopped agent stays stopped"
+        );
+
+        wait_until(|| recorded_args(&agent, &root).contains("--resume"));
+        wait_until(|| recorded_args(&agent, &worker).contains("--resume"));
+        let root_args = recorded_args(&agent, &root);
+        assert!(
+            root_args.contains("--model\nsonnet\n--resume\nconv-root\n"),
+            "{root_args}"
+        );
+        assert!(
+            !root_args.contains("the goal"),
+            "the first prompt is not sent again"
+        );
+        assert!(
+            root_args.contains("--settings"),
+            "CORVX's hooks are registered again"
+        );
+        let nudge = root_args.lines().last().unwrap();
+        assert!(
+            nudge.starts_with("[CORVX]") && nudge.contains(&worker) && nudge.contains(&stopped)
+        );
+        let worker_args = recorded_args(&agent, &worker);
+        assert!(worker_args.contains("--permission-mode\nacceptEdits\n--resume\nconv-worker\n"));
+        assert!(!worker_args.contains("do x"));
+
+        let again = f
+            .mgr
+            .handle(&f.core, methods::SESSION_RESUME, json!({"id": root}));
+        assert!(matches!(again, Err(ServiceError::Rpc(c, _)) if c == codes::NOT_RESUMABLE));
+        for id in [&root, &worker] {
+            assert_eq!(session_state(&mut f, id).state, SessionState::Running);
+            f.mgr
+                .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn plain_commands_are_not_resumable() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+        let r = f
+            .mgr
+            .handle(&f.core, methods::SESSION_RESUME, json!({"id": id}));
+        assert!(matches!(r, Err(ServiceError::Rpc(c, _)) if c == codes::NOT_RESUMABLE));
+    }
+
+    #[test]
+    fn resume_args_keep_flags_and_drop_the_first_prompt() {
+        let args: Vec<String> = [
+            "--mcp-config",
+            "/m.json",
+            "--settings",
+            "/s.json",
+            "--append-system-prompt",
+            "be an orchestrator",
+            "--model=opus",
+            "--verbose",
+            "--resume",
+            "old",
+            "Build Snip",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            resume_args(&args),
+            vec![
+                "--append-system-prompt",
+                "be an orchestrator",
+                "--model=opus",
+                "--verbose"
+            ]
+        );
+    }
+
+    #[test]
+    fn requests_are_described_in_one_line() {
+        assert_eq!(
+            describe_request(&json!({"tool_name": "Write",
+                                     "tool_input": {"file_path": "/a/b.py", "content": "x"}})),
+            "Write: /a/b.py"
+        );
+        assert_eq!(
+            describe_request(&json!({"tool_name": "Bash",
+                                     "tool_input": {"command": "a &&\nb"}})),
+            "Bash: a && ⏎ b"
+        );
+        assert_eq!(describe_request(&json!({})), "a tool");
+    }
+
+    #[test]
+    fn conversations_are_found_by_directory_and_start_time() {
+        let projects = TempDir::new().unwrap();
+        let cwd = Path::new("/Users/me/dev/snip/.corvx/worktrees/s1");
+        let dir = projects
+            .path()
+            .join("-Users-me-dev-snip--corvx-worktrees-s1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("abc-123.jsonl"), "{}").unwrap();
+        fs::write(dir.join("notes.txt"), "").unwrap();
+        let now = now_secs();
+        assert_eq!(
+            find_claude_conversation(projects.path(), cwd, now - 10, None).as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(
+            find_claude_conversation(projects.path(), cwd, now + 100, None),
+            None,
+            "a conversation from before the session started is someone else's"
+        );
+        assert_eq!(
+            find_claude_conversation(projects.path(), Path::new("/elsewhere"), now - 10, None),
+            None
+        );
+    }
+
+    fn start_with(f: &mut Fixture, params: Value) -> Result<String, ServiceError> {
+        let mut params = params;
+        params["project"] = json!(f.project_id);
+        let v = f.mgr.handle(&f.core, methods::SESSION_START, params)?;
+        Ok(v["id"].as_str().unwrap().to_string())
+    }
+
+    fn open_items(f: &Fixture) -> Vec<corvx_proto::AttentionItem> {
+        f.core.store().list_attention(false, now_secs()).unwrap()
+    }
+
+    #[test]
+    fn supervised_agents_report_to_their_supervisor_not_the_inbox() {
+        let mut f = fixture();
+        let sup = start(&mut f, "sleep", &["30"]);
+        let worker = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": sup}),
+        )
+        .unwrap();
+        assert_eq!(
+            session_state(&mut f, &worker).supervisor.as_deref(),
+            Some(sup.as_str())
+        );
+
+        send_hook(&mut f, &worker, "Stop", json!({}));
+        assert_eq!(
+            session_state(&mut f, &worker).agent_state,
+            AgentState::Waiting
+        );
+        assert!(
+            open_kinds(&f, &worker).is_empty(),
+            "waiting goes to the orchestrator"
+        );
+
+        // Permission requests still need a human.
+        send_hook(
+            &mut f,
+            &worker,
+            "Notification",
+            json!({"notification_type": "permission_prompt", "message": "Allow rm?"}),
+        );
+        assert_eq!(open_kinds(&f, &worker), vec!["blocked"]);
+        for id in [&worker, &sup] {
+            f.mgr
+                .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn delegation_depth_is_limited() {
+        let mut f = fixture();
+        let l1 = start(&mut f, "sleep", &["30"]);
+        let l2 = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": l1}),
+        )
+        .unwrap();
+        let l3 = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": l2}),
+        )
+        .unwrap();
+        let err = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": l3}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(c, _) if c == codes::DEPTH_LIMIT));
+        let err = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": "ghost"}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(c, _) if c == codes::SESSION_NOT_FOUND));
+        for id in [&l3, &l2, &l1] {
+            f.mgr
+                .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn report_done_raises_a_review_item_with_the_summary() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        f.mgr
+            .handle(
+                &f.core,
+                methods::SESSION_REPORT,
+                json!({"id": id, "outcome": "done", "summary": "API and UI built on corvx/s1"}),
+            )
+            .unwrap();
+        let s = session_state(&mut f, &id);
+        assert_eq!(s.agent_state, AgentState::Done);
+        assert_eq!(s.agent_source.as_deref(), Some("self-report"));
+        let item = open_items(&f)
+            .into_iter()
+            .find(|i| i.session_id == id)
+            .unwrap();
+        assert_eq!(item.kind, "done");
+        assert_eq!(item.summary, "API and UI built on corvx/s1");
+        let err = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::SESSION_REPORT,
+                json!({"id": id, "outcome": "maybe", "summary": "x"}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(c, _) if c == codes::INVALID_PARAMS));
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn questions_reach_the_inbox_and_take_an_answer() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        let v = f
+            .mgr
+            .handle(
+                &f.core,
+                methods::ATTENTION_ASK,
+                json!({"session_id": id, "question": "SQLite or Postgres?"}),
+            )
+            .unwrap();
+        let qid = v["id"].as_str().unwrap().to_string();
+        let item = open_items(&f).into_iter().find(|i| i.id == qid).unwrap();
+        assert_eq!(item.kind, "question");
+        f.core
+            .handle(
+                methods::ATTENTION_ANSWER,
+                json!({"id": qid, "answer": "SQLite"}),
+            )
+            .unwrap();
+        let answered: corvx_proto::AttentionItem = serde_json::from_value(
+            f.core
+                .handle(methods::ATTENTION_GET, json!({"id": qid}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answered.answer.as_deref(), Some("SQLite"));
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn worktree_sessions_get_their_own_branch() {
+        let mut f = fixture();
+        let repo = Path::new(
+            &f.core
+                .store()
+                .get_project(&f.project_id)
+                .unwrap()
+                .unwrap()
+                .path,
+        )
+        .to_path_buf();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                ok.status.success(),
+                "{}",
+                String::from_utf8_lossy(&ok.stderr)
+            );
+            String::from_utf8_lossy(&ok.stdout).trim().to_string()
+        };
+        // Without a commit there is nothing to branch from.
+        git(&["init", "-q"]);
+        let err = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "worktree": true}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServiceError::Rpc(c, _) if c == codes::WORKTREE_FAILED));
+
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let id = start_with(&mut f, json!({"command": "pwd", "worktree": true})).unwrap();
+        let wt = session_state(&mut f, &id).worktree.unwrap();
+        assert!(wt.ends_with(&format!(".corvx/worktrees/{id}")), "{wt}");
+        assert!(Path::new(&wt).is_dir());
+        assert!(git(&["branch", "--list", &format!("corvx/{id}")]).contains(&id));
+        assert_eq!(
+            git(&["status", "--porcelain"]),
+            "",
+            "worktrees stay out of git status"
+        );
+        // The agent runs inside its worktree.
+        wait_until(|| output_text(&mut f, &id).0.contains(".corvx/worktrees"));
+    }
+
+    #[test]
+    fn claude_sessions_get_corvx_tools() {
+        let mut f = fixture();
+        let id = start_with(
+            &mut f,
+            json!({"command": "sh", "args": ["-c", "exit 0"], "runtime": "claude"}),
+        )
+        .unwrap();
+        let dir = f.data.path().join("sessions");
+        let mcp: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(format!("{id}.mcp.json"))).unwrap())
+                .unwrap();
+        let server = &mcp["mcpServers"]["corvx"];
+        assert_eq!(server["args"].as_array().unwrap().last().unwrap(), "mcp");
+        assert_eq!(server["env"]["CORVX_SESSION_ID"], id.as_str());
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(dir.join(format!("{id}.settings.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["permissions"]["allow"][0], "mcp__corvx");
+    }
+
+    #[test]
+    fn screen_shows_the_session_as_text() {
+        let mut f = fixture();
+        let id = start(
+            &mut f,
+            "sh",
+            &["-c", "printf '\\033[1mbold-text\\033[0m\\n'; sleep 5"],
+        );
+        wait_until(|| output_text(&mut f, &id).0.contains("bold-text"));
+        let v = f
+            .mgr
+            .handle(&f.core, methods::SESSION_SCREEN, json!({"id": id}))
+            .unwrap();
+        let screen: SessionScreen = serde_json::from_value(v).unwrap();
+        assert!(screen.text.contains("bold-text"));
+        assert!(!screen.text.contains('\u{1b}'), "escape codes are removed");
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn strip_ansi_keeps_text_only() {
+        assert_eq!(
+            strip_ansi("\u{1b}[31mred\u{1b}[0m\r\n\u{1b}]0;title\u{7}ok"),
+            "red\nok"
+        );
     }
 }

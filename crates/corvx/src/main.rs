@@ -3,6 +3,7 @@
 //! With no arguments, opens the terminal UI. Every command here is a thin
 //! wrapper over a protocol call, so scripts can do the same thing.
 
+mod mcp;
 mod tui;
 
 use std::path::PathBuf;
@@ -40,6 +41,28 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Start an orchestrator: a Claude Code session that plans the goal, delegates to
+    /// agents in their own worktrees, and involves you only through the inbox.
+    Orchestrate {
+        /// Project id.
+        project: String,
+        /// The goal, in your words.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        goal: Vec<String>,
+        /// Model for the orchestrator. It plans and reviews, so it gets a strong one.
+        #[arg(long, default_value = DEFAULT_ORCHESTRATOR_MODEL)]
+        model: String,
+        /// Model its agents get unless it picks another for a task.
+        #[arg(long, default_value = DEFAULT_AGENT_MODEL)]
+        agent_model: String,
+        /// Who decides the agents' permission requests: the orchestrator (it passes on what
+        /// it should not decide), or you.
+        #[arg(long, value_enum, default_value_t = Approver::Orchestrator)]
+        approvals: Approver,
+    },
+    /// CORVX's tools for agents, as an MCP server on stdio. Started by agent sessions.
+    #[command(hide = true)]
+    Mcp,
     /// What needs you: agents that are blocked, finished or failed.
     Attention {
         #[command(subcommand)]
@@ -56,6 +79,25 @@ enum Command {
 enum AttentionCommand {
     /// Acknowledge an item: you have seen it.
     Ack { id: String },
+    /// Approve an agent's permission request.
+    Approve {
+        id: String,
+        /// Also allow this kind of request from now on (Claude Code's "don't ask again").
+        #[arg(long)]
+        always: bool,
+    },
+    /// Deny an agent's permission request, optionally telling it why or what to do instead.
+    Deny {
+        id: String,
+        #[arg(num_args = 0.., trailing_var_arg = true)]
+        message: Vec<String>,
+    },
+    /// Answer a question an agent asked.
+    Answer {
+        id: String,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        answer: Vec<String>,
+    },
     /// Hide an item until later.
     Snooze {
         id: String,
@@ -86,6 +128,9 @@ enum SessionCommand {
         /// Terminal backend: `tmux` (survives daemon restarts) or `pty`. Default: tmux when installed.
         #[arg(long)]
         backend: Option<String>,
+        /// Work in a new git worktree on its own branch.
+        #[arg(long)]
+        worktree: bool,
     },
     /// List sessions.
     List,
@@ -103,10 +148,30 @@ enum SessionCommand {
     },
     /// Stop a running session.
     Stop { id: String },
+    /// Resume an interrupted Claude Code session (e.g. after a restart), continuing its
+    /// conversation. Resuming an orchestrator also resumes the lost agents it supervised.
+    Resume { id: String },
+    /// Turn autopilot on or off: CORVX approves the session's permission requests itself,
+    /// without asking you or its orchestrator. Every approval is recorded in the event log.
+    Autopilot {
+        id: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     /// Forward a runtime hook event (JSON on stdin) to the daemon. Used by the hooks CORVX registers.
     #[command(hide = true)]
     Hook { id: String },
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Approver {
+    Orchestrator,
+    Human,
+}
+
+/// Strong models plan and review; cheaper ones execute under their supervision.
+const DEFAULT_ORCHESTRATOR_MODEL: &str = "opus";
+const DEFAULT_AGENT_MODEL: &str = "sonnet";
 
 #[derive(Subcommand)]
 enum ProjectCommand {
@@ -153,6 +218,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    // The MCP server talks to its agent over stdio; it connects to the daemon when needed.
+    if let Some(Command::Mcp) = &cli.command {
+        return mcp::serve(&data_dir);
+    }
+
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => {
             let client = connect(&data_dir)?;
@@ -170,6 +240,21 @@ fn run() -> Result<()> {
         Command::Project { command } => project(command, &data_dir),
         Command::Session { command } => session(command, &data_dir),
         Command::Attention { command } => attention(command, &data_dir),
+        Command::Orchestrate {
+            project,
+            goal,
+            model,
+            agent_model,
+            approvals,
+        } => orchestrate(
+            &project,
+            &goal.join(" "),
+            &model,
+            &agent_model,
+            approvals == Approver::Human,
+            &data_dir,
+        ),
+        Command::Mcp => unreachable!("handled above"),
     }
 }
 
@@ -186,6 +271,7 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
             command,
             runtime,
             backend,
+            worktree,
         } => {
             let mut parts = command.into_iter();
             let program = parts.next().unwrap_or_default();
@@ -195,6 +281,12 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
                 args: parts.collect(),
                 runtime,
                 backend,
+                supervisor: None,
+                worktree,
+                label: None,
+                autopilot: false,
+                agent_model: None,
+                human_approves_agents: false,
             };
             let s: Session = client.call(methods::SESSION_START, &params)?;
             println!(
@@ -211,7 +303,7 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<20} {:<16} {:<12} {:<26} {:<6} COMMAND",
+                "{:<20} {:<16} {:<12} {:<26} {:<6} NAME",
                 "ID", "PROJECT", "PROCESS", "AGENT", "PID"
             );
             for s in list.sessions {
@@ -226,6 +318,11 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
                     Some(d) => format!("{agent}: {d}"),
                     None => agent,
                 };
+                let agent = if s.autopilot {
+                    format!("{agent} [autopilot]")
+                } else {
+                    agent
+                };
                 println!(
                     "{:<20} {:<16} {:<12} {:<26} {:<6} {}",
                     s.id,
@@ -233,7 +330,7 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
                     state,
                     agent,
                     s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                    s.command.join(" ")
+                    display_name(&s)
                 );
             }
             Ok(())
@@ -273,6 +370,35 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
             let _: serde_json::Value =
                 client.call(methods::SESSION_STOP, &SessionIdParams { id: id.clone() })?;
             println!("stopped {id}");
+            Ok(())
+        }
+        SessionCommand::Resume { id } => {
+            let r: corvx_proto::SessionResumed = client.call(
+                methods::SESSION_RESUME,
+                &corvx_proto::SessionResumeParams { id: id.clone() },
+            )?;
+            for s in &r.sessions {
+                println!("resumed {:<20} {}", s.id, display_name(s));
+            }
+            Ok(())
+        }
+        SessionCommand::Autopilot { id, state } => {
+            let on = state == "on";
+            let _: Session = client.call(
+                methods::SESSION_AUTOPILOT,
+                &corvx_proto::SessionAutopilotParams {
+                    id: id.clone(),
+                    on,
+                    by: None,
+                },
+            )?;
+            if on {
+                println!(
+                    "autopilot on for {id}: its permission requests are approved without asking"
+                );
+            } else {
+                println!("autopilot off for {id}");
+            }
             Ok(())
         }
     }
@@ -378,9 +504,94 @@ fn forward_hook(data_dir: &std::path::Path, session_id: &str) {
     let params = SessionHookParams {
         id: session_id.to_string(),
         event,
-        payload,
+        payload: payload.clone(),
     };
-    let _: Result<serde_json::Value> = client.call(methods::SESSION_HOOK, &params);
+    let reply: Result<serde_json::Value> = client.call(methods::SESSION_HOOK, &params);
+    let reply = reply.ok();
+    // Autopilot: the daemon decided at once.
+    if let Some(decision) = reply
+        .as_ref()
+        .and_then(|r| r.get("decision"))
+        .and_then(|v| v.as_str())
+    {
+        println!("{}", permission_output(decision, None, &payload));
+        return;
+    }
+    // A permission request: wait for a decision from the inbox, then hand it to Claude Code.
+    if let Some(item) = reply.and_then(|r| {
+        r.get("approval")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }) {
+        if let Some(output) = wait_for_decision(&mut client, session_id, &item, &payload) {
+            println!("{output}");
+        }
+    }
+}
+
+/// Polls the daemon until the approval item is decided. Returns the hook output for Claude
+/// Code, or None when there is nothing to say: it was answered in the session, dismissed, the
+/// agent moved on, or the daemon went away. The dialog in the session then stands.
+fn wait_for_decision(
+    client: &mut corvx_client::Client,
+    session_id: &str,
+    item: &str,
+    request: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use corvx_proto::{methods, PermissionStatus, SessionPermissionParams};
+    let params = SessionPermissionParams {
+        id: session_id.to_string(),
+        item: item.to_string(),
+    };
+    loop {
+        let status: PermissionStatus = client.call(methods::SESSION_PERMISSION, &params).ok()?;
+        match status.status.as_str() {
+            "pending" => std::thread::sleep(std::time::Duration::from_millis(500)),
+            "decided" => {
+                return Some(permission_output(
+                    status.decision.as_deref()?,
+                    status.message.as_deref(),
+                    request,
+                ))
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Claude Code's PermissionRequest hook output for a decision.
+fn permission_output(
+    decision: &str,
+    message: Option<&str>,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let decision = match decision {
+        "deny" => json!({
+            "behavior": "deny",
+            "message": message.unwrap_or("Denied by the human from the CORVX inbox."),
+        }),
+        "always" => {
+            // Claude Code's own "don't ask again" options for this request, minus any that
+            // would change the session's permission mode.
+            let rules: Vec<serde_json::Value> = request
+                .get("permission_suggestions")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter(|s| s.get("type").and_then(|t| t.as_str()) != Some("setMode"))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if rules.is_empty() {
+                json!({"behavior": "allow"})
+            } else {
+                json!({"behavior": "allow", "updatedPermissions": rules})
+            }
+        }
+        _ => json!({"behavior": "allow"}),
+    };
+    json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}})
 }
 
 /// Attaches this terminal to a session. Your keys go to the session as the bytes your
@@ -683,11 +894,55 @@ fn attention(command: Option<AttentionCommand>, data_dir: &std::path::Path) -> R
                 "ID", "KIND", "PROJECT", "SESSION"
             );
             for i in list.items {
+                let summary = match (&i.note, i.kind.as_str(), i.severity) {
+                    (_, "approval", s) if s < 3 => format!("(orchestrator deciding) {}", i.summary),
+                    (Some(note), "approval", _) => format!("{} · {note}", i.summary),
+                    _ => i.summary.clone(),
+                };
                 println!(
                     "{:<26} {:<9} {:<16} {:<20} {}",
-                    i.id, i.kind, i.project, i.session_id, i.summary
+                    i.id, i.kind, i.project, i.session_id, summary
                 );
             }
+            Ok(())
+        }
+        Some(AttentionCommand::Approve { id, always }) => {
+            let decision = if always { "always" } else { "allow" };
+            let _: serde_json::Value = client.call(
+                methods::ATTENTION_DECIDE,
+                &corvx_proto::AttentionDecideParams {
+                    id: id.clone(),
+                    decision: decision.into(),
+                    message: None,
+                    by: None,
+                },
+            )?;
+            println!("approved {id}");
+            Ok(())
+        }
+        Some(AttentionCommand::Deny { id, message }) => {
+            let message = message.join(" ");
+            let _: serde_json::Value = client.call(
+                methods::ATTENTION_DECIDE,
+                &corvx_proto::AttentionDecideParams {
+                    id: id.clone(),
+                    decision: "deny".into(),
+                    message: (!message.trim().is_empty()).then(|| message.trim().to_string()),
+                    by: None,
+                },
+            )?;
+            println!("denied {id}");
+            Ok(())
+        }
+        Some(AttentionCommand::Answer { id, answer }) => {
+            let _: serde_json::Value = client.call(
+                methods::ATTENTION_ANSWER,
+                &corvx_proto::AttentionAnswerParams {
+                    id: id.clone(),
+                    answer: answer.join(" "),
+                },
+            )?;
+            println!("answered {id}");
             Ok(())
         }
         Some(AttentionCommand::Ack { id }) => {
@@ -723,9 +978,208 @@ fn attention(command: Option<AttentionCommand>, data_dir: &std::path::Path) -> R
     }
 }
 
+/// The role prompt for an orchestrator session. Kept short and concrete so smaller models
+/// follow it too.
+const ORCHESTRATOR_PROMPT: &str = "You are an orchestrator working through CORVX. You do not write the code yourself: \
+you plan, delegate to coding agents, review their work, and keep the human informed.
+
+How to work:
+1. Read the project (list_projects; read its README and any .corvx/ files) and break the goal into pieces that \
+can be done independently by separate agents.
+2. If agents must agree on an interface (an API, a data format), write that contract to a file in the repository \
+and commit it before starting them, so they can work in parallel.
+3. Start one agent per piece with start_agent. Give each a complete prompt: the goal, its exact scope, the \
+contract, how to test its work, and to commit on its branch when done. Agents cannot see your conversation.
+4. Loop on wait_for. When an agent is waiting, read_screen to see what it did, then send_message with the next \
+instruction or a correction. When it reports done, review its result before accepting it.
+5. Use ask_human only for decisions the human must make (product choices, conflicts you cannot resolve, anything \
+risky). Do not ask about things you can check yourself.
+6. When the goal is met, summarize what each agent did, which branches hold the work, and what the human should \
+review or merge, then call report_done with that summary.";
+
+/// The orchestrator's role prompt, with its model and approval policy.
+fn orchestrator_prompt(agent_model: &str, human_approves_agents: bool) -> String {
+    let models = format!(
+        "Models: you run on a strong model so you can plan and review; agents do the execution on cheaper ones. \
+start_agent uses {agent_model} unless you pass model. Pick haiku for mechanical work (renames, formatting, \
+docs, simple tests) and a stronger model (opus) only for a piece that needs it (tricky design, hard debugging)."
+    );
+    let approvals = if human_approves_agents {
+        "Approvals: the human decides your agents' permission requests. When wait_for reports an approval, \
+just wait; you cannot decide it.".to_string()
+    } else {
+        "Approvals: your agents' permission requests come to you. When wait_for reports an approval, decide it \
+with decide_approval. Allow what the agent's task needs inside its worktree: running tests and builds, installing \
+the project's declared dependencies, git commands on its own branch. Deny (with a message saying what to do \
+instead) what does not belong to its task. Escalate to the human anything destructive or irreversible, anything \
+outside the project, touching credentials or secrets, pushing or publishing, or that you are unsure about. \
+When an agent's work is routine and confined to its worktree, you may set_autopilot so it stops asking; \
+turn it off if it drifts.".to_string()
+    };
+    format!("{ORCHESTRATOR_PROMPT}\n\n{models}\n\n{approvals}")
+}
+
+/// A readable name for a session: its label, or one derived from its command for sessions
+/// started without a label (e.g. by an older daemon). Never the whole prompt.
+pub(crate) fn display_name(s: &corvx_proto::Session) -> String {
+    if let Some(label) = &s.label {
+        return label.clone();
+    }
+    let is_orchestrator = s.command.iter().any(|a| a == "--append-system-prompt");
+    // A Claude session's prompt is its last argument when it does not start with a dash.
+    let prompt = s
+        .command
+        .iter()
+        .skip(1)
+        .last()
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| short_label(a));
+    match (is_orchestrator, s.supervisor.is_some(), prompt) {
+        (true, _, Some(p)) => format!("orchestrator · {p}"),
+        (true, _, None) => "orchestrator".into(),
+        (false, true, Some(p)) => format!("agent · {p}"),
+        _ => short_label(&s.command.join(" ")),
+    }
+}
+
+/// The first line of a text, cut to about 40 characters, for session labels.
+pub(crate) fn short_label(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= 40 {
+        line.to_string()
+    } else {
+        format!("{}…", line.chars().take(39).collect::<String>().trim_end())
+    }
+}
+
+/// Starts an orchestrator session for a goal.
+fn orchestrate(
+    project: &str,
+    goal: &str,
+    model: &str,
+    agent_model: &str,
+    human_approves_agents: bool,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    use corvx_proto::{methods, Session, SessionStartParams};
+    let mut client = connect(data_dir)?;
+    let args = vec![
+        "--append-system-prompt".to_string(),
+        orchestrator_prompt(agent_model, human_approves_agents),
+        "--model".into(),
+        model.to_string(),
+        goal.to_string(),
+    ];
+    let params = SessionStartParams {
+        project: project.to_string(),
+        command: "claude".into(),
+        args,
+        runtime: Some("claude".into()),
+        backend: None,
+        supervisor: None,
+        worktree: false,
+        label: Some(format!("orchestrator · {}", short_label(goal))),
+        autopilot: false,
+        agent_model: Some(agent_model.to_string()),
+        human_approves_agents,
+    };
+    let s: Session = client.call(methods::SESSION_START, &params)?;
+    println!(
+        "started orchestrator {} on {model}; its agents default to {agent_model}",
+        s.id
+    );
+    if human_approves_agents {
+        println!("  approvals:  you decide the agents' permission requests");
+    } else {
+        println!("  approvals:  the orchestrator decides its agents' requests and passes risky ones to you");
+    }
+    println!("  watch it:   corvx session attach {}", s.id);
+    println!("  your inbox: corvx attention");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::route_keys;
+
+    #[test]
+    fn the_orchestrator_prompt_names_its_agents_model_and_who_approves() {
+        let p = super::orchestrator_prompt("haiku", false);
+        assert!(p.contains("start_agent uses haiku"), "{p}");
+        assert!(
+            p.contains("decide_approval") && p.contains("set_autopilot"),
+            "{p}"
+        );
+        let p = super::orchestrator_prompt("sonnet", true);
+        assert!(
+            p.contains("the human decides your agents' permission requests"),
+            "{p}"
+        );
+        assert!(!p.contains("set_autopilot"), "{p}");
+    }
+
+    #[test]
+    fn display_names_are_short_and_never_the_whole_prompt() {
+        use corvx_proto::{AgentState, Session, SessionState};
+        let mk = |command: &[&str], supervisor: Option<&str>, label: Option<&str>| Session {
+            id: "s1".into(),
+            project: "p".into(),
+            command: command.iter().map(|a| a.to_string()).collect(),
+            runtime: Some("claude".into()),
+            backend: "tmux".into(),
+            supervisor: supervisor.map(String::from),
+            worktree: None,
+            label: label.map(String::from),
+            state: SessionState::Running,
+            pid: None,
+            started_at: 0,
+            ended_at: None,
+            exit_code: None,
+            agent_state: AgentState::Unknown,
+            agent_detail: None,
+            agent_source: None,
+            runtime_session: None,
+            autopilot: false,
+            agent_model: None,
+            human_approves_agents: false,
+        };
+        let long_role = "You are an orchestrator.\nMany more lines of instructions";
+        let orch = mk(
+            &[
+                "claude",
+                "--append-system-prompt",
+                long_role,
+                "--model",
+                "sonnet",
+                "Build Snip as described",
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            super::display_name(&orch),
+            "orchestrator · Build Snip as described"
+        );
+        let worker = mk(
+            &[
+                "claude",
+                "--permission-mode",
+                "acceptEdits",
+                "You are the BACKEND agent for Snip, a tiny link shortener. Read CLAUDE.md first.",
+            ],
+            Some("s0"),
+            None,
+        );
+        let name = super::display_name(&worker);
+        assert!(
+            name.starts_with("agent · You are the BACKEND agent"),
+            "{name}"
+        );
+        assert!(name.chars().count() < 60, "{name}");
+        let labelled = mk(&["claude"], None, Some("agent · backend"));
+        assert_eq!(super::display_name(&labelled), "agent · backend");
+        assert_eq!(super::display_name(&mk(&["cat"], None, None)), "cat");
+    }
 
     #[test]
     fn ctrl_b_now_reaches_the_session() {

@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use corvx_core::paths;
 use corvx_core::service::{Core, ServiceError};
 use corvx_core::store::Store;
-use corvx_proto::{codes, Request, Response};
+use corvx_proto::{codes, methods, Request, Response};
 
 mod sessions;
 mod tmux;
@@ -137,7 +137,11 @@ fn respond(line: &str, core: &Mutex<Core>, sessions: &Mutex<SessionManager>) -> 
     // consistent because each store call is its own transaction.
     let core = core.lock().unwrap_or_else(|p| p.into_inner());
     // Lock order is always core, then sessions.
-    let result = if req.method.starts_with("session.") {
+    // Session work, and questions (which need to know the asking session), go to the manager.
+    let result = if req.method.starts_with("session.")
+        || req.method == methods::ATTENTION_ASK
+        || req.method == methods::ATTENTION_DECIDE
+    {
         let mut mgr = sessions.lock().unwrap_or_else(|p| p.into_inner());
         mgr.handle(&core, &req.method, req.params)
     } else {

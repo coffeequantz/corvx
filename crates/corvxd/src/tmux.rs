@@ -37,8 +37,10 @@ set -g set-titles-string "corvx · #S"
 set -g status on
 set -g status-position bottom
 set -g status-style "bg=default,fg=colour244"
-set -g status-left " corvx · #S "
-set -g status-left-length 50
+set -g status-left " corvx · #{?@corvx_label,#{@corvx_label},#S} "
+set -g status-left-length 80
+# Ctrl+\ then s: switch to another CORVX session, listed by label.
+bind s choose-tree -Zs -F "#{?@corvx_label,#{@corvx_label},#{session_name}}"
 set -g status-right "#{?client_prefix,#[reverse] ctrl+\\ · press d to detach #[noreverse],ctrl+\\ then d to detach }"
 set -g status-right-length 60
 set -g window-status-format ""
@@ -77,10 +79,15 @@ impl Tmux {
             .mode(0o600)
             .open(&config)?;
         f.write_all(CONFIG.as_bytes())?;
-        Ok(Self {
+        let tmux = Self {
             socket: socket_path(data_dir),
             config,
-        })
+        };
+        // A server left running by a previous daemon keeps its old config unless reloaded.
+        // With no server running this fails harmlessly.
+        let config_path = tmux.config.to_string_lossy().to_string();
+        let _ = tmux.run(["source-file", config_path.as_str()]);
+        Ok(tmux)
     }
 
     /// A tmux command for CORVX's server. The environment is cleaned, because the server
@@ -170,9 +177,16 @@ impl Tmux {
         ];
         respawn.extend(env_args);
         respawn.extend(argv.iter().cloned());
-        if let Err(e) = self.run(&respawn) {
-            let _ = self.kill(name);
-            return Err(e);
+        // On macOS, replacing a pane right after it was created sometimes fails to open its
+        // new pty ("fork failed: Device not configured"); a moment later it works.
+        let mut attempt = 0;
+        while let Err(e) = self.run(&respawn) {
+            attempt += 1;
+            if attempt >= 5 || !e.contains("fork failed") {
+                let _ = self.kill(name);
+                return Err(e);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
         }
 
         let pid = self
@@ -223,14 +237,19 @@ impl Tmux {
         .map(|_| ())
     }
 
+    /// Sets the label tmux shows for a session (status bar and session list).
+    pub fn set_label(&self, name: &str, label: &str) -> Result<(), String> {
+        self.run(["set-option", "-t", name, "@corvx_label", label])
+            .map(|_| ())
+    }
+
     pub fn kill(&self, name: &str) -> Result<(), String> {
         self.run(["kill-session", "-t", name]).map(|_| ())
     }
 
-    /// The current screen of a session, as text with colour codes. For peek in the TUI.
-    #[allow(dead_code)]
+    /// The current screen of a session as plain text, with wrapped lines joined.
     pub fn capture(&self, name: &str) -> Result<String, String> {
-        self.run(["capture-pane", "-p", "-e", "-t", name])
+        self.run(["capture-pane", "-p", "-J", "-t", name])
     }
 
     /// Every pane on CORVX's server, by session name. Empty when the server is not running.

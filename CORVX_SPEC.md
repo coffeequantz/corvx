@@ -198,6 +198,8 @@ An orchestrator is an agent session started with CORVX's MCP server attached (`c
 | `read_output` | The session's current screen, or recent output. |
 | `send_input` | Send an instruction to a session. |
 | `wait_for` | Block until any supervised session becomes `blocked`, `waiting`, `done` or `failed` (with a timeout). The orchestrator's main loop. |
+| `decide_approval` | Decide a supervised agent's permission request: allow, always, deny (with a message), or escalate to you. |
+| `set_autopilot` | Approve a supervised agent's permission requests without asking; each is logged. |
 | `stop_agent` | Stop a session. |
 | `ask_human` | Put a question in your inbox and wait for the answer. |
 | `report_done` | Mark this session's task complete, with a summary. |
@@ -210,7 +212,9 @@ An orchestrator is an agent session started with CORVX's MCP server attached (`c
 
 ### 9.4 Supervision and escalation
 
-- Items from a supervised session go to its supervisor. An orchestrator sees them through `wait_for`; you see them in the inbox only if the orchestrator escalates (`ask_human`) or the item is one policy reserves for humans (most permission requests).
+- Items from a supervised session go to its supervisor. An orchestrator sees them through `wait_for`; you see them in the inbox only if the orchestrator escalates (`ask_human`, or `decide_approval` with `escalate`) or the item is one policy reserves for humans. Permission requests go to the orchestrator first: it decides what belongs to the agent's task and escalates the rest. They stay visible to you, and you can decide any of them. An orchestrator started with `--approvals human` leaves them all to you.
+- Model tiers: the orchestrator runs on a strong model and its agents on cheaper ones by default. It picks per task (haiku for mechanical work, opus for hard pieces).
+- Autopilot: a session on autopilot has its permission requests approved without asking anyone; each approval is logged. An orchestrator can set it for its own agents, and you can set it for any session.
 - You can always see every session and take over any of them.
 - Budgets (tokens, cost where reported, time, number of agents) and the delegation depth limit apply to everything an orchestrator starts.
 
@@ -322,6 +326,7 @@ Daemon, protocol v0, SQLite store, project registry with a project scan, TUI she
 - **Done when:** three Claude Code sessions in two projects; restarting the daemon does not stop them; the inbox shows a permission request within 2 seconds; you can attach from the TUI and detach cleanly.
 
 ### M2 · Orchestration — the core bet
+- Built and tested with a stand-in agent: `corvx mcp` (all tools in 9.2 except `journal` and `propose_knowledge`, which belong to M3); supervision with depth limit 3; supervised agents' waiting/done/failed go to the orchestrator, questions to you; worktrees on `corvx/<id>` branches; questions answered from the CLI (`corvx attention answer`) and TUI inbox (`r`); `corvx orchestrate` with a role prompt. Inline approvals: Claude Code's `PermissionRequest` hook waits (up to 24 h) for a decision from the inbox (`y` once, `Y` with Claude's own "don't ask again" rules minus mode changes, `n` with an optional reason), while the dialog stays answerable in the session; the first answer wins, and a decision nobody is waiting for any more turns into a plain blocked item. Resume: hooks record Claude's conversation id; a tmux session that vanishes (reboot) is `lost`; `corvx session resume` (TUI `R`) restarts it with `--resume`, together with the lost agents it supervised, and tells orchestration members what happened. Delegated approvals: an agent's permission requests go to its orchestrator (severity 1 in your inbox, "orchestrator deciding"), which decides them with `decide_approval` (allow, always, deny, escalate). Escalated requests, and the requests of agents whose orchestrator has ended, come to you. `corvx orchestrate --approvals human` keeps them all with you. Autopilot (`set_autopilot`, `corvx session autopilot`, TUI `a`/`A`) approves a session's requests without asking anyone, and logs each one. An orchestrator can set it only for its own agents. Model tiers: `corvx orchestrate --model` (default opus) and `--agent-model` (default sonnet); the role prompt tells the orchestrator when to pick haiku or opus for an agent. Remaining: finishing the real trial on a test project (Snip; first run interrupted by a reboot, backend and frontend merged).
 - `corvx mcp` server with the tools in section 9.2; supervision and escalation.
 - `start_agent` with git worktrees.
 - Inline approvals from the inbox for Claude Code.
@@ -361,15 +366,16 @@ Daemon, protocol v0, SQLite store, project registry with a project scan, TUI she
 | 7 | GUI after the orchestration milestone | v0.3 (replaces "GUI from the start") |
 | 8 | Detach / prefix key `Ctrl+\` | v0.3 (replaces `Ctrl+B`) |
 | 9 | Name CORVX; domain acquired | v0.2 |
+| 10 | `waiting` items for your own sessions go in the inbox at severity 1; the presentation can be refined later | v0.3 |
 
 ### 18.2 Open
 
 1. **License.** Needed before the repository goes public.
 2. **Windows.** WSL with tmux, or a holder-process backend?
-3. **`waiting` items for your own sessions.** Raise them in the inbox (severity 1), or only show them in the session list? Proposed: inbox, collapsed by default.
-4. **Default orchestrator runtime and model**, and its budget defaults.
-5. **Knowledge in git.** Committed by default (proposed), or opt-in per project?
-6. **Trademark check** before public launch.
+3. **Default orchestrator runtime and budget defaults.** Models are settled for now: opus for orchestrators, sonnet for agents (fable for the hardest orchestration, at about twice opus's price).
+4. **Knowledge in git.** Committed by default (proposed), or opt-in per project?
+5. **Trademark check** before public launch.
+6. **Non-Anthropic models for agents** (e.g. DeepSeek through OpenRouter): through a CLI agent that supports OpenRouter (runs today as a plain session, without hooks), or through CORVX's own agent loop (deferred)?
 
 ## 19. Reference points
 
