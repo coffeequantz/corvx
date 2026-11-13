@@ -4,7 +4,7 @@ Build without boundaries.
 
 CORVX is a local-first control plane for AI coding agents: it runs them durably, knows what each one is doing, routes decisions to you, and remembers what it learns about every project. Design: [`CORVX_SPEC.md`](CORVX_SPEC.md) (v0.3). Interaction design: [`CORVX_UX.md`](CORVX_UX.md). Clickable prototype (pre-v0.3): `prototype/index.html`.
 
-> Status: M2 (orchestration through MCP) is done; M3 (the knowledge loop) is next. Not ready for general use. No license has been chosen yet, and the repository is not public.
+> Status: M2 (orchestration through MCP) is done; M3 (the knowledge loop) is built and waiting for its five-mission trial. Not ready for general use. No license has been chosen yet, and the repository is not public.
 
 ## Layout
 
@@ -30,6 +30,7 @@ cargo test --workspace
 python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no model calls
 
 ./target/debug/corvx project add ./my-app
+./target/debug/corvx knowledge init my-app        # .corvx/ knowledge files, read by every agent
 ./target/debug/corvx session start my-app --runtime claude -- claude
 ./target/debug/corvx session attach <id>      # Ctrl+\ then d to detach
 ./target/debug/corvx attention                 # what needs you
@@ -39,12 +40,16 @@ python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no mode
 ./target/debug/corvx session autopilot <id> on # approve its permission requests without asking
 ./target/debug/corvx orchestrate my-app "add CSV export"   # orchestrator on opus, agents on sonnet
 ./target/debug/corvx project autonomy my-app autonomous   # supervised|guided|autonomous|full
+./target/debug/corvx knowledge my-app          # what CORVX knows about it, and proposals waiting
+./target/debug/corvx knowledge accept <id> --edit   # accept a proposal (or: reject <id> why)
 ./target/debug/corvx rules                     # what CORVX asks you, allows or denies
 ./target/debug/corvx rules set delete-recursive allow --project my-app   # ask|allow|deny|off|default
 ./target/debug/corvx rules add --command '\bterraform\s+apply\b' --reason "changes infrastructure"
 ./target/debug/corvx rules add --command '\bmake\s+deploy-staging\b' --reason "staging deploy" --action allow
-./target/debug/corvx                           # terminal UI; press i for the inbox (y/Y/n/A on requests)
+./target/debug/corvx                           # terminal UI: a add · o mission · b brief · K knowledge · i inbox
 ```
+
+The terminal UI covers the whole loop without the CLI. `a` adds a project: type its path (Tab completes), look at what CORVX found (stack, test and build commands, git) and choose whether to set up its knowledge files. `b` opens its brief in `$EDITOR` and commits it when you save. `o` starts a mission: the goal, the autonomy level, the orchestrator's and agents' models, and who approves, with a line on what knowledge the orchestrator starts from. Each project shows the next step to take, and a first run shows how to begin.
 
 Permission requests from Claude Code agents reach the inbox as approvals. You can decide them there, or attach and answer the dialog in the session; whichever answer comes first applies. When the machine restarts, agent sessions are marked lost. Resuming one starts Claude Code again with its conversation, and resuming an orchestrator also resumes the lost agents under it.
 
@@ -62,6 +67,8 @@ How much agents do without asking is a dial you set per project, and can change 
 Rules you set yourself always win over the level, so "autonomous, but always ask me before `git push`" or "full, but never `sudo`" both work. And when you keep approving the same thing (three times for the same simple command, or for requests under the same rule), CORVX offers in the inbox to allow it without asking from now on; it never changes a rule by itself. An allowed command may take other arguments, but not be chained, piped or redirected.
 
 CORVX rules decide some requests themselves, whoever would otherwise decide them (the orchestrator, autopilot, or Claude Code's own settings). Each rule asks you, allows the request at once, or denies it at once, and you can change that at any time, for one project or all of them: `corvx rules set`, the rules view in the TUI (`l`; `h` ask, `y` allow, `n` deny, `o` off, `d` default, `g` switches between the selected project and every project), or `L` on a request a rule sent you, which allows that rule in its project from now on and approves the request. When several rules match, the strictest wins (deny, then ask, then allow), so a broad allow does not override a narrower ask. Built-in rules, all set to ask: `git push`, discarding git work (`reset --hard`, `clean -f`, `branch -D`), deleting directories, publishing (`npm publish`, `gh pr create`, ...), `sudo`, anything touching credentials or keys, an agent changing CORVX's own rules or approvals, and writing files outside the agent's working directory (temporary files excepted). You can add rules of your own (a regular expression on commands or paths). Every automatic approval or denial is logged. Rules match what an agent asks to run as text, so they catch the usual ways of doing these things, not an agent determined to get around them.
+
+Each project keeps what has been learned about it in plain files in its `.corvx/` folder: `brief.md` (yours: what it is, what matters now), `decisions.md` and `conventions.md` (changed only through proposals you accept), a generated `map.md` (stack, commands, structure, entry points) and the mission `journal/`. `corvx knowledge init` creates them and adds a block to the project's `CLAUDE.md` that imports them, so every agent starts from them; orchestrators also read them with `read_knowledge`, and are told to cite the decisions and conventions that shape their plan. At the end of a mission an orchestrator proposes what should be remembered (`propose_knowledge`, one point each, with its evidence). Proposals reach your inbox: `y` accepts (the file is written and just that file is committed, so new worktrees see it), `e` edits it in `$EDITOR` first, and `n` rejects it with a reason. A rejected proposal is not accepted again, and agents see why it was rejected.
 
 `CORVX_E2E_REAL_CLAUDE=1 python3 tests/e2e/run_e2e.py` also runs one scenario against real Claude Code. It uses your Claude account.
 

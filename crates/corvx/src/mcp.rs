@@ -20,8 +20,9 @@ use anyhow::{anyhow, Result};
 use corvx_client::{ensure_daemon, Client};
 use corvx_proto::{
     methods, AgentState, AttentionAskParams, AttentionDecideParams, AttentionItem, AttentionList,
-    ProjectJournalParams, ProjectList, Session, SessionAutopilotParams, SessionList,
-    SessionReportParams, SessionScreen, SessionStartParams, SessionState,
+    Knowledge, KnowledgeProposeParams, KnowledgeReadParams, ProjectJournalParams, ProjectList,
+    Proposal, Session, SessionAutopilotParams, SessionList, SessionReportParams, SessionScreen,
+    SessionStartParams, SessionState,
 };
 use serde_json::{json, Value};
 
@@ -94,9 +95,11 @@ impl Server {
                     .unwrap_or_else(|| json!("2025-06-18")),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "corvx", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "CORVX runs and supervises agent sessions. Use start_agent to delegate, \
-                                 wait_for to learn when an agent needs you, ask_human when only the \
-                                 human can decide, and report_done when your task is complete."
+                "instructions": "CORVX runs and supervises agent sessions and keeps what is learned about \
+                                 each project. Use read_knowledge before you plan, start_agent to \
+                                 delegate, wait_for to learn when an agent needs you, ask_human when \
+                                 only the human can decide, propose_knowledge for what later work \
+                                 should know, and report_done when your task is complete."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools()})),
@@ -130,6 +133,19 @@ impl Server {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The project of the calling session.
+    fn my_project(&mut self) -> Result<String> {
+        let me = self
+            .me
+            .clone()
+            .ok_or_else(|| anyhow!("project is required outside a CORVX session"))?;
+        self.sessions()?
+            .into_iter()
+            .find(|x| x.id == me)
+            .map(|x| x.project)
+            .ok_or_else(|| anyhow!("session '{me}' not found"))
     }
 
     fn sessions(&mut self) -> Result<Vec<Session>> {
@@ -408,6 +424,42 @@ impl Server {
                 let v = self.rpc(methods::PROJECT_JOURNAL, serde_json::to_value(params)?)?;
                 Ok(json!({"file": v["file"]}))
             }
+            "read_knowledge" => {
+                let project = match s("project") {
+                    Some(p) => p,
+                    None => self.my_project()?,
+                };
+                let journal = args
+                    .get("journal")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                let params = KnowledgeReadParams { project, journal };
+                let k: Knowledge = serde_json::from_value(
+                    self.rpc(methods::KNOWLEDGE_READ, serde_json::to_value(params)?)?,
+                )?;
+                Ok(describe_knowledge(&k))
+            }
+            "propose_knowledge" => {
+                let me = self.me.clone().ok_or_else(|| {
+                    anyhow!("propose_knowledge only works inside a CORVX session")
+                })?;
+                let params = KnowledgeProposeParams {
+                    session: me,
+                    project: s("project"),
+                    file: s("file").ok_or_else(|| anyhow!("file is required"))?,
+                    title: s("title").ok_or_else(|| anyhow!("title is required"))?,
+                    text: s("text").ok_or_else(|| anyhow!("text is required"))?,
+                    replaces: s("replaces"),
+                    evidence: s("evidence"),
+                };
+                let p: Proposal = serde_json::from_value(
+                    self.rpc(methods::KNOWLEDGE_PROPOSE, serde_json::to_value(params)?)?,
+                )?;
+                Ok(
+                    json!({"proposed": p.id, "file": format!(".corvx/{}.md", p.file),
+                          "note": "It is in the human's inbox. Accepted proposals are written to the file and committed; do not edit the file yourself."}),
+                )
+            }
             other => Err(anyhow!("unknown tool: {other}")),
         }
     }
@@ -620,6 +672,26 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}
         },
         {
+            "name": "read_knowledge",
+            "description": "What has been learned about a project: its brief, decisions, conventions, a generated map (stack, commands, structure), the latest mission journal entries, and knowledge proposals waiting for the human or rejected before. Read it before you plan, and cite the decisions and conventions that shape your plan.",
+            "inputSchema": {"type": "object", "properties": {
+                "project": {"type": "string", "description": "Project id; default: your session's project."},
+                "journal": {"type": "integer", "description": "How many recent journal entries to include in full (default 2)."}
+            }}
+        },
+        {
+            "name": "propose_knowledge",
+            "description": "Propose an addition or edit to a project's knowledge, for the human to accept, edit or reject in the inbox. Accepted proposals are written to .corvx/<file>.md and every later agent starts from them. Propose only what would change how later work is done: a decision with its reason, a convention, a pitfall. One proposal per point. Do not repeat what the files already say, what is waiting, or what was rejected.",
+            "inputSchema": {"type": "object", "properties": {
+                "file": {"type": "string", "enum": ["decisions", "conventions", "brief"], "description": "decisions: architecture and product choices, with the reason. conventions: how things are done here (style, patterns, testing, pitfalls). brief: what the project is and its priorities (the human's; propose edits sparingly)."},
+                "title": {"type": "string", "description": "One line, e.g. 'Time comes from server.now()'."},
+                "text": {"type": "string", "description": "Markdown, short: the rule or decision, and why."},
+                "evidence": {"type": "string", "description": "Where it comes from: the mission, review finding or correction, e.g. 'mission s12: two agents each wrote their own clock'."},
+                "replaces": {"type": "string", "description": "For an edit: the exact text in the file that text replaces (it must appear once)."},
+                "project": {"type": "string", "description": "Project id; default: your session's project."}
+            }, "required": ["file", "title", "text", "evidence"]}
+        },
+        {
             "name": "journal",
             "description": "Add an entry to this mission's journal, a Markdown file in the project's .corvx/journal/ that later missions read. At the end of a mission: the goal, what happened, what went wrong, what was learned.",
             "inputSchema": {"type": "object", "properties": {
@@ -636,4 +708,29 @@ fn tools() -> Value {
             }, "required": ["summary"]}
         }
     ])
+}
+
+/// A project's knowledge as an agent reads it.
+fn describe_knowledge(k: &Knowledge) -> Value {
+    let files: Vec<Value> = k
+        .files
+        .iter()
+        .map(|f| {
+            let text = if f.exists || f.name == "map" {
+                f.text.clone()
+            } else {
+                "(not written yet)".into()
+            };
+            json!({"path": f.path, "text": text})
+        })
+        .collect();
+    json!({
+        "project": k.project,
+        "files": files,
+        "journal": k.journal.iter().map(|e| json!({"path": e.path, "text": e.text})).collect::<Vec<_>>(),
+        "journal_entries_in_all": k.journal_count,
+        "waiting_for_the_human": k.open.iter().map(|p| json!({"file": p.file, "title": p.title})).collect::<Vec<_>>(),
+        "rejected_before": k.rejected.iter().map(|p| json!({"file": p.file, "title": p.title, "reason": p.reason})).collect::<Vec<_>>(),
+        "note": "Change these files only with propose_knowledge. Older journal entries are in .corvx/journal/."
+    })
 }

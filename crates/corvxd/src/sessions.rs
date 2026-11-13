@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use corvx_core::knowledge::{date_of, time_of};
 use corvx_core::policy;
 use corvx_core::service::{Core, ServiceError};
 use corvx_core::store::now_secs;
@@ -1994,36 +1995,6 @@ fn project_level(core: &Core, project: &str) -> Result<String, ServiceError> {
         .unwrap_or_else(|| autonomy::GUIDED.into()))
 }
 
-/// The UTC date of a unix time, as YYYY-MM-DD.
-fn date_of(secs: i64) -> String {
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// The UTC date and time of a unix time, as YYYY-MM-DD HH:MM UTC.
-fn time_of(secs: i64) -> String {
-    let rem = secs.rem_euclid(86_400);
-    format!(
-        "{} {:02}:{:02} UTC",
-        date_of(secs),
-        rem / 3600,
-        rem % 3600 / 60
-    )
-}
-
-/// Days since 1970-01-01 to a (year, month, day) date (Howard Hinnant's algorithm).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
-}
-
 /// The CORVX rule a tool call matches, if any. Rules apply to the session's project; the
 /// working directory is its worktree, or the project itself.
 fn rule_hit(
@@ -3557,13 +3528,6 @@ mod tests {
             "one title: {text}"
         );
         stop_all(&mut f, &[&id]);
-    }
-
-    #[test]
-    fn dates_are_utc_calendar_dates() {
-        assert_eq!(date_of(0), "1970-01-01");
-        assert_eq!(date_of(951_782_400), "2000-02-29");
-        assert_eq!(time_of(1_794_412_999), "2026-11-11 16:03 UTC");
     }
 
     #[test]

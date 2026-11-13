@@ -82,6 +82,41 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// What CORVX has learned about a project: its .corvx/ knowledge files, and the proposals
+    /// agents make to change them. Shows a project's knowledge when given no subcommand.
+    #[command(args_conflicts_with_subcommands = true)]
+    Knowledge {
+        #[command(subcommand)]
+        command: Option<KnowledgeCommand>,
+        /// Project id.
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommand {
+    /// Create the project's missing knowledge files (brief, decisions, conventions, map) and
+    /// point its CLAUDE.md at them, so every agent starts from them. Commits what it writes.
+    Init { project: String },
+    /// Proposals waiting for you.
+    Proposals {
+        #[arg(long)]
+        project: Option<String>,
+        /// Decided ones too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a proposal in full.
+    Show { id: String },
+    /// Accept a proposal: it is written into its file and committed.
+    Accept {
+        id: String,
+        /// Edit the text in $EDITOR first.
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Reject a proposal. The reason is kept, and it is not proposed again.
+    Reject { id: String, reason: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -229,7 +264,7 @@ enum Approver {
 }
 
 /// Strong models plan and review; cheaper ones execute under their supervision.
-const DEFAULT_ORCHESTRATOR_MODEL: &str = "opus";
+pub(crate) const DEFAULT_ORCHESTRATOR_MODEL: &str = "opus";
 const DEFAULT_AGENT_MODEL: &str = "sonnet";
 
 #[derive(Subcommand)]
@@ -340,6 +375,7 @@ fn run() -> Result<()> {
         Command::Session { command } => session(command, &data_dir),
         Command::Attention { command } => attention(command, &data_dir),
         Command::Rules { command, project } => rules(command, project, &data_dir),
+        Command::Knowledge { command, project } => knowledge(command, project, &data_dir),
         Command::Orchestrate {
             project,
             goal,
@@ -647,6 +683,10 @@ fn project(command: ProjectCommand, data_dir: &std::path::Path) -> Result<()> {
             if let Some(t) = &p.test_command {
                 println!("  test:  {t}");
             }
+            println!(
+                "  next:  corvx knowledge init {}   (its knowledge files, read by every agent)",
+                p.id
+            );
             Ok(())
         }
         ProjectCommand::List { json: as_json } => {
@@ -1251,20 +1291,27 @@ const ORCHESTRATOR_PROMPT: &str = "You are an orchestrator working through CORVX
 you plan, delegate to coding agents, review their work, and keep the human informed.
 
 How to work:
-1. Read the project (list_projects; read its README and any .corvx/ files) and break the goal into pieces that \
-can be done independently by separate agents.
+1. Read the project: read_knowledge first (its brief, decisions, conventions, map and the latest mission journals), \
+then its README and whatever else you need. Break the goal into pieces that can be done independently by separate \
+agents. In your plan, name the decisions and conventions that shape it, and what earlier missions taught that you \
+are applying.
 2. If agents must agree on an interface (an API, a data format), write that contract to a file in the repository \
 and commit it before starting them, so they can work in parallel.
 3. Start one agent per piece with start_agent. Give each a complete prompt: the goal, its exact scope, the \
-contract, how to test its work, and to commit on its branch when done. Agents cannot see your conversation.
+contract, the decisions and conventions that apply to its piece, how to test its work, and to commit on its \
+branch when done. Agents cannot see your conversation.
 4. Loop on wait_for. When an agent is waiting, read_screen to see what it did, then send_message with the next \
 instruction or a correction. When it reports done, review its result before accepting it.
 5. Use ask_human only for decisions the human must make (product choices, conflicts you cannot resolve, anything \
 risky). Do not ask about things you can check yourself.
 6. When the goal is met, write the mission's journal entry with journal: the goal, what happened, what went wrong, \
-and what was learned that the next mission on this project should know. Then summarize what each agent did, \
-which branches hold the work, and what the human should review or merge, and call report_done with that summary \
-(it is added to the journal too).";
+and what was learned that the next mission on this project should know. \
+7. Propose what should be remembered with propose_knowledge, one point per proposal, each with its evidence: \
+decisions made in this mission and why, conventions the agents should follow next time, pitfalls that cost time. \
+Only what would change how later work is done, and not what the knowledge already says, is waiting, or was \
+rejected. Usually zero to three proposals. The human accepts, edits or rejects them in the inbox. \
+8. Summarize what each agent did, which branches hold the work, which knowledge you proposed, and what the human \
+should review or merge, and call report_done with that summary (it is added to the journal too).";
 
 /// The orchestrator's role prompt, with its model and approval policy.
 fn orchestrator_prompt(agent_model: &str, human_approves_agents: bool) -> String {
@@ -1339,8 +1386,50 @@ fn orchestrate(
     human_approves_agents: bool,
     data_dir: &std::path::Path,
 ) -> Result<()> {
-    use corvx_proto::{methods, Session, SessionStartParams};
     let mut client = connect(data_dir)?;
+    let started = start_orchestrator(
+        &mut client,
+        project,
+        goal,
+        model,
+        agent_model,
+        human_approves_agents,
+    )?;
+    println!(
+        "started orchestrator {} on {model}; its agents default to {agent_model}",
+        started.session.id
+    );
+    if !started.wired {
+        println!(
+            "  knowledge:  not set up, so only the orchestrator reads it · corvx knowledge init {project}"
+        );
+    }
+    if human_approves_agents {
+        println!("  approvals:  you decide the agents' permission requests");
+    } else {
+        println!("  approvals:  the orchestrator decides its agents' requests and passes risky ones to you");
+    }
+    println!("  watch it:   corvx session attach {}", started.session.id);
+    println!("  your inbox: corvx attention");
+    Ok(())
+}
+
+pub(crate) struct Started {
+    pub session: corvx_proto::Session,
+    /// Whether the project's agents read its knowledge files (through CLAUDE.md).
+    pub wired: bool,
+}
+
+/// Starts an orchestrator session on a project. Shared by `corvx orchestrate` and the TUI.
+pub(crate) fn start_orchestrator(
+    client: &mut corvx_client::Client,
+    project: &str,
+    goal: &str,
+    model: &str,
+    agent_model: &str,
+    human_approves_agents: bool,
+) -> Result<Started> {
+    use corvx_proto::{methods, Session, SessionStartParams};
     let args = vec![
         "--append-system-prompt".to_string(),
         orchestrator_prompt(agent_model, human_approves_agents),
@@ -1350,7 +1439,8 @@ fn orchestrate(
     ];
     let params = SessionStartParams {
         project: project.to_string(),
-        command: "claude".into(),
+        // `CORVX_AGENT_COMMAND` replaces the agent program, e.g. with a test stand-in.
+        command: std::env::var("CORVX_AGENT_COMMAND").unwrap_or_else(|_| "claude".into()),
         args,
         runtime: Some("claude".into()),
         backend: None,
@@ -1361,18 +1451,220 @@ fn orchestrate(
         agent_model: Some(agent_model.to_string()),
         human_approves_agents,
     };
-    let s: Session = client.call(methods::SESSION_START, &params)?;
-    println!(
-        "started orchestrator {} on {model}; its agents default to {agent_model}",
-        s.id
-    );
-    if human_approves_agents {
-        println!("  approvals:  you decide the agents' permission requests");
-    } else {
-        println!("  approvals:  the orchestrator decides its agents' requests and passes risky ones to you");
+    let knowledge: Option<corvx_proto::Knowledge> = client
+        .call(
+            methods::KNOWLEDGE_READ,
+            &corvx_proto::KnowledgeReadParams {
+                project: project.to_string(),
+                journal: Some(0),
+            },
+        )
+        .ok();
+    let session: Session = client.call(methods::SESSION_START, &params)?;
+    Ok(Started {
+        session,
+        wired: knowledge.map_or(true, |k| k.wired),
+    })
+}
+
+/// `corvx knowledge`: a project's knowledge files and the proposals to change them.
+fn knowledge(
+    command: Option<KnowledgeCommand>,
+    project: Option<String>,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    use corvx_proto::{
+        methods, Knowledge, KnowledgeAccepted, KnowledgeInit, Proposal, ProposalList,
+    };
+    let mut client = connect(data_dir)?;
+    let proposal = |client: &mut corvx_client::Client, id: &str| -> Result<Proposal> {
+        let list: ProposalList =
+            client.call(methods::KNOWLEDGE_PROPOSALS, &json!({"all": true}))?;
+        list.proposals
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no proposal '{id}'"))
+    };
+    match command {
+        None => {
+            let Some(project) = project else {
+                anyhow::bail!("which project? corvx knowledge <project>");
+            };
+            let k: Knowledge = client.call(
+                methods::KNOWLEDGE_READ,
+                &json!({"project": project, "journal": 0}),
+            )?;
+            println!("{} · {}", k.project, k.path);
+            for f in &k.files {
+                let what = if f.name == "map" {
+                    if f.exists {
+                        "generated".to_string()
+                    } else {
+                        "not written yet".to_string()
+                    }
+                } else if !f.exists {
+                    "not written yet".to_string()
+                } else {
+                    let sections = f.text.lines().filter(|l| l.starts_with("## ")).count();
+                    format!("{sections} section{}", if sections == 1 { "" } else { "s" })
+                };
+                println!("  {:<24} {what}", f.path);
+            }
+            println!("  {:<24} {} entries", ".corvx/journal/", k.journal_count);
+            println!(
+                "  agents read it:          {}",
+                if k.wired {
+                    "yes, through CLAUDE.md".to_string()
+                } else {
+                    format!("only orchestrators · corvx knowledge init {}", k.project)
+                }
+            );
+            if k.open.is_empty() {
+                println!("no proposals waiting");
+            } else {
+                println!("waiting for you:");
+                for p in &k.open {
+                    println!("  {}  {}: {}", p.id, p.file, p.title);
+                }
+                println!("corvx knowledge show <id> · accept <id> [--edit] · reject <id> [reason]");
+            }
+            Ok(())
+        }
+        Some(KnowledgeCommand::Init { project }) => {
+            let done: KnowledgeInit =
+                client.call(methods::KNOWLEDGE_INIT, &json!({"project": project}))?;
+            for f in &done.written {
+                println!("wrote {f}");
+            }
+            if done.committed {
+                println!("committed");
+            }
+            if let Some(note) = done.note {
+                println!("{note}");
+            }
+            println!("Edit .corvx/brief.md to say what the project is and what matters now.");
+            Ok(())
+        }
+        Some(KnowledgeCommand::Proposals { project, all }) => {
+            let list: ProposalList = client.call(
+                methods::KNOWLEDGE_PROPOSALS,
+                &json!({"project": project, "all": all}),
+            )?;
+            if list.proposals.is_empty() {
+                println!("no proposals{}", if all { "" } else { " waiting" });
+            }
+            for p in list.proposals {
+                println!(
+                    "{:<22} {:<9} {:<12} {:<12} {}",
+                    p.id, p.status, p.project, p.file, p.title
+                );
+            }
+            Ok(())
+        }
+        Some(KnowledgeCommand::Show { id }) => {
+            let p = proposal(&mut client, &id)?;
+            print!("{}", describe_proposal(&p));
+            Ok(())
+        }
+        Some(KnowledgeCommand::Accept { id, edit }) => {
+            let p = proposal(&mut client, &id)?;
+            let text = if edit {
+                match edit_text(&p.text)? {
+                    Some(t) => Some(t),
+                    None => {
+                        println!("unchanged: nothing accepted");
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            let done: KnowledgeAccepted =
+                client.call(methods::KNOWLEDGE_ACCEPT, &json!({"id": id, "text": text}))?;
+            println!(
+                "accepted: written to {}{}",
+                done.file,
+                if done.committed { " and committed" } else { "" }
+            );
+            if let Some(note) = done.note {
+                println!("{note}");
+            }
+            Ok(())
+        }
+        Some(KnowledgeCommand::Reject { id, reason }) => {
+            let reason = (!reason.is_empty()).then(|| reason.join(" "));
+            client.call::<_, serde_json::Value>(
+                methods::KNOWLEDGE_REJECT,
+                &json!({"id": id, "reason": reason}),
+            )?;
+            println!("rejected; it will not be proposed again");
+            Ok(())
+        }
     }
-    println!("  watch it:   corvx session attach {}", s.id);
-    println!("  your inbox: corvx attention");
+}
+
+/// A proposal in full, as text.
+pub(crate) fn describe_proposal(p: &corvx_proto::Proposal) -> String {
+    let mut out = format!(
+        "{} · {} · .corvx/{}.md\n{}\n",
+        p.id, p.status, p.file, p.title
+    );
+    if let Some(e) = &p.evidence {
+        out.push_str(&format!("evidence: {e}\n"));
+    }
+    out.push_str(&format!("proposed by {}\n", p.by));
+    if let Some(r) = &p.replaces {
+        out.push_str(&format!("\nreplaces:\n{r}\n\nwith:\n"));
+    } else {
+        out.push('\n');
+    }
+    out.push_str(&p.text);
+    out.push('\n');
+    if let Some(r) = &p.reason {
+        out.push_str(&format!("\nrejected: {r}\n"));
+    }
+    out
+}
+
+/// Lets the human edit a text in $VISUAL or $EDITOR (vi if neither is set). Returns None
+/// when they leave it unchanged or empty.
+pub(crate) fn edit_text(initial: &str) -> Result<Option<String>> {
+    let path = std::env::temp_dir().join(format!(
+        "corvx-edit-{}-{}.md",
+        std::process::id(),
+        corvx_core::store::now_secs()
+    ));
+    std::fs::write(&path, initial)?;
+    let edited = run_editor(&path);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    edited?;
+    let text = text.trim().to_string();
+    Ok((!text.is_empty() && text != initial.trim()).then_some(text))
+}
+
+/// Opens a file in $VISUAL or $EDITOR. Returns whether its content changed.
+pub(crate) fn edit_file(path: &std::path::Path) -> Result<bool> {
+    let before = std::fs::read(path).ok();
+    run_editor(path)?;
+    Ok(std::fs::read(path).ok() != before)
+}
+
+fn run_editor(path: &std::path::Path) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    // The editor may come with arguments, e.g. "code --wait".
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("corvx-edit")
+        .arg(path)
+        .status()
+        .with_context(|| format!("cannot start the editor '{editor}'"))?;
+    if !status.success() {
+        anyhow::bail!("the editor '{editor}' exited with {status}");
+    }
     Ok(())
 }
 

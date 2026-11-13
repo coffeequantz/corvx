@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use corvx_client::{ensure_daemon, is_connection_error, Client};
 use corvx_proto::{
-    methods, AttentionItem, AttentionList, Project, ProjectList, Rule, RuleList, Session,
-    SessionList, SessionState,
+    methods, AttentionItem, AttentionList, Knowledge, KnowledgeAccepted, KnowledgeInit, Project,
+    ProjectList, Proposal, ProposalList, Rule, RuleList, Session, SessionList, SessionState,
 };
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,6 +33,10 @@ const BORDER: Color = Color::Rgb(38, 45, 54);
 enum Mode {
     Normal,
     AddPath,
+    /// What adding the typed path would add: its scan, and whether to set up its knowledge.
+    AddPreview,
+    /// The form that starts a mission: goal, autonomy level, models, who approves.
+    Mission,
     Palette,
     ConfirmRemove,
     Help,
@@ -42,6 +46,8 @@ enum Mode {
     Answer,
     /// Typing an optional reason for denying the selected permission request.
     Deny,
+    /// Typing an optional reason for rejecting the selected knowledge proposal.
+    Reject,
     /// CORVX's rules: what it asks you, allows or denies, for the selected project.
     Rules,
 }
@@ -49,6 +55,9 @@ enum Mode {
 #[derive(Clone, Copy, Debug)]
 enum Action {
     AddProject,
+    StartMission,
+    SetUpKnowledge,
+    EditBrief,
     RemoveProject,
     Refresh,
     Inbox,
@@ -57,8 +66,11 @@ enum Action {
     Quit,
 }
 
-const ACTIONS: [(Action, &str); 7] = [
+const ACTIONS: [(Action, &str); 10] = [
     (Action::AddProject, "add project"),
+    (Action::StartMission, "start a mission"),
+    (Action::SetUpKnowledge, "set up knowledge files"),
+    (Action::EditBrief, "edit the brief"),
     (Action::RemoveProject, "remove project"),
     (Action::Refresh, "refresh"),
     (Action::Inbox, "attention inbox"),
@@ -68,6 +80,55 @@ const ACTIONS: [(Action, &str); 7] = [
 ];
 
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+
+/// Models an orchestrator can run on, and its agents, defaults first.
+const ORCHESTRATOR_MODELS: [&str; 2] = ["opus", "sonnet"];
+const AGENT_MODELS: [&str; 3] = ["sonnet", "haiku", "opus"];
+
+#[derive(Clone, Copy, Default)]
+struct KnowledgeState {
+    wired: bool,
+    brief_written: bool,
+}
+
+impl KnowledgeState {
+    fn of(project: &Project) -> Self {
+        let root = Path::new(&project.path);
+        let brief = std::fs::read_to_string(root.join(".corvx/brief.md")).unwrap_or_default();
+        KnowledgeState {
+            wired: corvx_core::knowledge::wired(root),
+            // The template's placeholders mean nobody has written it yet.
+            brief_written: !brief.trim().is_empty() && !brief.contains("(What the project does"),
+        }
+    }
+}
+
+struct AddPreview {
+    path: PathBuf,
+    scan: corvx_core::scan::Scan,
+    git: bool,
+    wired: bool,
+    /// The project already registered at this path.
+    existing: Option<String>,
+    /// Set up its knowledge files once it is added.
+    knowledge: bool,
+}
+
+struct MissionForm {
+    project: String,
+    goal: String,
+    /// 0 goal, 1 autonomy, 2 orchestrator model, 3 agent model, 4 approvals.
+    field: usize,
+    level: usize,
+    model: usize,
+    agent_model: usize,
+    human_approves: bool,
+    /// What the orchestrator will start from, in one line.
+    knowledge: String,
+    wired: bool,
+}
+
+const MISSION_FIELDS: usize = 5;
 
 struct App {
     client: Client,
@@ -82,6 +143,17 @@ struct App {
     sessions_sel: usize,
     /// A session to attach to. The event loop hands it the terminal.
     pending_attach: Option<String>,
+    /// A proposal to edit before accepting it. The event loop hands the terminal to $EDITOR.
+    pending_edit: Option<String>,
+    /// Open knowledge proposals, by id (the id of their inbox item).
+    proposals: std::collections::HashMap<String, Proposal>,
+    /// A knowledge file to open in $EDITOR (the project, the file); committed if it changed.
+    pending_file: Option<(String, PathBuf)>,
+    /// Per project: whether its agents read its knowledge, and whether its brief is written.
+    knowledge_state: std::collections::HashMap<String, KnowledgeState>,
+    /// The project the add flow would add.
+    preview: Option<AddPreview>,
+    mission: Option<MissionForm>,
     inbox_sel: usize,
     /// The rules as they apply where the rules view sets them.
     rules: Vec<Rule>,
@@ -118,6 +190,32 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 if key.kind == KeyEventKind::Press {
                     app.on_key(key);
                 }
+            }
+        }
+        if let Some(id) = app.pending_edit.take() {
+            // Give the terminal to the editor, then accept what the human wrote.
+            let text = app
+                .proposals
+                .get(&id)
+                .map(|p| p.text.clone())
+                .unwrap_or_default();
+            ratatui::restore();
+            let edited = crate::edit_text(&text);
+            *terminal = ratatui::init();
+            terminal.clear()?;
+            match app.report(edited) {
+                Some(Some(text)) => app.accept_proposal(&id, Some(text)),
+                Some(None) => app.flash = "unchanged: nothing accepted".into(),
+                None => {}
+            }
+        }
+        if let Some((project, path)) = app.pending_file.take() {
+            ratatui::restore();
+            let edited = crate::edit_file(&path);
+            *terminal = ratatui::init();
+            terminal.clear()?;
+            if let Some(changed) = app.report(edited) {
+                app.after_editing(&project, &path, changed);
             }
         }
         if let Some(id) = app.pending_attach.take() {
@@ -159,6 +257,12 @@ impl App {
             session_depths: Vec::new(),
             sessions_sel: 0,
             pending_attach: None,
+            pending_edit: None,
+            proposals: Default::default(),
+            pending_file: None,
+            knowledge_state: Default::default(),
+            preview: None,
+            mission: None,
             inbox_sel: 0,
             rules: Vec::new(),
             rules_sel: 0,
@@ -207,6 +311,18 @@ impl App {
         {
             self.inbox_sel = i;
         }
+        self.knowledge_state = self
+            .projects
+            .iter()
+            .map(|p| (p.id.clone(), KnowledgeState::of(p)))
+            .collect();
+        // (An older daemon has no proposals: the inbox works without them.)
+        self.proposals = self
+            .rpc(methods::KNOWLEDGE_PROPOSALS, json!({}))
+            .ok()
+            .and_then(|v| serde_json::from_value::<ProposalList>(v).ok())
+            .map(|l| l.proposals.into_iter().map(|p| (p.id.clone(), p)).collect())
+            .unwrap_or_default();
         let list: SessionList =
             serde_json::from_value(self.rpc(methods::SESSION_LIST, json!({}))?)?;
         let (sessions, depths) = session_tree(list.sessions);
@@ -245,6 +361,8 @@ impl App {
         match self.mode {
             Mode::Normal => self.key_normal(key.code),
             Mode::AddPath => self.key_add(key.code),
+            Mode::AddPreview => self.key_preview(key.code),
+            Mode::Mission => self.key_mission(key.code),
             Mode::Palette => self.key_palette(key.code),
             Mode::ConfirmRemove => self.key_confirm(key.code),
             Mode::Help => self.mode = Mode::Normal,
@@ -252,6 +370,7 @@ impl App {
             Mode::Sessions => self.key_sessions(key.code),
             Mode::Answer => self.key_answer(key.code),
             Mode::Deny => self.key_deny(key.code),
+            Mode::Reject => self.key_reject(key.code),
             Mode::Rules => self.key_rules(key.code),
         }
     }
@@ -283,6 +402,9 @@ impl App {
             KeyCode::Char('i') => self.open_inbox(),
             KeyCode::Char('s') => self.open_sessions(),
             KeyCode::Char('l') => self.open_rules(),
+            KeyCode::Char('o') => self.open_mission(),
+            KeyCode::Char('b') => self.edit_brief(),
+            KeyCode::Char('K') => self.init_knowledge(),
             KeyCode::Char(':') => self.toggle_palette(),
             KeyCode::Esc => self.flash.clear(),
             _ => {}
@@ -336,6 +458,50 @@ impl App {
             }
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
+        }
+    }
+
+    fn key_reject(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Inbox;
+                self.input.clear();
+            }
+            KeyCode::Enter => {
+                let reason = std::mem::take(&mut self.input);
+                self.mode = Mode::Inbox;
+                let reason = reason.trim();
+                self.attention_action(
+                    methods::KNOWLEDGE_REJECT,
+                    json!({"reason": (!reason.is_empty()).then_some(reason)}),
+                    "rejected; it won't be proposed again",
+                );
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    /// Accepts a knowledge proposal, as proposed or as edited.
+    fn accept_proposal(&mut self, id: &str, text: Option<String>) {
+        let r = self.rpc(methods::KNOWLEDGE_ACCEPT, json!({"id": id, "text": text}));
+        if let Some(v) = self.report(r) {
+            let done: KnowledgeAccepted = serde_json::from_value(v).unwrap_or_default();
+            let edited = if text.is_some() { "edited and " } else { "" };
+            self.flash = format!(
+                "{edited}accepted · written to {}{}",
+                done.file,
+                match &done.note {
+                    Some(n) => format!(" · {n}"),
+                    None if done.committed => " and committed".into(),
+                    None => String::new(),
+                }
+            );
+            let r = self.refresh();
+            self.report(r);
         }
     }
 
@@ -590,6 +756,15 @@ impl App {
                         self.input.clear();
                     }
                 },
+                Some(item) if item.kind == "proposal" => {
+                    if c == 'n' {
+                        self.mode = Mode::Reject;
+                        self.input.clear();
+                    } else {
+                        let id = item.id.clone();
+                        self.accept_proposal(&id, None);
+                    }
+                }
                 Some(item) if item.kind == "suggestion" => {
                     if c == 'n' {
                         self.attention_action(
@@ -606,6 +781,14 @@ impl App {
                     }
                 }
                 Some(_) => self.flash = "only permission requests take y / n".into(),
+                None => {}
+            },
+            // Edit a proposal in $EDITOR, then accept it.
+            KeyCode::Char('e') => match self.attention.get(self.inbox_sel) {
+                Some(item) if item.kind == "proposal" => {
+                    self.pending_edit = Some(item.id.clone());
+                }
+                Some(_) => self.flash = "e is for knowledge proposals".into(),
                 None => {}
             },
             // A CORVX rule sent this to you: allow that rule from now on in this project.
@@ -695,10 +878,22 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
             }
-            KeyCode::Enter => {
-                let raw = std::mem::take(&mut self.input);
-                self.mode = Mode::Normal;
-                self.add_project(&raw);
+            KeyCode::Enter => self.preview_add(),
+            KeyCode::Tab => {
+                let (completed, choices) = complete_dir(&self.input);
+                self.input = completed;
+                self.flash = match choices.len() {
+                    0 | 1 => String::new(),
+                    n => {
+                        let shown: Vec<_> = choices.iter().take(6).cloned().collect();
+                        let more = if n > 6 {
+                            format!(" … {} more", n - 6)
+                        } else {
+                            String::new()
+                        };
+                        format!("{}{more}", shown.join("  "))
+                    }
+                };
             }
             KeyCode::Backspace => {
                 self.input.pop();
@@ -706,6 +901,254 @@ impl App {
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
         }
+    }
+
+    /// Looks at the typed path before adding it: what it is built with, whether it is a git
+    /// repository, whether CORVX already knows it.
+    fn preview_add(&mut self) {
+        let expanded = expand_home(self.input.trim());
+        if expanded.is_empty() {
+            self.flash = "type the path of a project directory".into();
+            return;
+        }
+        let path = match std::fs::canonicalize(&expanded) {
+            Ok(p) if p.is_dir() => p,
+            Ok(_) => {
+                self.flash = format!("not a directory: {expanded}");
+                return;
+            }
+            Err(_) => {
+                self.flash = format!("no such path: {expanded}");
+                return;
+            }
+        };
+        let git = path.join(".git").exists();
+        let wired = corvx_core::knowledge::wired(&path);
+        let existing = self
+            .projects
+            .iter()
+            .find(|p| Path::new(&p.path) == path)
+            .map(|p| p.id.clone());
+        self.preview = Some(AddPreview {
+            scan: corvx_core::scan::scan(&path),
+            path,
+            git,
+            wired,
+            existing,
+            knowledge: git && !wired,
+        });
+        self.mode = Mode::AddPreview;
+        self.flash.clear();
+    }
+
+    fn key_preview(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.mode = Mode::AddPath,
+            KeyCode::Char(' ') => {
+                if let Some(p) = &mut self.preview {
+                    p.knowledge = !p.knowledge;
+                }
+            }
+            KeyCode::Enter => {
+                let Some(preview) = self.preview.take() else {
+                    self.mode = Mode::Normal;
+                    return;
+                };
+                self.mode = Mode::Normal;
+                self.input.clear();
+                if let Some(id) = &preview.existing {
+                    self.select_project(id);
+                    self.flash = format!("{id} is already added");
+                    return;
+                }
+                self.add_project(&preview);
+            }
+            _ => {}
+        }
+    }
+
+    fn select_project(&mut self, id: &str) {
+        if let Some(i) = self.projects.iter().position(|x| x.id == id) {
+            self.selected = i;
+        }
+    }
+
+    /// Sets up the selected project's knowledge files and points its CLAUDE.md at them.
+    fn init_knowledge(&mut self) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "add a project first: a".into();
+            return;
+        };
+        let r = self
+            .rpc(methods::KNOWLEDGE_INIT, json!({"project": p.id}))
+            .and_then(|v| Ok(serde_json::from_value::<KnowledgeInit>(v)?));
+        if let Some(done) = self.report(r) {
+            self.flash = knowledge_flash(&p.id, &done);
+            let r = self.refresh();
+            self.report(r);
+        }
+    }
+
+    /// Opens the selected project's brief in $EDITOR.
+    fn edit_brief(&mut self) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "add a project first: a".into();
+            return;
+        };
+        let path = Path::new(&p.path).join(".corvx/brief.md");
+        if !path.is_file() {
+            self.flash = format!("{} has no knowledge files yet · K sets them up", p.id);
+            return;
+        }
+        self.pending_file = Some((p.id.clone(), path));
+    }
+
+    fn after_editing(&mut self, project: &str, path: &Path, changed: bool) {
+        if !changed {
+            self.flash = format!("{}: unchanged", path.display());
+            return;
+        }
+        let r = self
+            .rpc(
+                methods::KNOWLEDGE_COMMIT,
+                json!({"project": project, "file": "brief"}),
+            )
+            .and_then(|v| Ok(serde_json::from_value::<KnowledgeInit>(v)?));
+        if let Some(done) = self.report(r) {
+            self.flash = match (done.committed, done.note) {
+                (true, _) => format!("{project}: brief saved and committed · o starts a mission"),
+                (false, Some(note)) => format!("{project}: brief saved · {note}"),
+                (false, None) => format!("{project}: brief saved"),
+            };
+            let r = self.refresh();
+            self.report(r);
+        }
+    }
+
+    fn open_mission(&mut self) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "add a project first: a".into();
+            return;
+        };
+        let k: Option<Knowledge> = self
+            .rpc(
+                methods::KNOWLEDGE_READ,
+                json!({"project": p.id, "journal": 0}),
+            )
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok());
+        let (knowledge, wired) = match &k {
+            Some(k) => (knowledge_summary(k), k.wired),
+            None => (
+                "unknown (the daemon is older than this UI)".to_string(),
+                true,
+            ),
+        };
+        let level = corvx_proto::autonomy::ALL
+            .iter()
+            .position(|l| *l == p.autonomy)
+            .unwrap_or(1);
+        self.mission = Some(MissionForm {
+            project: p.id,
+            goal: String::new(),
+            field: 0,
+            level,
+            model: 0,
+            agent_model: 0,
+            human_approves: false,
+            knowledge,
+            wired,
+        });
+        self.mode = Mode::Mission;
+        self.flash.clear();
+    }
+
+    fn key_mission(&mut self, code: KeyCode) {
+        let Some(m) = &mut self.mission else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let step = |at: usize, len: usize, back: bool| {
+            if back {
+                (at + len - 1) % len
+            } else {
+                (at + 1) % len
+            }
+        };
+        match code {
+            KeyCode::Esc => {
+                self.mission = None;
+                self.mode = Mode::Normal;
+                self.flash = "no mission started".into();
+            }
+            KeyCode::Enter => self.start_mission(),
+            KeyCode::Tab | KeyCode::Down => m.field = (m.field + 1) % MISSION_FIELDS,
+            KeyCode::BackTab | KeyCode::Up => m.field = step(m.field, MISSION_FIELDS, true),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if m.field > 0 => {
+                let back = code == KeyCode::Left;
+                match m.field {
+                    1 => m.level = step(m.level, corvx_proto::autonomy::ALL.len(), back),
+                    2 => m.model = step(m.model, ORCHESTRATOR_MODELS.len(), back),
+                    3 => m.agent_model = step(m.agent_model, AGENT_MODELS.len(), back),
+                    _ => m.human_approves = !m.human_approves,
+                }
+            }
+            KeyCode::Backspace if m.field == 0 => {
+                m.goal.pop();
+            }
+            KeyCode::Char(c) if m.field == 0 => m.goal.push(c),
+            _ => {}
+        }
+    }
+
+    fn start_mission(&mut self) {
+        let Some(m) = self.mission.take() else {
+            return;
+        };
+        let goal = m.goal.trim().to_string();
+        if goal.is_empty() {
+            self.flash = "say what the mission should achieve".into();
+            self.mission = Some(m);
+            return;
+        }
+        self.mode = Mode::Normal;
+        let level = corvx_proto::autonomy::ALL[m.level];
+        let current = self
+            .projects
+            .iter()
+            .find(|p| p.id == m.project)
+            .map(|p| p.autonomy.clone());
+        if current.as_deref() != Some(level) {
+            let r = self.rpc(
+                methods::PROJECT_AUTONOMY,
+                json!({"id": m.project, "level": level}),
+            );
+            if self.report(r).is_none() {
+                return;
+            }
+        }
+        let (model, agent_model) = (ORCHESTRATOR_MODELS[m.model], AGENT_MODELS[m.agent_model]);
+        let r = crate::start_orchestrator(
+            &mut self.client,
+            &m.project,
+            &goal,
+            model,
+            agent_model,
+            m.human_approves,
+        );
+        let Some(started) = self.report(r) else {
+            return;
+        };
+        let id = started.session.id;
+        let r = self.refresh();
+        self.report(r);
+        self.open_sessions();
+        if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
+            self.sessions_sel = i;
+        }
+        self.flash = format!(
+            "started orchestrator {id} on {model} ({level}) · Enter watches it · i inbox · Esc back"
+        );
     }
 
     fn key_confirm(&mut self, code: KeyCode) {
@@ -753,6 +1196,9 @@ impl App {
     fn run_action(&mut self, action: Action) {
         match action {
             Action::AddProject => self.start_add(),
+            Action::StartMission => self.open_mission(),
+            Action::SetUpKnowledge => self.init_knowledge(),
+            Action::EditBrief => self.edit_brief(),
             Action::RemoveProject => self.start_remove(),
             Action::Refresh => {
                 let r = self.refresh();
@@ -788,33 +1234,28 @@ impl App {
         self.selected = (self.selected as i32 + delta).clamp(0, max) as usize;
     }
 
-    fn add_project(&mut self, raw: &str) {
-        let expanded = expand_home(raw.trim());
-        if expanded.is_empty() {
-            self.flash = "enter a path".into();
-            return;
-        }
-        let abs = match std::fs::canonicalize(&expanded) {
-            Ok(p) => p,
-            Err(_) => {
-                self.flash = format!("no such path: {expanded}");
-                return;
-            }
-        };
+    fn add_project(&mut self, preview: &AddPreview) {
         let r = self
             .rpc(
                 methods::PROJECT_ADD,
-                json!({"path": abs.display().to_string()}),
+                json!({"path": preview.path.display().to_string()}),
             )
             .and_then(|v| Ok(serde_json::from_value::<Project>(v)?));
-        if let Some(p) = self.report(r) {
-            self.flash = format!("added {}", p.id);
-            let r = self.refresh();
-            self.report(r);
-            if let Some(i) = self.projects.iter().position(|x| x.id == p.id) {
-                self.selected = i;
+        let Some(p) = self.report(r) else {
+            return;
+        };
+        self.flash = format!("added {} · o starts a mission", p.id);
+        if preview.knowledge {
+            let r = self
+                .rpc(methods::KNOWLEDGE_INIT, json!({"project": p.id}))
+                .and_then(|v| Ok(serde_json::from_value::<KnowledgeInit>(v)?));
+            if let Some(done) = self.report(r) {
+                self.flash = format!("added {} · {}", p.id, knowledge_flash(&p.id, &done));
             }
         }
+        let r = self.refresh();
+        self.report(r);
+        self.select_project(&p.id);
     }
 
     fn remove_selected(&mut self) {
@@ -843,6 +1284,78 @@ fn filter_actions(query: &str) -> Vec<(Action, &'static str)> {
         .collect()
 }
 
+/// Completes the last part of a typed path to the directories it can name. Returns the new
+/// input and the directories that matched.
+fn complete_dir(input: &str) -> (String, Vec<String>) {
+    let cut = input.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let (head, prefix) = input.split_at(cut);
+    let dir = if head.is_empty() {
+        ".".to_string()
+    } else {
+        expand_home(head)
+    };
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| {
+                    n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.'))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    match names.as_slice() {
+        [] => (input.to_string(), names),
+        [only] => (format!("{head}{only}/"), names),
+        [first, rest @ ..] => {
+            let mut common = first.clone();
+            for n in rest {
+                while !n.starts_with(&common) {
+                    common.pop();
+                }
+            }
+            (format!("{head}{common}"), names)
+        }
+    }
+}
+
+/// What setting up knowledge did, for the status line.
+fn knowledge_flash(project: &str, done: &KnowledgeInit) -> String {
+    if done.written.is_empty() {
+        return format!("{project}: knowledge already set up · b edits the brief");
+    }
+    let committed = if done.committed {
+        " and committed".to_string()
+    } else {
+        done.note
+            .as_deref()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default()
+    };
+    format!("knowledge set up{committed} · b writes the brief")
+}
+
+/// What an orchestrator will start from, in one line.
+fn knowledge_summary(k: &Knowledge) -> String {
+    let sections = |name: &str| {
+        k.files
+            .iter()
+            .find(|f| f.name == name && f.exists)
+            .map(|f| f.text.lines().filter(|l| l.starts_with("## ")).count())
+            .unwrap_or(0)
+    };
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    format!(
+        "{} · {} · {}",
+        plural(sections("decisions"), "decision", "decisions"),
+        plural(sections("conventions"), "convention", "conventions"),
+        plural(k.journal_count, "past mission", "past missions")
+    )
+}
+
 fn expand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -867,7 +1380,7 @@ fn draw(f: &mut Frame, app: &App) {
     let [rail, main] = Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body);
     draw_rail(f, rail, app);
     match app.mode {
-        Mode::Inbox | Mode::Answer | Mode::Deny => draw_inbox(f, main, app),
+        Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject => draw_inbox(f, main, app),
         Mode::Sessions => draw_sessions(f, main, app),
         Mode::Rules => draw_rules(f, main, app),
         _ => draw_main(f, main, app),
@@ -878,6 +1391,7 @@ fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Palette => draw_palette(f, body, app),
         Mode::Help => draw_help(f, body),
+        Mode::Mission => draw_mission(f, body, app),
         _ => {}
     }
 }
@@ -983,23 +1497,17 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_main(f: &mut Frame, area: Rect, app: &App) {
+    if app.mode == Mode::AddPreview {
+        if let Some(p) = &app.preview {
+            draw_preview(f, area, p);
+            return;
+        }
+    }
     let block = Block::bordered()
         .title(" project ")
         .border_style(Style::default().fg(BORDER));
     let Some(p) = app.selected_project() else {
-        let welcome = vec![
-            Line::styled(
-                "No projects yet.",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::from(""),
-            Line::styled(
-                "Press a to add a project directory, or run:",
-                Style::default().fg(DIM),
-            ),
-            Line::from("  corvx project add ./my-app"),
-        ];
-        f.render_widget(Paragraph::new(welcome).block(block), area);
+        f.render_widget(Paragraph::new(welcome_lines()).block(block), area);
         return;
     };
 
@@ -1017,6 +1525,35 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(p.autonomy.clone(), level_style(&p.autonomy)),
             Span::styled("  · l to change", Style::default().fg(DIM)),
         ]),
+        {
+            let waiting = app.proposals.values().filter(|x| x.project == p.id).count();
+            let k = app.knowledge_state.get(&p.id).copied().unwrap_or_default();
+            Line::from(vec![
+                label("knowledge"),
+                if !k.wired {
+                    Span::styled("not set up · K sets it up", Style::default().fg(AMBER))
+                } else if waiting > 0 {
+                    Span::styled(
+                        format!(
+                            "{waiting} proposal{} waiting in the inbox",
+                            if waiting == 1 { "" } else { "s" }
+                        ),
+                        kind_style("proposal"),
+                    )
+                } else if !k.brief_written {
+                    Span::styled(
+                        "set up · brief not written yet: b",
+                        Style::default().fg(AMBER),
+                    )
+                } else {
+                    Span::raw("set up · no proposals waiting")
+                },
+                Span::styled(
+                    format!("  · corvx knowledge {}", p.id),
+                    Style::default().fg(DIM),
+                ),
+            ])
+        },
         Line::from(vec![
             label("branch"),
             Span::raw(p.branch.clone().unwrap_or_else(|| "-".into())),
@@ -1052,17 +1589,278 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.extend(attention_lines(app, &p.id));
     lines.push(Line::from(""));
+    lines.push(Line::styled(next_step(app, p), Style::default().fg(GREEN)));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The one thing to do next on a project, so a new one is never a dead end.
+fn next_step(app: &App, p: &Project) -> String {
+    let k = app.knowledge_state.get(&p.id).copied().unwrap_or_default();
+    let running = app
+        .sessions
+        .iter()
+        .any(|s| s.project == p.id && s.state == SessionState::Running);
+    if !k.wired {
+        "next: K sets up the knowledge files every agent reads, then o starts a mission".into()
+    } else if !k.brief_written {
+        "next: b writes the brief (what it is, what matters now), then o starts a mission".into()
+    } else if running {
+        "o starts another mission · s shows the sessions · i the inbox".into()
+    } else {
+        "next: o starts a mission".into()
+    }
+}
+
+fn welcome_lines() -> Vec<Line<'static>> {
+    let step = |key: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {key:<3}"),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(what),
+        ])
+    };
+    vec![
+        Line::styled(
+            "Welcome to CORVX.",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        Line::styled(
+            "It runs coding agents on your projects and comes to you only when it needs you.",
+            Style::default().fg(DIM),
+        ),
+        Line::from(""),
+        step("a", "add a project: a git repository you work on"),
+        step("b", "write its brief: what it is, and what matters now"),
+        step(
+            "o",
+            "start a mission: a goal; an orchestrator plans it and runs agents",
+        ),
+        step(
+            "i",
+            "your inbox: approvals, questions, results, things to remember",
+        ),
+        Line::from(""),
+        Line::styled(
+            "? all keys · q quits this view (agents keep running)",
+            Style::default().fg(DIM),
+        ),
+    ]
+}
+
+/// Splits text into lines of at most `width` characters, at spaces.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// What adding the typed path would add.
+fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
+    let label = |s: &str| Span::styled(format!("{s:<11}"), Style::default().fg(DIM));
+    let or = |v: &Option<String>, none: &str| v.clone().unwrap_or_else(|| none.to_string());
+    let name = p
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut lines = vec![
+        Line::styled(
+            name,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![label("path"), Span::raw(p.path.display().to_string())]),
+        Line::from(vec![
+            label("stack"),
+            Span::raw(if p.scan.stack.is_empty() {
+                "not detected".to_string()
+            } else {
+                p.scan.stack.join(", ")
+            }),
+        ]),
+        Line::from(vec![
+            label("test"),
+            Span::raw(or(&p.scan.test_command, "not detected")),
+        ]),
+        Line::from(vec![
+            label("build"),
+            Span::raw(or(&p.scan.build_command, "not detected")),
+        ]),
+        Line::from(vec![
+            label("git"),
+            if p.git {
+                Span::raw(format!("yes, on {}", or(&p.scan.branch, "a detached HEAD")))
+            } else {
+                Span::styled(
+                    "no: agents need git for their own worktrees (git init first)",
+                    Style::default().fg(AMBER),
+                )
+            },
+        ]),
+        Line::from(""),
+    ];
+    if let Some(id) = &p.existing {
+        lines.push(Line::styled(
+            format!("Already added as {id}. Enter selects it."),
+            Style::default().fg(AMBER),
+        ));
+    } else if p.wired {
+        lines.push(Line::styled(
+            "Its knowledge files are already set up.",
+            Style::default().fg(GREEN),
+        ));
+    } else {
+        let mark = if p.knowledge { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{mark} "),
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("set up its knowledge files"),
+        ]));
+        lines.push(Line::styled(
+            "    .corvx/brief, decisions, conventions and map, read by every agent through CLAUDE.md;",
+            Style::default().fg(DIM),
+        ));
+        lines.push(Line::styled(
+            "    committed to the current branch. Nothing else in the project is touched.",
+            Style::default().fg(DIM),
+        ));
+    }
+    lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Project Model: L1 structure scanned at registration · L2+ arrive in M3",
+        "Enter add · space knowledge on/off · Esc back",
         Style::default().fg(DIM),
     ));
+    let block = Block::bordered()
+        .title(" add this project? ")
+        .border_style(Style::default().fg(GREEN));
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The form that starts a mission.
+fn draw_mission(f: &mut Frame, area: Rect, app: &App) {
+    let Some(m) = &app.mission else {
+        return;
+    };
+    let rect = centered(area, 78, 19);
+    f.render_widget(Clear, rect);
+    let label = |i: usize, s: &str| {
+        let style = if m.field == i {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        Span::styled(
+            format!("{} {s:<13}", if m.field == i { "▸" } else { " " }),
+            style,
+        )
+    };
+    let choice = |i: usize, options: &[&str], at: usize| {
+        let mut spans = Vec::new();
+        for (j, o) in options.iter().enumerate() {
+            let style = if j == at {
+                if m.field == i {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(GREEN)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                }
+            } else {
+                Style::default().fg(DIM)
+            };
+            spans.push(Span::styled(format!(" {o} "), style));
+            spans.push(Span::raw(" "));
+        }
+        spans
+    };
+    let cursor = if m.field == 0 { "█" } else { "" };
+    let goal = if m.goal.is_empty() && m.field != 0 {
+        Span::styled("(what should be achieved)", Style::default().fg(DIM))
+    } else {
+        Span::raw(format!("{}{cursor}", m.goal))
+    };
+    let levels = corvx_proto::autonomy::ALL;
+    let row = |i: usize, name: &str, options: &[&str], at: usize| {
+        let mut spans = vec![label(i, name)];
+        spans.extend(choice(i, options, at));
+        Line::from(spans)
+    };
+    let indent = 16;
+    let width = (rect.width as usize).saturating_sub(indent + 2).max(20);
+    let indented = |text: &str, style: Style| -> Vec<Line<'static>> {
+        wrap(text, width)
+            .into_iter()
+            .map(|l| Line::styled(format!("{:indent$}{l}", ""), style))
+            .collect()
+    };
+    let mut lines = vec![
+        Line::from(vec![label(0, "goal"), goal]),
+        Line::from(""),
+        row(1, "autonomy", levels, m.level),
+    ];
+    lines.extend(indented(
+        crate::level_meaning(levels[m.level]),
+        Style::default().fg(DIM),
+    ));
+    lines.extend([
+        row(2, "orchestrator", &ORCHESTRATOR_MODELS, m.model),
+        row(3, "agents", &AGENT_MODELS, m.agent_model),
+        row(
+            4,
+            "approvals",
+            &["orchestrator decides", "you decide"],
+            usize::from(m.human_approves),
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  knowledge     ", Style::default().fg(DIM)),
+            Span::raw(m.knowledge.clone()),
+        ]),
+    ]);
+    if !m.wired {
+        lines.extend(indented(
+            "not set up: only the orchestrator reads it · Esc, then K sets it up",
+            Style::default().fg(AMBER),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Enter start · Tab/↑↓ field · ←/→ change · Esc cancel",
+        Style::default().fg(DIM),
+    ));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" start a mission on {} ", m.project))
+                .border_style(Style::default().fg(GREEN)),
+        ),
+        rect,
+    );
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let (label, color) = match app.mode {
         Mode::Normal => ("NORMAL", ACCENT),
         Mode::AddPath => ("ADD", GREEN),
+        Mode::AddPreview => ("ADD", GREEN),
+        Mode::Mission => ("MISSION", GREEN),
         Mode::Palette => ("PALETTE", Color::Rgb(188, 140, 255)),
         Mode::ConfirmRemove => ("CONFIRM", AMBER),
         Mode::Help => ("HELP", ACCENT),
@@ -1070,6 +1868,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Sessions => ("SESSIONS", ACCENT),
         Mode::Answer => ("ANSWER", GREEN),
         Mode::Deny => ("DENY", RED),
+        Mode::Reject => ("REJECT", RED),
         Mode::Rules => ("RULES", ACCENT),
     };
     let hint = if !app.flash.is_empty() {
@@ -1077,9 +1876,16 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         match app.mode {
             Mode::Normal => {
-                "j/k move · a add · d remove · r refresh · : commands · ? help · q quit".into()
+                "j/k move · a add · o mission · b brief · K knowledge · i inbox · s sessions · l rules · ? help · q quit"
+                    .into()
             }
-            Mode::AddPath => "type a path · Enter add · Esc cancel".into(),
+            Mode::AddPath => {
+                "type the project's path · Tab completes · Enter look at it · Esc cancel".into()
+            }
+            Mode::AddPreview => "Enter add · space knowledge on/off · Esc back to the path".into(),
+            Mode::Mission => {
+                "type the goal · Tab/↑↓ field · ←/→ change · Enter start · Esc cancel".into()
+            }
             Mode::Palette => "type to filter · ↑↓ select · Enter run · Esc close".into(),
             Mode::ConfirmRemove => "y remove from CORVX · any other key cancels".into(),
             Mode::Help => "any key closes".into(),
@@ -1090,6 +1896,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 }
                 Some("suggestion") => {
                     "y allow from now on · n keep asking · j/k move · Esc".into()
+                }
+                Some("proposal") => {
+                    "y accept · e edit, then accept · n reject · z snooze · j/k move · Esc".into()
                 }
                 Some("question") => {
                     "r answer · Enter attach · a ack · z snooze · x dismiss · j/k move · Esc".into()
@@ -1103,6 +1912,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             }
             Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
             Mode::Deny => "why, or what to do instead (optional) · Enter deny · Esc cancel".into(),
+            Mode::Reject => {
+                "why (optional; agents see it, so they don't propose it again) · Enter reject · Esc cancel"
+                    .into()
+            }
             Mode::Rules => {
                 "-/+ autonomy · h ask · y allow · n deny · o off · d default · g this project/everywhere · Esc"
                     .into()
@@ -1135,6 +1948,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Mode::Deny => Line::from(vec![
             Span::styled("deny › ", Style::default().fg(RED)),
+            Span::raw(format!("{}█", app.input)),
+        ]),
+        Mode::Reject => Line::from(vec![
+            Span::styled("reject › ", Style::default().fg(RED)),
             Span::raw(format!("{}█", app.input)),
         ]),
         Mode::ConfirmRemove => Line::styled(
@@ -1182,11 +1999,14 @@ fn draw_palette(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 66, 17);
+    let rect = centered(area, 72, 21);
     f.render_widget(Clear, rect);
     let rows = [
         ("j / k, ↑ ↓", "move selection"),
-        ("a", "add a project directory"),
+        ("a", "add a project directory (Tab completes the path)"),
+        ("o", "start a mission on the selected project"),
+        ("b", "edit its brief in $EDITOR (committed when saved)"),
+        ("K", "set up its knowledge files, read by every agent"),
         ("d", "remove the selected project (files untouched)"),
         ("r", "refresh from the daemon"),
         (": or Ctrl+K", "command palette"),
@@ -1196,6 +2016,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "  in inbox",
             "y approve · Y always · n deny · A autopilot · z snooze",
         ),
+        (
+            "  proposals",
+            "y accept · e edit, then accept · n reject, with why",
+        ),
         ("  in sessions", "R resume · a autopilot on/off"),
         (
             "l",
@@ -1204,7 +2028,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("?", "this help"),
         ("q", "quit the UI (the daemon keeps running)"),
         ("", ""),
-        ("CLI", "corvx project add|list|remove · corvx status"),
+        (
+            "CLI",
+            "corvx project · orchestrate · knowledge · rules · attention",
+        ),
     ];
     let lines: Vec<Line> = rows
         .iter()
@@ -1286,6 +2113,7 @@ fn kind_label(kind: &str) -> &'static str {
         "question" => "QUESTION",
         "approval" => "APPROVE?",
         "suggestion" => "SUGGEST",
+        "proposal" => "LEARN?",
         "done" => "DONE",
         "failed" => "FAILED",
         _ => "?",
@@ -1299,6 +2127,7 @@ fn kind_style(kind: &str) -> Style {
         "question" => AMBER,
         "approval" => AMBER,
         "suggestion" => GREEN,
+        "proposal" => Color::Rgb(188, 140, 255),
         "done" => GREEN,
         "failed" => RED,
         _ => DIM,
@@ -1358,13 +2187,19 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
     let detail = app.attention.get(app.inbox_sel).filter(|i| {
         matches!(
             i.kind.as_str(),
-            "approval" | "question" | "blocked" | "suggestion"
+            "approval" | "question" | "blocked" | "suggestion" | "proposal"
         ) || i.summary.len() > 60
     });
     let Some(item) = detail else {
         f.render_widget(Paragraph::new(lines).block(block), area);
         return;
     };
+    if item.kind == "proposal" {
+        if let Some(p) = app.proposals.get(&item.id) {
+            draw_proposal(f, area, lines, block, p, app);
+            return;
+        }
+    }
     let [list_area, detail_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(7)]).areas(area);
     f.render_widget(Paragraph::new(lines).block(block), list_area);
@@ -1415,6 +2250,69 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
             Block::bordered()
                 .title(title)
                 .border_style(kind_style(&item.kind)),
+        );
+    f.render_widget(detail, detail_area);
+}
+
+/// The inbox with a knowledge proposal selected: the list, and the proposal in full below it.
+fn draw_proposal(
+    f: &mut Frame,
+    area: Rect,
+    lines: Vec<Line>,
+    block: Block,
+    p: &Proposal,
+    app: &App,
+) {
+    let mut text = vec![Line::from(vec![
+        Span::styled(
+            format!(".corvx/{}.md  ", p.file),
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(
+            p.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    if let Some(e) = &p.evidence {
+        text.push(Line::styled(
+            format!("evidence: {e}"),
+            Style::default().fg(DIM),
+        ));
+    }
+    text.push(Line::from(""));
+    if let Some(old) = &p.replaces {
+        text.push(Line::styled("replaces:", Style::default().fg(DIM)));
+        for l in old.lines() {
+            text.push(Line::styled(format!("- {l}"), Style::default().fg(RED)));
+        }
+        text.push(Line::styled("with:", Style::default().fg(DIM)));
+        for l in p.text.lines() {
+            text.push(Line::styled(format!("+ {l}"), Style::default().fg(GREEN)));
+        }
+    } else {
+        text.extend(p.text.lines().map(|l| Line::raw(l.to_string())));
+    }
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "y accept (written to the file and committed) · e edit, then accept · n reject, with why",
+        Style::default().fg(DIM),
+    ));
+    let height = (text.len() as u16 + 2).clamp(7, area.height.saturating_sub(5).max(7));
+    let [list_area, detail_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).areas(area);
+    f.render_widget(Paragraph::new(lines).block(block), list_area);
+    let agent = app
+        .sessions
+        .iter()
+        .find(|s| s.id == p.by)
+        .map(crate::display_name)
+        .unwrap_or_else(|| p.by.clone());
+    let detail = Paragraph::new(text)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(
+            Block::bordered()
+                .title(format!(" {agent} proposes to remember "))
+                .border_style(kind_style("proposal")),
         );
     f.render_widget(detail, detail_area);
 }

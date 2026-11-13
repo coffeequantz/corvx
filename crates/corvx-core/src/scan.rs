@@ -46,16 +46,38 @@ pub fn scan(root: &Path) -> Scan {
         }
     }
 
-    if root.join("pyproject.toml").is_file()
+    let has_manifest = root.join("pyproject.toml").is_file()
         || root.join("setup.py").is_file()
-        || root.join("requirements.txt").is_file()
-    {
+        || root.join("requirements.txt").is_file();
+    if has_manifest || has_file_with_extension(root, "py") {
         s.stack.push("python".into());
-        let uses_pytest = fs::read_to_string(root.join("pyproject.toml"))
-            .map(|t| t.contains("pytest"))
-            .unwrap_or(false);
-        if uses_pytest || root.join("tests").is_dir() {
+        let uses_pytest = ["pyproject.toml", "requirements.txt", "setup.py"]
+            .iter()
+            .any(|f| {
+                fs::read_to_string(root.join(f))
+                    .map(|t| t.contains("pytest"))
+                    .unwrap_or(false)
+            });
+        if uses_pytest {
             set_if_none(&mut s.test_command, "pytest");
+        } else if root.join("tests").is_dir() {
+            // Standard-library tests need no runner; anything else is assumed to be pytest.
+            let texts: Vec<String> = fs::read_dir(root.join("tests"))
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "py"))
+                        .filter_map(|e| fs::read_to_string(e.path()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let unittest = texts.iter().any(|t| t.contains("import unittest"))
+                && texts.iter().all(|t| !t.contains("pytest"));
+            let cmd = if unittest {
+                "python3 -m unittest"
+            } else {
+                "pytest"
+            };
+            set_if_none(&mut s.test_command, cmd);
         }
     }
 
@@ -81,6 +103,16 @@ pub fn scan(root: &Path) -> Scan {
 
     s.branch = git_branch(root);
     s
+}
+
+/// Whether a directory (not its subdirectories) holds a file with this extension.
+fn has_file_with_extension(dir: &Path, ext: &str) -> bool {
+    fs::read_dir(dir)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .any(|e| e.path().is_file() && e.path().extension().is_some_and(|x| x == ext))
+        })
+        .unwrap_or(false)
 }
 
 fn set_if_none(slot: &mut Option<String>, value: &str) {
@@ -113,6 +145,20 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn plain_python_with_standard_library_tests() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("server.py"), "print(1)\n").unwrap();
+        fs::create_dir(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests/test_server.py"), "import unittest\n").unwrap();
+        let s = scan(dir.path());
+        assert_eq!(s.stack, vec!["python"]);
+        assert_eq!(s.test_command.as_deref(), Some("python3 -m unittest"));
+
+        fs::write(dir.path().join("tests/conftest.py"), "import pytest\n").unwrap();
+        assert_eq!(scan(dir.path()).test_command.as_deref(), Some("pytest"));
+    }
 
     #[test]
     fn empty_directory_has_no_stack() {

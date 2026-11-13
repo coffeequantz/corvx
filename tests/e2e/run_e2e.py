@@ -896,12 +896,167 @@ def autonomy_trust_and_journal(h: Harness):
     assert "## Done · " in text and "Formatting is clean." in text, text
 
 
+def the_knowledge_loop(h: Harness):
+    """Knowledge files, proposals reviewed in the inbox, and what later agents read."""
+    git = lambda *a: subprocess.run(["git", "-C", str(h.project), *a], check=True,
+                                    capture_output=True, text=True).stdout
+    if not (h.project / ".git").exists():
+        git("init", "-q")
+    git("config", "user.name", "e2e")
+    git("config", "user.email", "e2e@e2e")
+    git("add", "-A")
+    git("commit", "-q", "--allow-empty", "-m", "before knowledge")
+
+    out = h.corvx("knowledge", "init", "e2e")
+    assert "wrote .corvx/decisions.md" in out and "committed" in out, out
+    assert "@.corvx/conventions.md" in (h.project / "CLAUDE.md").read_text()
+    assert "agents read it:          yes" in h.corvx("knowledge", "e2e")
+
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    m = Mcp({**h.env, "CORVX_SESSION_ID": sid})
+    try:
+        m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "e2e", "version": "0"}})
+        m.notify("notifications/initialized")
+        k = m.tool("read_knowledge")
+        paths = [f["path"] for f in k["files"]]
+        assert paths == [".corvx/brief.md", ".corvx/decisions.md", ".corvx/conventions.md",
+                         ".corvx/map.md"], paths
+        assert "- test: `cargo test`" in k["files"][3]["text"], k["files"][3]
+
+        propose = lambda file, title, text: m.tool("propose_knowledge", {
+            "file": file, "title": title, "text": text, "evidence": f"mission {sid}"})
+        fmt = propose("conventions", "Run cargo fmt first", "Run `cargo fmt` before committing.")
+        redis = propose("decisions", "Use Redis", "Cache in Redis.")
+        edit = propose("conventions", "Tests name the behaviour", "Name tests after what they show.")
+        # The agent moving on does not close its proposals.
+        h.corvx("session", "input", sid, "work", "--enter")
+        time.sleep(1.5)
+        inbox = h.attention_text()
+        for p in (fmt, redis, edit):
+            assert p["proposed"] in inbox, inbox
+
+        # Rejected with a reason: it is not proposed again, and agents see why.
+        h.corvx("knowledge", "reject", redis["proposed"], "no", "external", "services")
+        try:
+            propose("decisions", "use redis", "Again.")
+            raise AssertionError("a rejected proposal was accepted again")
+        except AssertionError as e:
+            assert "no external services" in str(e), e
+
+        # Reviewed in the terminal UI: y accepts one, e edits the other first.
+        for line in h.attention_text().splitlines()[1:]:
+            item = line.split()[0]
+            if item not in (fmt["proposed"], edit["proposed"]):
+                h.corvx("attention", "dismiss", item, check=False)
+        env = {**h.env, "EDITOR": "printf 'Name each test after the behaviour it shows.\\n' >"}
+        t = Term([str(CORVX)], env)
+        try:
+            t.send(b"i")
+            assert t.wait_for("proposes to remember", 5), "inbox:\n" + t.text()
+            t.key(b"k", b"k", b"k")
+            assert t.wait_for("Run cargo fmt first", 5), t.text()
+            t.send(b"y")
+            wait_until(lambda: "Run `cargo fmt`" in (h.project / ".corvx/conventions.md").read_text(),
+                       10, "y to accept:\n" + t.text())
+            assert t.wait_for("Tests name the behaviour", 5), t.text()
+            t.send(b"e")
+            wait_until(lambda: "after the behaviour it shows" in
+                       (h.project / ".corvx/conventions.md").read_text(), 10, "e to edit and accept:\n" + t.text())
+            t.key(b"\x1b", b"q")
+        finally:
+            t.close()
+        log = git("log", "-3", "--format=%s")
+        assert "Knowledge: Run cargo fmt first" in log and "Knowledge: Tests name the behaviour" in log, log
+
+        # What the next agent reads.
+        k = m.tool("read_knowledge")
+        conventions = k["files"][2]["text"]
+        assert "Run `cargo fmt` before committing." in conventions, conventions
+        assert "Name each test after the behaviour it shows." in conventions, conventions
+        assert "Name tests after" not in conventions, conventions
+        assert k["waiting_for_the_human"] == [], k
+        assert k["rejected_before"] == [{"file": "decisions", "title": "Use Redis",
+                                         "reason": "no external services"}], k
+    finally:
+        m.close()
+
+
+def setting_up_in_the_terminal_ui(h: Harness):
+    """Add a project, set up its knowledge, write its brief and start a mission, all in the TUI."""
+    proj = h.base / "newproj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "server.py").write_text("print('hi')\n")
+    (proj / "tests" / "test_server.py").write_text("import unittest\n")
+    git = lambda *a: subprocess.run(["git", "-C", str(proj), *a], check=True,
+                                    capture_output=True, text=True).stdout
+    git("init", "-q")
+    git("config", "user.name", "e2e")
+    git("config", "user.email", "e2e@e2e")
+    git("add", "-A")
+    git("commit", "-q", "-m", "init")
+
+    env = {**h.env, "EDITOR": "printf '# New\\n\\nA small server.\\n' >",
+           "CORVX_AGENT_COMMAND": str(FAKE_CLAUDE)}
+    t = Term([str(CORVX)], env, cols=130, rows=36)
+    orch = None
+    try:
+        assert t.wait_for("projects", 10), t.text()
+        t.send(b"a")
+        t.send(f"{h.base}/newp".encode())
+        t.send(b"\t")
+        assert t.wait_for("newproj/", 5), "Tab did not complete the path:\n" + t.text()
+        t.send(b"\r")
+        assert t.wait_for("add this project?", 5), t.text()
+        assert t.wait_for("python3 -m unittest", 5), t.text()
+        assert "[x] set up its knowledge files" in t.text(), t.text()
+        t.send(b"\r")
+        assert t.wait_for("knowledge set up and committed", 10), t.text()
+        assert "newproj" in h.corvx("project", "list")
+        assert "<!-- corvx:knowledge -->" in (proj / "CLAUDE.md").read_text()
+        assert "CORVX: project knowledge files" in git("log", "-1", "--format=%s")
+        assert t.wait_for("next: b writes the brief", 5), t.text()
+
+        t.send(b"b")
+        assert t.wait_for("brief saved and committed", 10), t.text()
+        assert (proj / ".corvx" / "brief.md").read_text() == "# New\n\nA small server.\n"
+        assert "Knowledge: update brief" in git("log", "-1", "--format=%s")
+        assert t.wait_for("next: o starts a mission", 5), t.text()
+
+        t.send(b"o")
+        assert t.wait_for("start a mission on newproj", 5), t.text()
+        assert "0 decisions · 0 conventions · 0 past missions" in t.text(), t.text()
+        t.send(b"Add a health check")
+        t.send(b"\t")
+        t.send(b"\x1b[C")  # autonomy: guided -> autonomous
+        t.send(b"\t")
+        t.send(b"\t")
+        t.send(b"\x1b[C")  # agents: sonnet -> haiku
+        t.pump(0.5)
+        t.send(b"\r")
+        assert t.wait_for("started orchestrator", 10), t.text()
+        line = next(l for l in h.corvx("session", "list").splitlines() if "orchestrator · Add a health check" in l)
+        orch = line.split()[0]
+        assert "autonomous" in h.corvx("project", "autonomy", "newproj")
+        started = [e for e in events_of(h, "session.started") if e.get("id") == orch]
+        command = " ".join(started[-1]["command"]) if started else ""
+        assert "--model opus" in command and "start_agent uses haiku" in command, command
+        t.key(b"\x1b", b"q")
+    finally:
+        t.close()
+        if orch:
+            h.corvx("session", "stop", orch, check=False)
+        h.corvx("project", "remove", "newproj", check=False)
+
+
 SCENARIOS = [
     attach_and_detach_pty,
     orchestration_through_mcp,
     orchestrator_decides_approvals,
     rules_reach_the_human,
     autonomy_trust_and_journal,
+    the_knowledge_loop,
+    setting_up_in_the_terminal_ui,
     real_claude_rules,
     attach_from_the_terminal_ui,
     attach_and_detach_tmux,

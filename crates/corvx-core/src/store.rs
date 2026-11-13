@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use corvx_proto::{AgentState, AttentionItem, Project, Session, SessionState};
+use corvx_proto::{AgentState, AttentionItem, Project, Proposal, Session, SessionState};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
@@ -23,7 +23,7 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE projects (
@@ -96,6 +96,25 @@ CREATE TABLE trust (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (project, key)
 );
+";
+
+/// Version 10: knowledge proposals. Each has an inbox item of kind "proposal" with the same id.
+const SCHEMA_V10: &str = "
+CREATE TABLE proposals (
+    id         TEXT PRIMARY KEY,
+    project    TEXT NOT NULL,
+    file       TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    replaces   TEXT,
+    evidence   TEXT,
+    by_session TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    reason     TEXT,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+);
+CREATE INDEX proposals_project ON proposals(project, status);
 ";
 
 /// Version 5: readable session labels.
@@ -204,6 +223,9 @@ impl Store {
         }
         if version < 9 {
             conn.execute_batch(SCHEMA_V9)?;
+        }
+        if version < 10 {
+            conn.execute_batch(SCHEMA_V10)?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -315,7 +337,8 @@ impl Store {
         }
         self.conn.execute(
             "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2, note = 'agent moved on'
-             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != ?3 AND kind != 'question'",
+             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != ?3
+                   AND kind NOT IN ('question', 'proposal')",
             params![session_id, now, state],
         )?;
         if !matches!(state, "blocked" | "waiting" | "done" | "failed") {
@@ -355,11 +378,12 @@ impl Store {
         Ok(())
     }
 
-    /// Resolves every open item, e.g. when the daemon restarts and its sessions are gone.
+    /// Resolves every open item about a session, e.g. when the daemon restarts and its
+    /// sessions are gone. Suggestions and proposals stay: they do not depend on a session.
     pub fn resolve_all_attention(&self, reason: &str, now: i64) -> Result<usize> {
         Ok(self.conn.execute(
             "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2, note = ?1
-             WHERE status IN ('open', 'snoozed')",
+             WHERE status IN ('open', 'snoozed') AND kind NOT IN ('suggestion', 'proposal')",
             params![reason, now],
         )?)
     }
@@ -463,7 +487,7 @@ impl Store {
         self.conn.execute(
             "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2,
                     note = CASE kind WHEN 'approval' THEN 'superseded' ELSE 'agent moved on' END
-             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != 'question'",
+             WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind NOT IN ('question', 'proposal')",
             params![session_id, now],
         )?;
         let id = new_attention_id(now);
@@ -801,6 +825,80 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Records a knowledge proposal and opens its inbox item (severity 2: review). The item
+    /// belongs to the proposing session but is not closed when that session moves on.
+    pub fn insert_proposal(&self, p: &Proposal, now: i64) -> Result<String> {
+        let id = new_attention_id(now);
+        self.conn.execute(
+            "INSERT INTO proposals (id, project, file, title, text, replaces, evidence, by_session, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
+            params![id, p.project, p.file, p.title, p.text, p.replaces, p.evidence, p.by, now],
+        )?;
+        self.conn.execute(
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
+             VALUES (?1, 'proposal', 2, ?2, ?3, ?4, 'open', ?5, ?5)",
+            params![id, p.project, p.by, format!("{}: {}", p.file, p.title), now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_proposal(&self, id: &str) -> Result<Option<Proposal>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM proposals WHERE id = ?1",
+                params![id],
+                proposal_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Proposals, newest first: open ones only unless `all`, for one project or all of them.
+    pub fn list_proposals(&self, project: Option<&str>, all: bool) -> Result<Vec<Proposal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM proposals WHERE (?1 IS NULL OR project = ?1) AND (?2 OR status = 'open')
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![project, all], proposal_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The most recent rejected proposals of a project.
+    pub fn rejected_proposals(&self, project: &str, limit: i64) -> Result<Vec<Proposal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM proposals WHERE project = ?1 AND status = 'rejected'
+             ORDER BY decided_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project, limit], proposal_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Decides an open proposal: "accepted" (with the text as written) or "rejected" (with a
+    /// reason). Closes its inbox item. Returns false if it is not open.
+    pub fn decide_proposal(
+        &self,
+        id: &str,
+        status: &str,
+        text: Option<&str>,
+        reason: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE proposals SET status = ?2, text = COALESCE(?3, text), reason = ?4, decided_at = ?5
+             WHERE id = ?1 AND status = 'open'",
+            params![id, status, text, reason, now],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE attention SET status = 'answered', answer = ?2, note = ?3, resolved_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+            params![id, status, reason, now],
+        )?;
+        Ok(true)
+    }
+
     pub fn recent_events(&self, limit: i64) -> Result<Vec<StoredEvent>> {
         let mut stmt = self
             .conn
@@ -832,6 +930,23 @@ fn attention_from_row(row: &Row<'_>) -> rusqlite::Result<AttentionItem> {
         snooze_until: row.get("snooze_until")?,
         answer: row.get("answer")?,
         note: row.get("note")?,
+    })
+}
+
+fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<Proposal> {
+    Ok(Proposal {
+        id: row.get("id")?,
+        project: row.get("project")?,
+        file: row.get("file")?,
+        title: row.get("title")?,
+        text: row.get("text")?,
+        replaces: row.get("replaces")?,
+        evidence: row.get("evidence")?,
+        by: row.get("by_session")?,
+        status: row.get("status")?,
+        reason: row.get("reason")?,
+        created_at: row.get("created_at")?,
+        decided_at: row.get("decided_at")?,
     })
 }
 

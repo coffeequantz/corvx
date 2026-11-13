@@ -8,13 +8,16 @@ use std::path::{Path, PathBuf};
 
 use corvx_proto::{
     codes, methods, rule_actions, AttentionAnswerParams, AttentionDismissParams, AttentionIdParams,
-    AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, Project,
-    ProjectAddParams, ProjectAutonomyParams, ProjectList, ProjectRemoveParams, RuleList,
-    RulesAddParams, RulesListParams, RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
+    AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, KnowledgeAcceptParams,
+    KnowledgeCommitParams, KnowledgeInitParams, KnowledgeProposalsParams, KnowledgeProposeParams,
+    KnowledgeReadParams, KnowledgeRejectParams, Project, ProjectAddParams, ProjectAutonomyParams,
+    ProjectList, ProjectRemoveParams, ProposalList, RuleList, RulesAddParams, RulesListParams,
+    RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use crate::knowledge;
 use crate::policy;
 use crate::scan::scan;
 use crate::store::{now_secs, Store, StoreError};
@@ -116,6 +119,14 @@ impl Core {
             }
             methods::ATTENTION_DISMISS => {
                 let p: AttentionDismissParams = parse(params)?;
+                if self
+                    .store
+                    .get_proposal(&p.id)?
+                    .is_some_and(|x| x.status == "open")
+                {
+                    knowledge::reject(&self.store, &p.id, p.reason.as_deref(), now_secs())?;
+                    return Ok(json!({"ok": true}));
+                }
                 let reason = p.reason.unwrap_or_else(|| "dismissed".into());
                 self.attention_must_exist(
                     &p.id,
@@ -127,6 +138,42 @@ impl Core {
                 )?;
                 policy::suggestion_dismissed(&self.store, &p.id, now_secs())?;
                 Ok(json!({"ok": true}))
+            }
+            methods::KNOWLEDGE_READ => {
+                let p: KnowledgeReadParams = parse(params)?;
+                let k = knowledge::read(&self.store, &p.project, p.journal.unwrap_or(2))?;
+                Ok(serde_json::to_value(k).expect("Knowledge serializes"))
+            }
+            methods::KNOWLEDGE_INIT => {
+                let p: KnowledgeInitParams = parse(params)?;
+                let done = knowledge::init(&self.store, &p.project)?;
+                Ok(serde_json::to_value(done).expect("KnowledgeInit serializes"))
+            }
+            methods::KNOWLEDGE_PROPOSE => {
+                let p: KnowledgeProposeParams = parse(params)?;
+                let proposal = knowledge::propose(&self.store, &p, now_secs())?;
+                Ok(serde_json::to_value(proposal).expect("Proposal serializes"))
+            }
+            methods::KNOWLEDGE_PROPOSALS => {
+                let p: KnowledgeProposalsParams = parse(params)?;
+                let proposals = self.store.list_proposals(p.project.as_deref(), p.all)?;
+                Ok(serde_json::to_value(ProposalList { proposals })
+                    .expect("ProposalList serializes"))
+            }
+            methods::KNOWLEDGE_ACCEPT => {
+                let p: KnowledgeAcceptParams = parse(params)?;
+                let done = knowledge::accept(&self.store, &p.id, p.text.as_deref(), now_secs())?;
+                Ok(serde_json::to_value(done).expect("KnowledgeAccepted serializes"))
+            }
+            methods::KNOWLEDGE_COMMIT => {
+                let p: KnowledgeCommitParams = parse(params)?;
+                let done = knowledge::commit_file(&self.store, &p.project, &p.file)?;
+                Ok(serde_json::to_value(done).expect("KnowledgeInit serializes"))
+            }
+            methods::KNOWLEDGE_REJECT => {
+                let p: KnowledgeRejectParams = parse(params)?;
+                knowledge::reject(&self.store, &p.id, p.reason.as_deref(), now_secs())?;
+                Ok(json!({"rejected": p.id}))
             }
             methods::PROJECT_AUTONOMY => {
                 let p: ProjectAutonomyParams = parse(params)?;
