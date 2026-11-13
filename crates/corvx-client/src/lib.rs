@@ -125,6 +125,52 @@ pub fn ensure_daemon(data_dir: &Path, daemon_bin: Option<&Path>) -> Result<Clien
     }
 }
 
+/// Connects to the daemon if it is running. Never starts it.
+pub fn running_daemon(data_dir: &Path) -> Option<Client> {
+    Client::connect(&paths::socket_path(data_dir)).ok()
+}
+
+/// Stops the running daemon and waits for it to exit. Returns its pid, or None if no daemon
+/// was running. Sessions in tmux keep running; the next daemon adopts them.
+pub fn stop_daemon(data_dir: &Path) -> Result<Option<u32>> {
+    let Some(mut client) = running_daemon(data_dir) else {
+        return Ok(None);
+    };
+    let pid = client.info()?.pid;
+    drop(client);
+    // SAFETY: kill only sends a signal.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+        bail!(
+            "cannot stop corvxd (pid {pid}): {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        if Instant::now() >= deadline {
+            bail!("corvxd (pid {pid}) did not stop within 5s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(Some(pid))
+}
+
+/// True if the daemon binary on disk was built after the running daemon started, so a
+/// restart would run newer code.
+pub fn newer_build_on_disk(info: &DaemonInfo) -> bool {
+    if info.started_at <= 0 {
+        return false;
+    }
+    let bin = resolve_daemon_bin(None);
+    let Ok(modified) = fs::metadata(&bin).and_then(|m| m.modified()) else {
+        return false;
+    };
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 > info.started_at)
+        .unwrap_or(false)
+}
+
 fn check_protocol(client: &mut Client) -> Result<()> {
     let info = client.info()?;
     if info.protocol_version != PROTOCOL_VERSION {

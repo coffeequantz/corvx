@@ -11,8 +11,8 @@ use corvx_proto::{
     AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, KnowledgeAcceptParams,
     KnowledgeCommitParams, KnowledgeInitParams, KnowledgeProposalsParams, KnowledgeProposeParams,
     KnowledgeReadParams, KnowledgeRejectParams, Project, ProjectAddParams, ProjectAutonomyParams,
-    ProjectList, ProjectRemoveParams, ProposalList, RuleList, RulesAddParams, RulesListParams,
-    RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
+    ProjectList, ProjectRemoveParams, ProjectUpdateParams, ProposalList, RuleList, RulesAddParams,
+    RulesListParams, RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -40,11 +40,16 @@ impl ServiceError {
 pub struct Core {
     store: Store,
     data_dir: PathBuf,
+    started_at: i64,
 }
 
 impl Core {
     pub fn new(store: Store, data_dir: PathBuf) -> Self {
-        Self { store, data_dir }
+        Self {
+            store,
+            data_dir,
+            started_at: now_secs(),
+        }
     }
 
     pub fn store(&self) -> &Store {
@@ -174,6 +179,10 @@ impl Core {
                 let p: KnowledgeRejectParams = parse(params)?;
                 knowledge::reject(&self.store, &p.id, p.reason.as_deref(), now_secs())?;
                 Ok(json!({"rejected": p.id}))
+            }
+            methods::PROJECT_UPDATE => {
+                let p: ProjectUpdateParams = parse(params)?;
+                Ok(serde_json::to_value(self.project_update(p)?).expect("Project serializes"))
             }
             methods::PROJECT_AUTONOMY => {
                 let p: ProjectAutonomyParams = parse(params)?;
@@ -315,6 +324,7 @@ impl Core {
             protocol_version: PROTOCOL_VERSION,
             pid: std::process::id(),
             data_dir: self.data_dir.display().to_string(),
+            started_at: self.started_at,
         }
     }
 
@@ -370,6 +380,46 @@ impl Core {
             &json!({"id": project.id, "path": project.path, "stack": project.stack}),
         )?;
         Ok(project)
+    }
+
+    fn project_update(&self, params: ProjectUpdateParams) -> Result<Project, ServiceError> {
+        let mut p = self.store.get_project(&params.id)?.ok_or_else(|| {
+            ServiceError::rpc(
+                codes::PROJECT_NOT_FOUND,
+                format!("no project '{}'", params.id),
+            )
+        })?;
+        let before = p.clone();
+        if let Some(name) = params.name {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(ServiceError::rpc(
+                    codes::INVALID_PARAMS,
+                    "a project needs a name",
+                ));
+            }
+            p.name = name.to_string();
+        }
+        if let Some(ws) = params.workspace {
+            let ws = ws.trim();
+            p.workspace = if ws.is_empty() { "default" } else { ws }.to_string();
+        }
+        if params.rescan {
+            let found = scan(Path::new(&p.path));
+            p.stack = found.stack;
+            p.test_command = found.test_command;
+            p.build_command = found.build_command;
+            p.branch = found.branch;
+        }
+        if p != before {
+            self.store.update_project(&p)?;
+            self.store.append_event(
+                "project.updated",
+                &json!({"id": p.id, "name": p.name, "workspace": p.workspace,
+                        "stack": p.stack, "test_command": p.test_command}),
+            )?;
+        }
+        Ok(p)
     }
 
     fn project_remove(&self, id: &str) -> Result<(), ServiceError> {
@@ -445,6 +495,64 @@ mod tests {
         assert_eq!(slug("My App!"), "my-app");
         assert_eq!(slug("  --api_gateway--  "), "api-gateway");
         assert_eq!(slug("!!!"), "project");
+    }
+
+    #[test]
+    fn projects_can_be_renamed_moved_and_rescanned() {
+        let core = core();
+        let dir = tempfile::tempdir().unwrap();
+        let added: Project = serde_json::from_value(
+            core.handle(
+                methods::PROJECT_ADD,
+                json!({"path": dir.path(), "name": "Old"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(added.stack.is_empty());
+        // The project grows a stack after it was added; a rescan finds it.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let updated: Project = serde_json::from_value(
+            core.handle(
+                methods::PROJECT_UPDATE,
+                json!({"id": added.id, "name": " New name ", "workspace": "work", "rescan": true}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated.id, added.id, "the id stays");
+        assert_eq!(updated.name, "New name");
+        assert_eq!(updated.workspace, "work");
+        assert!(
+            updated.stack.iter().any(|s| s == "rust"),
+            "{:?}",
+            updated.stack
+        );
+        let list: ProjectList =
+            serde_json::from_value(core.handle(methods::PROJECT_LIST, json!({})).unwrap()).unwrap();
+        assert_eq!(list.projects[0], updated);
+
+        // An empty name is refused; an empty workspace means the default one.
+        let err = core
+            .handle(
+                methods::PROJECT_UPDATE,
+                json!({"id": added.id, "name": "  "}),
+            )
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::INVALID_PARAMS);
+        let back: Project = serde_json::from_value(
+            core.handle(
+                methods::PROJECT_UPDATE,
+                json!({"id": added.id, "workspace": ""}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.workspace, "default");
+        let err = core
+            .handle(methods::PROJECT_UPDATE, json!({"id": "nope", "name": "x"}))
+            .unwrap_err();
+        assert_eq!(code_of(err), codes::PROJECT_NOT_FOUND);
     }
 
     #[test]

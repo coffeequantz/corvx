@@ -508,6 +508,7 @@ def tmux_available():
 
 
 def daemon_pid(h: Harness):
+    h.corvx("project", "list")  # starts the daemon if needed; status does not
     first = h.corvx("status").splitlines()[0]
     return int(first.split("pid ")[1].split()[0])
 
@@ -982,6 +983,82 @@ def the_knowledge_loop(h: Harness):
         m.close()
 
 
+def missions_cleanup_and_the_daemon(h: Harness):
+    """Mission history, the journal committed at the end, cleaning up worktrees, editing a
+    project, and stopping and restarting the daemon."""
+    git = lambda *a, cwd=h.project: subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=e2e", "-c", "user.email=e2e@e2e", *a],
+        check=True, capture_output=True, text=True).stdout
+    if not (h.project / ".git").exists():
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-q", "-m", "init")
+
+    # Renaming and moving a project keeps its id; a rescan picks up what changed.
+    h.corvx("project", "set", "e2e", "--name", "E2E app", "--workspace", "clients")
+    listed = next(l for l in h.corvx("project", "list").splitlines() if l.startswith("e2e "))
+    assert "clients" in listed, listed
+    (h.project / "Makefile").write_text("build:\n\ttrue\n")
+    assert "test:  cargo test" in h.corvx("project", "rescan", "e2e")
+    h.corvx("project", "set", "e2e", "--workspace", "default")
+
+    orch = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+    env = {**h.env, "CORVX_SESSION_ID": orch, "CORVX_AGENT_COMMAND": str(FAKE_CLAUDE)}
+    m = Mcp(env)
+    try:
+        m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "e2e", "version": "0"}})
+        m.notify("notifications/initialized")
+        merged = m.tool("start_agent", {"project": "e2e", "name": "merged", "prompt": "work"})
+        unmerged = m.tool("start_agent", {"project": "e2e", "name": "unmerged", "prompt": "work"})
+        h.sessions += [merged["id"], unmerged["id"]]
+        for a, name in [(merged, "a.txt"), (unmerged, "b.txt")]:
+            Path(a["worktree"], name).write_text("work\n")
+            git("add", name, cwd=a["worktree"])
+            git("commit", "-q", "-m", f"add {name}", cwd=a["worktree"])
+        git("merge", "-q", "--no-ff", "-m", "merge", f"corvx/{merged['id']}")
+        m.tool("stop_agent", {"id": merged["id"]})
+        m.tool("stop_agent", {"id": unmerged["id"]})
+
+        m.tool("journal", {"title": "Mission", "text": "**Goal:** Ship the widget."})
+        done = m.tool("report_done", {"summary": "Merged one branch; the other needs review."})
+        assert done["journal"], done
+        # The journal entry is committed at the end of the mission, and nothing else is.
+        assert git("log", "-1", "--format=%s").startswith("Journal: e2e mission"), git("log", "-3", "--oneline")
+        assert git("status", "--porcelain", "--", ".corvx/journal") == ""
+
+        history = h.corvx("missions", "e2e")
+        assert "Ship the widget." in history and "2 agents" in history, history
+        assert f"corvx session cleanup {orch}" in history, history
+        assert "Merged one branch" in h.corvx("missions", "e2e", "--show", orch)
+
+        # Cleaning up removes the merged worktree and branch, and keeps the unmerged one.
+        out = h.corvx("session", "cleanup", orch)
+        assert f"removed {merged['id']}" in out and f"kept    {unmerged['id']}" in out, out
+        assert "not merged" in out, out
+        assert not Path(merged["worktree"]).exists()
+        assert Path(unmerged["worktree"]).exists()
+        branches = git("branch", "--list", "corvx/*")
+        assert merged["id"] not in branches and unmerged["id"] in branches, branches
+    finally:
+        m.close()
+
+    # The daemon: status, a refused stop while a session without tmux runs, then a restart.
+    assert "sessions:" in h.corvx("daemon", "status")
+    pty = h.start(backend="pty", command=["cat"])
+    p = subprocess.run([str(CORVX), "daemon", "stop"], env=h.env, capture_output=True, text=True)
+    assert p.returncode != 0 and pty in p.stderr, p.stderr
+    h.corvx("session", "stop", pty)
+    old = daemon_pid(h)
+    out = h.corvx("daemon", "restart")
+    assert f"pid {old} →" in out, out
+    assert daemon_pid(h) != old
+    if tmux_available():
+        assert "running" in h.session_line(orch), h.session_line(orch)
+    # After the restart the ended agents are still listed under their orchestrator.
+    assert "2 agents" in h.corvx("missions", "e2e")
+
+
 def setting_up_in_the_terminal_ui(h: Harness):
     """Add a project, set up its knowledge, write its brief and start a mission, all in the TUI."""
     proj = h.base / "newproj"
@@ -1023,6 +1100,19 @@ def setting_up_in_the_terminal_ui(h: Harness):
         assert "Knowledge: update brief" in git("log", "-1", "--format=%s")
         assert t.wait_for("next: o starts a mission", 5), t.text()
 
+        # e renames the project and moves it to another workspace; its id stays.
+        t.send(b"e")
+        assert t.wait_for("edit newproj", 5), t.text()
+        t.send(b" server")
+        t.send(b"\t")
+        t.send(b"\x7f" * 10)
+        t.send(b"tools")
+        t.send(b"\r")
+        assert t.wait_for('renamed to "newproj server"', 5), t.text()
+        assert "TOOLS" in t.text(), t.text()
+        listed = next(l for l in h.corvx("project", "list").splitlines() if l.startswith("newproj "))
+        assert "tools" in listed, listed
+
         t.send(b"o")
         assert t.wait_for("start a mission on newproj", 5), t.text()
         assert "0 decisions · 0 conventions · 0 past missions" in t.text(), t.text()
@@ -1041,6 +1131,11 @@ def setting_up_in_the_terminal_ui(h: Harness):
         started = [e for e in events_of(h, "session.started") if e.get("id") == orch]
         command = " ".join(started[-1]["command"]) if started else ""
         assert "--model opus" in command and "start_agent uses haiku" in command, command
+
+        # m lists the project's missions, with the one just started.
+        t.key(b"\x1b", b"m")
+        assert t.wait_for("missions · newproj", 5), t.text()
+        assert "running" in t.text() and "Add a health check" in t.text(), t.text()
         t.key(b"\x1b", b"q")
     finally:
         t.close()
@@ -1056,6 +1151,7 @@ SCENARIOS = [
     rules_reach_the_human,
     autonomy_trust_and_journal,
     the_knowledge_loop,
+    missions_cleanup_and_the_daemon,
     setting_up_in_the_terminal_ui,
     real_claude_rules,
     attach_from_the_terminal_ui,

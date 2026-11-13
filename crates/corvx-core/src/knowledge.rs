@@ -470,7 +470,7 @@ fn write_map(p: &Project) -> Result<bool, ServiceError> {
 
 /// Commits exactly these paths in the project's checkout, leaving anything else (staged or
 /// not) alone. Returns whether it committed, and why not.
-fn commit(root: &Path, paths: &[String], message: &str) -> (bool, Option<String>) {
+pub fn commit(root: &Path, paths: &[String], message: &str) -> (bool, Option<String>) {
     let git = |args: &[&str]| Command::new("git").arg("-C").arg(root).args(args).output();
     match git(&["rev-parse", "--is-inside-work-tree"]) {
         Ok(o) if o.status.success() => {}

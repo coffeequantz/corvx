@@ -32,10 +32,10 @@ use corvx_core::store::now_secs;
 use corvx_proto::{
     autonomy, codes, methods, rule_actions, AgentState, AttentionAskParams, AttentionDecideParams,
     AttentionItem, PermissionStatus, ProjectJournalParams, Session, SessionAutopilotParams,
-    SessionHookParams, SessionIdParams, SessionInputParams, SessionList, SessionOutput,
-    SessionOutputParams, SessionPermissionParams, SessionReportParams, SessionResizeParams,
-    SessionResumeParams, SessionResumed, SessionScreen, SessionScreenParams, SessionStartParams,
-    SessionState,
+    SessionCleanup, SessionHookParams, SessionIdParams, SessionInputParams, SessionList,
+    SessionListParams, SessionOutput, SessionOutputParams, SessionPermissionParams,
+    SessionReportParams, SessionResizeParams, SessionResumeParams, SessionResumed, SessionScreen,
+    SessionScreenParams, SessionStartParams, SessionState,
 };
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::de::DeserializeOwned;
@@ -297,6 +297,18 @@ impl SessionManager {
             }
             self.insert_ended(&logs, session, one_shot);
         }
+        // The agents of the sessions listed so far are listed too, ended or not, so an
+        // orchestrator still shows its whole team after a restart.
+        let mut i = 0;
+        while i < self.order.len() {
+            let parent = self.order[i].clone();
+            for (session, one_shot) in core.store().supervised_by(&parent)? {
+                if !self.entries.contains_key(&session.id) {
+                    self.insert_ended(&logs, session, one_shot);
+                }
+            }
+            i += 1;
+        }
         // Items for sessions this daemon does not run are stale. Questions stay: a resumed
         // session can still take the answer.
         for item in core.store().list_attention(true, now_secs())? {
@@ -316,6 +328,28 @@ impl SessionManager {
             }
         }
         Ok(report)
+    }
+
+    /// The sessions this daemon runs or lists, in start order; with `all`, also the ones
+    /// that ended earlier, from the record.
+    fn list(&self, core: &Core, p: &SessionListParams) -> Result<Vec<Session>, ServiceError> {
+        let mine = |s: &Session| p.project.as_ref().map_or(true, |id| s.project == *id);
+        let mut sessions: Vec<Session> = self
+            .order
+            .iter()
+            .filter_map(|id| self.entries.get(id))
+            .map(Entry::snapshot)
+            .filter(mine)
+            .collect();
+        if p.all {
+            for (s, _) in core.store().project_sessions(p.project.as_deref())? {
+                if !self.entries.contains_key(&s.id) {
+                    sessions.push(s);
+                }
+            }
+            sessions.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
+        }
+        Ok(sessions)
     }
 
     /// Lists an ended session without running it.
@@ -399,13 +433,15 @@ impl SessionManager {
                 to_value(self.start(core, p)?)
             }
             methods::SESSION_LIST => {
-                let sessions = self
-                    .order
-                    .iter()
-                    .filter_map(|id| self.entries.get(id))
-                    .map(Entry::snapshot)
-                    .collect();
-                to_value(SessionList { sessions })
+                // (Older clients send no params.)
+                let p: SessionListParams = if params.is_null() {
+                    SessionListParams::default()
+                } else {
+                    parse(params)?
+                };
+                to_value(SessionList {
+                    sessions: self.list(core, &p)?,
+                })
             }
             methods::SESSION_OUTPUT => {
                 let p: SessionOutputParams = parse(params)?;
@@ -464,6 +500,10 @@ impl SessionManager {
             methods::SESSION_RESUME => {
                 let p: SessionResumeParams = parse(params)?;
                 to_value(self.resume(core, &p.id)?)
+            }
+            methods::SESSION_CLEANUP => {
+                let p: SessionIdParams = parse(params)?;
+                to_value(self.cleanup(core, &p.id)?)
             }
             other => Err(ServiceError::Rpc(
                 codes::METHOD_NOT_FOUND,
@@ -1317,12 +1357,121 @@ impl SessionManager {
                 format!("cannot write {}: {e}", file.display()),
             )
         })?;
+        // At the end of a mission the entry is committed, so it is not left lying in the
+        // checkout. Only this file: whatever else is staged or changed stays as it is.
+        let (committed, note) = if p.commit {
+            let rel = format!(
+                ".corvx/journal/{}",
+                file.file_name().unwrap().to_string_lossy()
+            );
+            corvx_core::knowledge::commit(
+                Path::new(&project.path),
+                &[rel],
+                &format!("Journal: {} mission {}", project.id, date_of(started)),
+            )
+        } else {
+            (false, None)
+        };
         core.store().append_event(
             "project.journal",
             &json!({"session": p.session, "project": project.id, "file": file.display().to_string(),
-                    "title": title}),
+                    "title": title, "committed": committed}),
         )?;
-        Ok(json!({"file": file.display().to_string()}))
+        Ok(json!({"file": file.display().to_string(), "committed": committed, "note": note}))
+    }
+
+    /// Removes the worktrees of a session and of the agents under it, once their work is
+    /// merged into the project's current branch, and deletes their merged branches. Keeps
+    /// what is still running, not merged, or has uncommitted changes; never forces.
+    fn cleanup(&self, core: &Core, id: &str) -> Result<SessionCleanup, ServiceError> {
+        // Ended sessions may only be in the record; running ones are current here.
+        let known = |sid: &str| -> Result<Option<Session>, ServiceError> {
+            Ok(match self.entries.get(sid) {
+                Some(e) => Some(e.snapshot()),
+                None => core.store().get_session(sid)?.map(|(s, _)| s),
+            })
+        };
+        let root = known(id)?.ok_or_else(|| not_found(id))?;
+        let project = core.store().get_project(&root.project)?.ok_or_else(|| {
+            ServiceError::Rpc(
+                codes::PROJECT_NOT_FOUND,
+                format!("no project '{}'", root.project),
+            )
+        })?;
+        let repo = Path::new(&project.path);
+        // The session and everything under it, at any depth.
+        let mut tree = vec![root];
+        let mut i = 0;
+        while i < tree.len() {
+            let parent = tree[i].id.clone();
+            for (child, _) in core.store().supervised_by(&parent)? {
+                if let Some(current) = known(&child.id)? {
+                    tree.push(current);
+                }
+            }
+            i += 1;
+        }
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+        };
+        let current = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "HEAD".into());
+        let mut done = SessionCleanup::default();
+        for s in &tree {
+            let sid = &s.id;
+            let Some(wt) = s.worktree.as_deref() else {
+                continue;
+            };
+            if !Path::new(wt).exists() {
+                continue;
+            }
+            if s.state == SessionState::Running {
+                done.kept.push(format!("{sid}: still running"));
+                continue;
+            }
+            let branch = format!("corvx/{sid}");
+            let merged = git(&["merge-base", "--is-ancestor", &branch, "HEAD"])
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !merged {
+                done.kept
+                    .push(format!("{sid}: {branch} is not merged into {current}"));
+                continue;
+            }
+            match git(&["worktree", "remove", wt]) {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    let why = String::from_utf8_lossy(&o.stderr);
+                    let why = why.trim().trim_start_matches("fatal: ");
+                    done.kept.push(format!("{sid}: {why}"));
+                    continue;
+                }
+                Err(e) => {
+                    done.kept.push(format!("{sid}: cannot run git: {e}"));
+                    continue;
+                }
+            }
+            let deleted = git(&["branch", "-d", &branch])
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            done.removed.push(if deleted {
+                format!("{sid} (worktree and branch {branch})")
+            } else {
+                format!("{sid} (worktree; branch {branch} kept)")
+            });
+        }
+        core.store().append_event(
+            "session.cleanup",
+            &json!({"session": id, "removed": done.removed, "kept": done.kept}),
+        )?;
+        Ok(done)
     }
 
     /// An orchestrator may only act on the sessions it supervises.

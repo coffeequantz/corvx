@@ -364,7 +364,7 @@ impl Store {
                     "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?7)",
                     params![
-                        new_attention_id(now),
+                        self.fresh_attention_id(now)?,
                         state,
                         severity,
                         project,
@@ -453,7 +453,7 @@ impl Store {
         question: &str,
         now: i64,
     ) -> Result<String> {
-        let id = new_attention_id(now);
+        let id = self.fresh_attention_id(now)?;
         self.conn.execute(
             "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
              VALUES (?1, 'question', 3, ?2, ?3, ?4, 'open', ?5, ?5)",
@@ -490,7 +490,7 @@ impl Store {
              WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind NOT IN ('question', 'proposal')",
             params![session_id, now],
         )?;
-        let id = new_attention_id(now);
+        let id = self.fresh_attention_id(now)?;
         self.conn.execute(
             "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at, note)
              VALUES (?1, 'approval', ?6, ?2, ?3, ?4, 'open', ?5, ?5, ?7)",
@@ -604,6 +604,24 @@ impl Store {
     }
 
     /// Sets a project's autonomy level. Returns false if there is no such project.
+    /// Replaces a project's name, workspace and scan results. Returns true if it exists.
+    pub fn update_project(&self, p: &Project) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE projects SET name = ?2, workspace = ?3, stack = ?4, test_command = ?5,
+                    build_command = ?6, branch = ?7
+             WHERE id = ?1",
+            params![
+                p.id,
+                p.name,
+                p.workspace,
+                serde_json::to_string(&p.stack)?,
+                p.test_command,
+                p.build_command,
+                p.branch,
+            ],
+        )? > 0)
+    }
+
     pub fn set_project_autonomy(&self, id: &str, level: &str) -> Result<bool> {
         Ok(self.conn.execute(
             "UPDATE projects SET autonomy = ?2 WHERE id = ?1",
@@ -658,7 +676,7 @@ impl Store {
     /// Opens a suggestion: an item for the human, tied to a project rather than a session
     /// (its session is "-"), so agents' state changes do not close it.
     pub fn open_suggestion(&self, project: &str, summary: &str, now: i64) -> Result<String> {
-        let id = new_attention_id(now);
+        let id = self.fresh_attention_id(now)?;
         self.conn.execute(
             "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
              VALUES (?1, 'suggestion', 1, ?2, '-', ?3, 'open', ?4, ?4)",
@@ -776,6 +794,14 @@ impl Store {
         Ok(self.load_sessions("id = ?1", params![id])?.pop())
     }
 
+    /// Every session recorded for a project (or for all projects), whatever its state.
+    pub fn project_sessions(&self, project: Option<&str>) -> Result<Vec<(Session, bool)>> {
+        match project {
+            Some(p) => self.load_sessions("project = ?1", params![p]),
+            None => self.load_sessions("1", params![]),
+        }
+    }
+
     /// The sessions a session supervises, whatever their state.
     pub fn supervised_by(&self, id: &str) -> Result<Vec<(Session, bool)>> {
         self.load_sessions("supervisor = ?1", params![id])
@@ -828,7 +854,7 @@ impl Store {
     /// Records a knowledge proposal and opens its inbox item (severity 2: review). The item
     /// belongs to the proposing session but is not closed when that session moves on.
     pub fn insert_proposal(&self, p: &Proposal, now: i64) -> Result<String> {
-        let id = new_attention_id(now);
+        let id = self.fresh_attention_id(now)?;
         self.conn.execute(
             "INSERT INTO proposals (id, project, file, title, text, replaces, evidence, by_session, status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
@@ -966,6 +992,24 @@ fn new_attention_id(now: i64) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("att-{now}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+impl Store {
+    /// An id no item has yet. The counter starts again with each daemon, so within the
+    /// second a daemon restarts, an earlier daemon's id may already be taken.
+    fn fresh_attention_id(&self, now: i64) -> Result<String> {
+        loop {
+            let id = new_attention_id(now);
+            let taken: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attention WHERE id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if !taken {
+                return Ok(id);
+            }
+        }
+    }
 }
 
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {

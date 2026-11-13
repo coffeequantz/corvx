@@ -395,6 +395,7 @@ impl Server {
                         session: me.clone(),
                         text: summary.clone(),
                         title: Some(title.into()),
+                        commit: true,
                     };
                     self.rpc(methods::PROJECT_JOURNAL, serde_json::to_value(params)?)
                         .ok()
@@ -420,6 +421,7 @@ impl Server {
                     session: me,
                     text,
                     title: s("title"),
+                    commit: false,
                 };
                 let v = self.rpc(methods::PROJECT_JOURNAL, serde_json::to_value(params)?)?;
                 Ok(json!({"file": v["file"]}))

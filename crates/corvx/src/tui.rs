@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use corvx_client::{ensure_daemon, is_connection_error, Client};
+
+use crate::missions::Mission;
 use corvx_proto::{
     methods, AttentionItem, AttentionList, Knowledge, KnowledgeAccepted, KnowledgeInit, Project,
     ProjectList, Proposal, ProposalList, Rule, RuleList, Session, SessionList, SessionState,
@@ -18,7 +20,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
@@ -50,6 +52,12 @@ enum Mode {
     Reject,
     /// CORVX's rules: what it asks you, allows or denies, for the selected project.
     Rules,
+    /// The selected project's name and workspace.
+    EditProject,
+    /// The selected project's missions, newest first, with the selected one's journal.
+    Missions,
+    /// Asking before stopping a session (from the sessions or missions view).
+    ConfirmStop,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,21 +66,36 @@ enum Action {
     StartMission,
     SetUpKnowledge,
     EditBrief,
+    EditDecisions,
+    EditConventions,
+    EditProject,
+    Rescan,
+    Missions,
     RemoveProject,
     Refresh,
+    RestartDaemon,
     Inbox,
     Sessions,
     Help,
     Quit,
 }
 
-const ACTIONS: [(Action, &str); 10] = [
+const ACTIONS: [(Action, &str); 16] = [
     (Action::AddProject, "add project"),
     (Action::StartMission, "start a mission"),
+    (Action::Missions, "missions: history and journals"),
     (Action::SetUpKnowledge, "set up knowledge files"),
     (Action::EditBrief, "edit the brief"),
+    (Action::EditDecisions, "edit the decisions"),
+    (Action::EditConventions, "edit the conventions"),
+    (
+        Action::EditProject,
+        "rename project or change its workspace",
+    ),
+    (Action::Rescan, "rescan project (stack, test command)"),
     (Action::RemoveProject, "remove project"),
     (Action::Refresh, "refresh"),
+    (Action::RestartDaemon, "restart the daemon"),
     (Action::Inbox, "attention inbox"),
     (Action::Sessions, "sessions"),
     (Action::Help, "help"),
@@ -89,6 +112,8 @@ const AGENT_MODELS: [&str; 3] = ["sonnet", "haiku", "opus"];
 struct KnowledgeState {
     wired: bool,
     brief_written: bool,
+    /// Entries in its mission journal.
+    journal: usize,
 }
 
 impl KnowledgeState {
@@ -99,6 +124,13 @@ impl KnowledgeState {
             wired: corvx_core::knowledge::wired(root),
             // The template's placeholders mean nobody has written it yet.
             brief_written: !brief.trim().is_empty() && !brief.contains("(What the project does"),
+            journal: std::fs::read_dir(root.join(".corvx/journal"))
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+                        .count()
+                })
+                .unwrap_or(0),
         }
     }
 }
@@ -112,6 +144,21 @@ struct AddPreview {
     existing: Option<String>,
     /// Set up its knowledge files once it is added.
     knowledge: bool,
+    name: String,
+    workspace: String,
+    /// 0 name, 1 workspace, 2 knowledge.
+    field: usize,
+}
+
+const PREVIEW_FIELDS: usize = 3;
+
+/// Renaming a project or moving it to another workspace.
+struct ProjectEdit {
+    id: String,
+    name: String,
+    workspace: String,
+    /// 0 name, 1 workspace.
+    field: usize,
 }
 
 struct MissionForm {
@@ -147,13 +194,24 @@ struct App {
     pending_edit: Option<String>,
     /// Open knowledge proposals, by id (the id of their inbox item).
     proposals: std::collections::HashMap<String, Proposal>,
-    /// A knowledge file to open in $EDITOR (the project, the file); committed if it changed.
-    pending_file: Option<(String, PathBuf)>,
+    /// A knowledge file to open in $EDITOR (the project, its path, which file); committed
+    /// if it changed.
+    pending_file: Option<(String, PathBuf, &'static str)>,
     /// Per project: whether its agents read its knowledge, and whether its brief is written.
     knowledge_state: std::collections::HashMap<String, KnowledgeState>,
     /// The project the add flow would add.
     preview: Option<AddPreview>,
     mission: Option<MissionForm>,
+    edit: Option<ProjectEdit>,
+    /// The missions view: whose, its missions, the selected one, how far its journal scrolled.
+    missions_project: String,
+    missions: Vec<Mission>,
+    missions_sel: usize,
+    journal_scroll: u16,
+    /// The session to stop once confirmed, and the view to go back to.
+    stop_target: Option<(String, Mode)>,
+    /// The daemon binary on disk is newer than the running daemon.
+    newer_build: bool,
     inbox_sel: usize,
     /// The rules as they apply where the rules view sets them.
     rules: Vec<Rule>,
@@ -209,13 +267,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 None => {}
             }
         }
-        if let Some((project, path)) = app.pending_file.take() {
+        if let Some((project, path, file)) = app.pending_file.take() {
             ratatui::restore();
             let edited = crate::edit_file(&path);
             *terminal = ratatui::init();
             terminal.clear()?;
             if let Some(changed) = app.report(edited) {
-                app.after_editing(&project, &path, changed);
+                app.after_editing(&project, &path, file, changed);
             }
         }
         if let Some(id) = app.pending_attach.take() {
@@ -263,6 +321,13 @@ impl App {
             knowledge_state: Default::default(),
             preview: None,
             mission: None,
+            edit: None,
+            missions_project: String::new(),
+            missions: Vec::new(),
+            missions_sel: 0,
+            journal_scroll: 0,
+            stop_target: None,
+            newer_build: false,
             inbox_sel: 0,
             rules: Vec::new(),
             rules_sel: 0,
@@ -334,6 +399,13 @@ impl App {
         if self.inbox_sel >= self.attention.len() {
             self.inbox_sel = self.attention.len().saturating_sub(1);
         }
+        if let Ok(info) = self.client.info() {
+            self.daemon_pid = info.pid;
+            self.newer_build = corvx_client::newer_build_on_disk(&info);
+        }
+        if self.mode == Mode::Missions {
+            self.load_missions();
+        }
         self.connected = true;
         self.last_refresh = Instant::now();
         Ok(())
@@ -372,6 +444,9 @@ impl App {
             Mode::Deny => self.key_deny(key.code),
             Mode::Reject => self.key_reject(key.code),
             Mode::Rules => self.key_rules(key.code),
+            Mode::EditProject => self.key_edit(key.code),
+            Mode::Missions => self.key_missions(key.code),
+            Mode::ConfirmStop => self.key_confirm_stop(key.code),
         }
     }
 
@@ -403,8 +478,10 @@ impl App {
             KeyCode::Char('s') => self.open_sessions(),
             KeyCode::Char('l') => self.open_rules(),
             KeyCode::Char('o') => self.open_mission(),
-            KeyCode::Char('b') => self.edit_brief(),
+            KeyCode::Char('b') => self.edit_knowledge("brief"),
             KeyCode::Char('K') => self.init_knowledge(),
+            KeyCode::Char('e') => self.open_edit(),
+            KeyCode::Char('m') => self.open_missions(),
             KeyCode::Char(':') => self.toggle_palette(),
             KeyCode::Esc => self.flash.clear(),
             _ => {}
@@ -680,7 +757,294 @@ impl App {
                     self.set_autopilot(&s.id, !s.autopilot);
                 }
             }
+            KeyCode::Char('x') => {
+                if let Some(s) = self.sessions.get(self.sessions_sel).cloned() {
+                    self.ask_stop(&s, Mode::Sessions);
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(id) = self.sessions.get(self.sessions_sel).map(|s| s.id.clone()) {
+                    self.cleanup(&id);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Asks before stopping a running session.
+    fn ask_stop(&mut self, s: &Session, back: Mode) {
+        if s.state != SessionState::Running {
+            self.flash = format!("{} is not running", s.id);
+            return;
+        }
+        self.stop_target = Some((s.id.clone(), back));
+        self.mode = Mode::ConfirmStop;
+    }
+
+    fn key_confirm_stop(&mut self, code: KeyCode) {
+        let Some((id, back)) = self.stop_target.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = back;
+        if code != KeyCode::Char('y') {
+            self.flash = "not stopped".into();
+            return;
+        }
+        let r = self.rpc(methods::SESSION_STOP, json!({"id": id}));
+        if self.report(r).is_some() {
+            self.flash = format!("stopped {id} · c removes its merged worktrees");
+            let r = self.refresh();
+            self.report(r);
+        }
+    }
+
+    /// Removes the merged worktrees of a finished session and its agents.
+    fn cleanup(&mut self, id: &str) {
+        let r = self
+            .rpc(methods::SESSION_CLEANUP, json!({"id": id}))
+            .and_then(|v| Ok(serde_json::from_value::<corvx_proto::SessionCleanup>(v)?));
+        let Some(done) = self.report(r) else {
+            return;
+        };
+        self.flash = match (done.removed.len(), done.kept.as_slice()) {
+            (0, []) => format!("{id}: no worktrees left to clean up"),
+            (n, []) => format!("{id}: removed {n} merged worktree(s) and their branches"),
+            (n, kept) => format!(
+                "{id}: removed {n} · kept {}: {}",
+                kept.len(),
+                kept.join("; ")
+            ),
+        };
+        let r = self.refresh();
+        self.report(r);
+    }
+
+    fn open_missions(&mut self) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "add a project first: a".into();
+            return;
+        };
+        if self.missions_project != p.id {
+            self.missions_sel = 0;
+            self.journal_scroll = 0;
+        }
+        self.missions_project = p.id;
+        self.mode = Mode::Missions;
+        self.flash.clear();
+        self.load_missions();
+    }
+
+    fn load_missions(&mut self) {
+        // Keep the same mission selected as the list changes.
+        let selected = self
+            .missions
+            .get(self.missions_sel)
+            .and_then(|m| m.session.as_ref().map(|s| s.id.clone()));
+        let project = self.missions_project.clone();
+        let r = crate::load_missions(&mut self.client, &project);
+        if let Some(list) = self.report(r) {
+            self.missions = list;
+        }
+        if let Some(i) = selected.and_then(|id| {
+            self.missions
+                .iter()
+                .position(|m| m.session.as_ref().is_some_and(|s| s.id == id))
+        }) {
+            self.missions_sel = i;
+        }
+        self.missions_sel = self.missions_sel.min(self.missions.len().saturating_sub(1));
+    }
+
+    fn key_missions(&mut self, code: KeyCode) {
+        let max = self.missions.len().saturating_sub(1);
+        let selected = self.missions.get(self.missions_sel).cloned();
+        let session = selected.as_ref().and_then(|m| m.session.clone());
+        match code {
+            KeyCode::Esc | KeyCode::Char('m') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.missions_sel = (self.missions_sel + 1).min(max);
+                self.journal_scroll = 0;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.missions_sel = self.missions_sel.saturating_sub(1);
+                self.journal_scroll = 0;
+            }
+            KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.journal_scroll = self.journal_scroll.saturating_add(10)
+            }
+            KeyCode::Char('K') | KeyCode::PageUp => {
+                self.journal_scroll = self.journal_scroll.saturating_sub(10)
+            }
+            KeyCode::Enter => match &session {
+                Some(s) if s.state == SessionState::Running => {
+                    self.pending_attach = Some(s.id.clone())
+                }
+                Some(s) if s.state == SessionState::Lost => {
+                    self.flash = format!("{} was interrupted · R resumes it", s.id)
+                }
+                _ => self.flash = "it has ended · its journal entry is shown below".into(),
+            },
+            KeyCode::Char('R') => match &session {
+                Some(s) if s.state == SessionState::Lost => {
+                    let r = self.rpc(methods::SESSION_RESUME, json!({"id": s.id}));
+                    if self.report(r).is_some() {
+                        self.flash = format!("resumed {} and its interrupted agents", s.id);
+                        let r = self.refresh();
+                        self.report(r);
+                    }
+                }
+                _ => self.flash = "only an interrupted mission can be resumed".into(),
+            },
+            KeyCode::Char('x') => match &session {
+                Some(s) => self.ask_stop(s, Mode::Missions),
+                None => self.flash = "nothing to stop".into(),
+            },
+            KeyCode::Char('c') => match &session {
+                Some(s) => {
+                    let id = s.id.clone();
+                    self.cleanup(&id);
+                }
+                None => self.flash = "nothing to clean up".into(),
+            },
+            KeyCode::Char('o') => self.open_mission(),
+            _ => {}
+        }
+    }
+
+    /// Opens the form that renames the selected project or changes its workspace.
+    fn open_edit(&mut self) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "add a project first: a".into();
+            return;
+        };
+        self.edit = Some(ProjectEdit {
+            id: p.id,
+            name: p.name,
+            workspace: p.workspace,
+            field: 0,
+        });
+        self.mode = Mode::EditProject;
+        self.flash.clear();
+    }
+
+    /// The workspaces projects are in, for picking one with ←/→.
+    fn workspaces(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.projects.iter().map(|p| p.workspace.clone()).collect();
+        if !all.iter().any(|w| w == "default") {
+            all.push("default".into());
+        }
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    fn key_edit(&mut self, code: KeyCode) {
+        let workspaces = self.workspaces();
+        let Some(e) = &mut self.edit else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.edit = None;
+                self.mode = Mode::Normal;
+                self.flash = "unchanged".into();
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => e.field = 1 - e.field,
+            KeyCode::Left | KeyCode::Right if e.field == 1 => {
+                e.workspace = cycle(&workspaces, &e.workspace, code == KeyCode::Left);
+            }
+            KeyCode::Enter => self.save_edit(),
+            KeyCode::Backspace => {
+                if e.field == 0 {
+                    e.name.pop();
+                } else {
+                    e.workspace.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if e.field == 0 {
+                    e.name.push(c);
+                } else {
+                    e.workspace.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Saves the edit form, and scans the project again while at it.
+    fn save_edit(&mut self) {
+        let Some(e) = self.edit.take() else {
+            return;
+        };
+        if e.name.trim().is_empty() {
+            self.flash = "a project needs a name".into();
+            self.edit = Some(e);
+            return;
+        }
+        self.mode = Mode::Normal;
+        let before = self.projects.iter().find(|p| p.id == e.id).cloned();
+        let r = self
+            .rpc(
+                methods::PROJECT_UPDATE,
+                json!({"id": e.id, "name": e.name, "workspace": e.workspace, "rescan": true}),
+            )
+            .and_then(|v| Ok(serde_json::from_value::<Project>(v)?));
+        if let Some(after) = self.report(r) {
+            self.flash = describe_update(before.as_ref(), &after);
+            let r = self.refresh();
+            self.report(r);
+            self.select_project(&after.id);
+        }
+    }
+
+    /// Scans the selected project again: its stack, test and build commands, branch.
+    fn rescan(&mut self) {
+        let Some(p) = self.selected_project().cloned() else {
+            self.flash = "add a project first: a".into();
+            return;
+        };
+        let r = self
+            .rpc(methods::PROJECT_UPDATE, json!({"id": p.id, "rescan": true}))
+            .and_then(|v| Ok(serde_json::from_value::<Project>(v)?));
+        if let Some(after) = self.report(r) {
+            self.flash = describe_update(Some(&p), &after);
+            let r = self.refresh();
+            self.report(r);
+        }
+    }
+
+    /// Stops the daemon and starts it again, to load a new build. Sessions in tmux keep
+    /// running; ones without tmux would end, so it refuses while any run.
+    fn restart_daemon(&mut self) {
+        let native: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.state == SessionState::Running && s.backend != "tmux")
+            .map(|s| s.id.clone())
+            .collect();
+        if !native.is_empty() {
+            self.flash = format!(
+                "not restarted: {} run without tmux and would end · stop them first, or corvx daemon restart --force",
+                native.join(", ")
+            );
+            return;
+        }
+        let old = self.daemon_pid;
+        let r = corvx_client::stop_daemon(&self.data_dir)
+            .and_then(|_| ensure_daemon(&self.data_dir, None));
+        let Some(client) = self.report(r) else {
+            return;
+        };
+        self.client = client;
+        let r = self.refresh();
+        if self.report(r).is_some() {
+            self.flash = format!(
+                "restarted the daemon: pid {old} → {} · sessions kept running",
+                self.daemon_pid
+            );
         }
     }
 
@@ -929,6 +1293,15 @@ impl App {
             .iter()
             .find(|p| Path::new(&p.path) == path)
             .map(|p| p.id.clone());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // New projects go where the selected one is, unless you pick another.
+        let workspace = self
+            .selected_project()
+            .map(|p| p.workspace.clone())
+            .unwrap_or_else(|| "default".into());
         self.preview = Some(AddPreview {
             scan: corvx_core::scan::scan(&path),
             path,
@@ -936,19 +1309,42 @@ impl App {
             wired,
             existing,
             knowledge: git && !wired,
+            name,
+            workspace,
+            field: 0,
         });
         self.mode = Mode::AddPreview;
         self.flash.clear();
     }
 
     fn key_preview(&mut self, code: KeyCode) {
+        let workspaces = self.workspaces();
+        let Some(p) = &mut self.preview else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        // A project already added has nothing to fill in.
+        let fields = if p.existing.is_some() {
+            1
+        } else {
+            PREVIEW_FIELDS
+        };
         match code {
             KeyCode::Esc => self.mode = Mode::AddPath,
-            KeyCode::Char(' ') => {
-                if let Some(p) = &mut self.preview {
-                    p.knowledge = !p.knowledge;
-                }
+            KeyCode::Tab | KeyCode::Down => p.field = (p.field + 1) % fields,
+            KeyCode::BackTab | KeyCode::Up => p.field = (p.field + fields - 1) % fields,
+            KeyCode::Char(' ') if p.field == 2 => p.knowledge = !p.knowledge,
+            KeyCode::Left | KeyCode::Right if p.field == 1 => {
+                p.workspace = cycle(&workspaces, &p.workspace, code == KeyCode::Left);
             }
+            KeyCode::Backspace if p.field == 0 => {
+                p.name.pop();
+            }
+            KeyCode::Backspace if p.field == 1 => {
+                p.workspace.pop();
+            }
+            KeyCode::Char(c) if p.field == 0 => p.name.push(c),
+            KeyCode::Char(c) if p.field == 1 => p.workspace.push(c),
             KeyCode::Enter => {
                 let Some(preview) = self.preview.take() else {
                     self.mode = Mode::Normal;
@@ -989,21 +1385,22 @@ impl App {
         }
     }
 
-    /// Opens the selected project's brief in $EDITOR.
-    fn edit_brief(&mut self) {
+    /// Opens one of the selected project's knowledge files (brief, decisions, conventions)
+    /// in $EDITOR.
+    fn edit_knowledge(&mut self, file: &'static str) {
         let Some(p) = self.selected_project().cloned() else {
             self.flash = "add a project first: a".into();
             return;
         };
-        let path = Path::new(&p.path).join(".corvx/brief.md");
+        let path = Path::new(&p.path).join(corvx_core::knowledge::rel_path(file));
         if !path.is_file() {
             self.flash = format!("{} has no knowledge files yet · K sets them up", p.id);
             return;
         }
-        self.pending_file = Some((p.id.clone(), path));
+        self.pending_file = Some((p.id.clone(), path, file));
     }
 
-    fn after_editing(&mut self, project: &str, path: &Path, changed: bool) {
+    fn after_editing(&mut self, project: &str, path: &Path, file: &str, changed: bool) {
         if !changed {
             self.flash = format!("{}: unchanged", path.display());
             return;
@@ -1011,14 +1408,19 @@ impl App {
         let r = self
             .rpc(
                 methods::KNOWLEDGE_COMMIT,
-                json!({"project": project, "file": "brief"}),
+                json!({"project": project, "file": file}),
             )
             .and_then(|v| Ok(serde_json::from_value::<KnowledgeInit>(v)?));
         if let Some(done) = self.report(r) {
+            let next = if file == "brief" {
+                " · o starts a mission"
+            } else {
+                ""
+            };
             self.flash = match (done.committed, done.note) {
-                (true, _) => format!("{project}: brief saved and committed · o starts a mission"),
-                (false, Some(note)) => format!("{project}: brief saved · {note}"),
-                (false, None) => format!("{project}: brief saved"),
+                (true, _) => format!("{project}: {file} saved and committed{next}"),
+                (false, Some(note)) => format!("{project}: {file} saved · {note}"),
+                (false, None) => format!("{project}: {file} saved"),
             };
             let r = self.refresh();
             self.report(r);
@@ -1198,12 +1600,18 @@ impl App {
             Action::AddProject => self.start_add(),
             Action::StartMission => self.open_mission(),
             Action::SetUpKnowledge => self.init_knowledge(),
-            Action::EditBrief => self.edit_brief(),
+            Action::EditBrief => self.edit_knowledge("brief"),
+            Action::EditDecisions => self.edit_knowledge("decisions"),
+            Action::EditConventions => self.edit_knowledge("conventions"),
+            Action::EditProject => self.open_edit(),
+            Action::Rescan => self.rescan(),
+            Action::Missions => self.open_missions(),
             Action::RemoveProject => self.start_remove(),
             Action::Refresh => {
                 let r = self.refresh();
                 self.report(r);
             }
+            Action::RestartDaemon => self.restart_daemon(),
             Action::Inbox => self.open_inbox(),
             Action::Sessions => self.open_sessions(),
             Action::Help => self.mode = Mode::Help,
@@ -1238,7 +1646,8 @@ impl App {
         let r = self
             .rpc(
                 methods::PROJECT_ADD,
-                json!({"path": preview.path.display().to_string()}),
+                json!({"path": preview.path.display().to_string(),
+                       "name": preview.name.trim(), "workspace": preview.workspace.trim()}),
             )
             .and_then(|v| Ok(serde_json::from_value::<Project>(v)?));
         let Some(p) = self.report(r) else {
@@ -1272,6 +1681,51 @@ impl App {
 
     fn selected_project(&self) -> Option<&Project> {
         self.projects.get(self.selected)
+    }
+}
+
+/// The next (or previous) choice after `current`; the first one if it is not a choice.
+fn cycle(choices: &[String], current: &str, back: bool) -> String {
+    if choices.is_empty() {
+        return current.to_string();
+    }
+    let n = choices.len();
+    let next = match choices.iter().position(|c| c == current) {
+        Some(i) if back => (i + n - 1) % n,
+        Some(i) => (i + 1) % n,
+        None => 0,
+    };
+    choices[next].clone()
+}
+
+/// What changed in a project, for the status line.
+fn describe_update(before: Option<&Project>, after: &Project) -> String {
+    let mut changes = Vec::new();
+    if let Some(b) = before {
+        if b.name != after.name {
+            changes.push(format!("renamed to \"{}\"", after.name));
+        }
+        if b.workspace != after.workspace {
+            changes.push(format!("now in workspace {}", after.workspace));
+        }
+        let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
+        if b.stack != after.stack {
+            changes.push(format!("stack {}", after.stack.join(", ")));
+        }
+        if b.test_command != after.test_command {
+            changes.push(format!("test: {}", or(&after.test_command)));
+        }
+        if b.build_command != after.build_command {
+            changes.push(format!("build: {}", or(&after.build_command)));
+        }
+        if b.branch != after.branch {
+            changes.push(format!("branch {}", or(&after.branch)));
+        }
+    }
+    if changes.is_empty() {
+        format!("{}: unchanged · the scan found nothing new", after.id)
+    } else {
+        format!("{}: {}", after.id, changes.join(" · "))
     }
 }
 
@@ -1383,6 +1837,11 @@ fn draw(f: &mut Frame, app: &App) {
         Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject => draw_inbox(f, main, app),
         Mode::Sessions => draw_sessions(f, main, app),
         Mode::Rules => draw_rules(f, main, app),
+        Mode::Missions => draw_missions(f, main, app),
+        Mode::ConfirmStop => match app.stop_target.as_ref().map(|(_, back)| *back) {
+            Some(Mode::Missions) => draw_missions(f, main, app),
+            _ => draw_sessions(f, main, app),
+        },
         _ => draw_main(f, main, app),
     }
     draw_status(f, status, app);
@@ -1392,6 +1851,7 @@ fn draw(f: &mut Frame, app: &App) {
         Mode::Palette => draw_palette(f, body, app),
         Mode::Help => draw_help(f, body),
         Mode::Mission => draw_mission(f, body, app),
+        Mode::EditProject => draw_edit(f, body, app),
         _ => {}
     }
 }
@@ -1448,6 +1908,14 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(RED),
         ),
         daemon,
+        Span::styled(
+            if app.newer_build && app.connected {
+                "  ↻ newer build: restart it from : (sessions keep running)"
+            } else {
+                ""
+            },
+            Style::default().fg(AMBER),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -1519,7 +1987,11 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
         ),
         Line::from(vec![label("id"), Span::raw(p.id.clone())]),
         Line::from(vec![label("path"), Span::raw(p.path.clone())]),
-        Line::from(vec![label("workspace"), Span::raw(p.workspace.clone())]),
+        Line::from(vec![
+            label("workspace"),
+            Span::raw(p.workspace.clone()),
+            Span::styled("  · e renames or moves it", Style::default().fg(DIM)),
+        ]),
         Line::from(vec![
             label("autonomy"),
             Span::styled(p.autonomy.clone(), level_style(&p.autonomy)),
@@ -1554,6 +2026,18 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
                 ),
             ])
         },
+        {
+            let k = app.knowledge_state.get(&p.id).copied().unwrap_or_default();
+            Line::from(vec![
+                label("missions"),
+                Span::raw(match k.journal {
+                    0 => "none yet".to_string(),
+                    1 => "1 journal entry".to_string(),
+                    n => format!("{n} journal entries"),
+                }),
+                Span::styled("  · m shows them", Style::default().fg(DIM)),
+            ])
+        },
         Line::from(vec![
             label("branch"),
             Span::raw(p.branch.clone().unwrap_or_else(|| "-".into())),
@@ -1572,6 +2056,14 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
                 p.test_command
                     .clone()
                     .unwrap_or_else(|| "not detected".into()),
+            ),
+            Span::styled(
+                if p.test_command.is_none() {
+                    "  · : rescan, after adding tests"
+                } else {
+                    ""
+                },
+                Style::default().fg(DIM),
             ),
         ]),
         Line::from(vec![
@@ -1673,16 +2165,30 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
     let label = |s: &str| Span::styled(format!("{s:<11}"), Style::default().fg(DIM));
     let or = |v: &Option<String>, none: &str| v.clone().unwrap_or_else(|| none.to_string());
-    let name = p
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let field = |i: usize, text: &str| {
+        if p.field == i && p.existing.is_none() {
+            Span::styled(
+                format!("{text}█"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(text.to_string())
+        }
+    };
     let mut lines = vec![
-        Line::styled(
-            name,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        Line::from(vec![label("name"), field(0, &p.name)]),
+        Line::from(vec![
+            label("workspace"),
+            field(1, &p.workspace),
+            Span::styled(
+                if p.field == 1 {
+                    "  ←/→ existing ones"
+                } else {
+                    ""
+                },
+                Style::default().fg(DIM),
+            ),
+        ]),
         Line::from(vec![label("path"), Span::raw(p.path.display().to_string())]),
         Line::from(vec![
             label("stack"),
@@ -1730,7 +2236,14 @@ fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
                 format!("{mark} "),
                 Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("set up its knowledge files"),
+            if p.field == 2 {
+                Span::styled(
+                    "set up its knowledge files",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                )
+            } else {
+                Span::raw("set up its knowledge files")
+            },
         ]));
         lines.push(Line::styled(
             "    .corvx/brief, decisions, conventions and map, read by every agent through CLAUDE.md;",
@@ -1743,7 +2256,7 @@ fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Enter add · space knowledge on/off · Esc back",
+        "Enter add · Tab next field · space (on the last) knowledge on/off · Esc back",
         Style::default().fg(DIM),
     ));
     let block = Block::bordered()
@@ -1870,19 +2383,34 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Deny => ("DENY", RED),
         Mode::Reject => ("REJECT", RED),
         Mode::Rules => ("RULES", ACCENT),
+        Mode::EditProject => ("EDIT", GREEN),
+        Mode::Missions => ("MISSIONS", ACCENT),
+        Mode::ConfirmStop => ("CONFIRM", AMBER),
     };
     let hint = if !app.flash.is_empty() {
         app.flash.clone()
     } else {
         match app.mode {
             Mode::Normal => {
-                "j/k move · a add · o mission · b brief · K knowledge · i inbox · s sessions · l rules · ? help · q quit"
+                "j/k move · a add · o mission · m missions · b brief · e edit · i inbox · s sessions · l rules · : more · ? help · q quit"
                     .into()
             }
             Mode::AddPath => {
                 "type the project's path · Tab completes · Enter look at it · Esc cancel".into()
             }
-            Mode::AddPreview => "Enter add · space knowledge on/off · Esc back to the path".into(),
+            Mode::AddPreview => {
+                "Enter add · Tab/↑↓ field · ←/→ pick a workspace · space knowledge on/off · Esc back"
+                    .into()
+            }
+            Mode::EditProject => {
+                "type · Tab other field · ←/→ pick a workspace · Enter save (and rescan) · Esc cancel"
+                    .into()
+            }
+            Mode::Missions => {
+                "j/k move · J/K scroll journal · Enter attach · c clean up worktrees · x stop · R resume · o new · Esc"
+                    .into()
+            }
+            Mode::ConfirmStop => "y stop it · any other key cancels".into(),
             Mode::Mission => {
                 "type the goal · Tab/↑↓ field · ←/→ change · Enter start · Esc cancel".into()
             }
@@ -1907,7 +2435,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                     .into(),
             },
             Mode::Sessions => {
-                "j/k move · Enter attach (Ctrl+\\ then d to come back) · R resume · a autopilot · Esc"
+                "j/k move · Enter attach (Ctrl+\\ then d to come back) · R resume · a autopilot · x stop · c clean up · Esc"
                     .into()
             }
             Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
@@ -1954,6 +2482,16 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("reject › ", Style::default().fg(RED)),
             Span::raw(format!("{}█", app.input)),
         ]),
+        Mode::ConfirmStop => Line::styled(
+            format!(
+                "stop {}? What it committed so far is kept.",
+                app.stop_target
+                    .as_ref()
+                    .map(|(id, _)| id.as_str())
+                    .unwrap_or("")
+            ),
+            Style::default().fg(AMBER),
+        ),
         Mode::ConfirmRemove => Line::styled(
             format!(
                 "remove '{}' from CORVX? Your files are not touched.",
@@ -1999,17 +2537,25 @@ fn draw_palette(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 72, 21);
+    let rect = centered(area, 76, 25);
     f.render_widget(Clear, rect);
     let rows = [
         ("j / k, ↑ ↓", "move selection"),
         ("a", "add a project directory (Tab completes the path)"),
         ("o", "start a mission on the selected project"),
+        ("m", "its missions: history, journals, clean up worktrees"),
         ("b", "edit its brief in $EDITOR (committed when saved)"),
+        (
+            "e",
+            "rename it or move it to another workspace (rescans it)",
+        ),
         ("K", "set up its knowledge files, read by every agent"),
         ("d", "remove the selected project (files untouched)"),
         ("r", "refresh from the daemon"),
-        (": or Ctrl+K", "command palette"),
+        (
+            ": or Ctrl+K",
+            "palette: decisions, conventions, rescan, restart daemon …",
+        ),
         ("i", "attention inbox: what needs you"),
         ("s", "sessions: Enter attaches, Ctrl+\\ then d returns"),
         (
@@ -2020,7 +2566,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "  proposals",
             "y accept · e edit, then accept · n reject, with why",
         ),
-        ("  in sessions", "R resume · a autopilot on/off"),
+        (
+            "  in sessions",
+            "R resume · a autopilot on/off · x stop · c clean up",
+        ),
         (
             "l",
             "rules and autonomy: what CORVX asks you, allows or denies",
@@ -2030,7 +2579,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("", ""),
         (
             "CLI",
-            "corvx project · orchestrate · knowledge · rules · attention",
+            "corvx project · orchestrate · missions · knowledge · daemon",
         ),
     ];
     let lines: Vec<Line> = rows
@@ -2408,7 +2957,7 @@ fn session_lines(app: &App, project: &str) -> Vec<Line<'static>> {
         .collect();
     if running.is_empty() {
         return vec![Line::styled(
-            "  none running · start one with `corvx session start`",
+            "  none running · o starts a mission",
             Style::default().fg(DIM),
         )];
     }
@@ -2548,7 +3097,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "Start one with: corvx session start <project> --runtime claude -- claude",
+                "o on a project starts a mission: an orchestrator and its agents.",
                 Style::default().fg(DIM),
             ),
         ];
@@ -2588,6 +3137,225 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Renaming a project or moving it to another workspace.
+fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
+    let Some(e) = &app.edit else {
+        return;
+    };
+    let rect = centered(area, 76, 10);
+    f.render_widget(Clear, rect);
+    let field = |i: usize, label: &str, text: &str| {
+        let style = if e.field == i {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<11}"), Style::default().fg(DIM)),
+            Span::styled(
+                format!("{text}{}", if e.field == i { "█" } else { "" }),
+                style,
+            ),
+        ])
+    };
+    let others: Vec<String> = app
+        .workspaces()
+        .into_iter()
+        .filter(|w| *w != e.workspace)
+        .collect();
+    let lines = vec![
+        field(0, "name", &e.name),
+        field(1, "workspace", &e.workspace),
+        Line::styled(
+            if others.is_empty() {
+                "            a new name makes a new workspace".to_string()
+            } else {
+                format!("            others: {} (←/→)", others.join(", "))
+            },
+            Style::default().fg(DIM),
+        ),
+        Line::from(""),
+        Line::styled(
+            format!(
+                "The id stays {}: sessions, rules and proposals refer to it.",
+                e.id
+            ),
+            Style::default().fg(DIM),
+        ),
+        Line::styled(
+            "Saving also scans the project again (stack, test and build commands).",
+            Style::default().fg(DIM),
+        ),
+        Line::from(""),
+        Line::styled(
+            "Enter save · Tab other field · Esc cancel",
+            Style::default().fg(DIM),
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" edit {} ", e.id))
+                .border_style(Style::default().fg(GREEN)),
+        ),
+        rect,
+    );
+}
+
+fn mission_style(state: &str) -> Style {
+    match state {
+        "running" => Style::default().fg(ACCENT),
+        "done" => Style::default().fg(GREEN),
+        "failed" => Style::default().fg(RED),
+        "interrupted" => Style::default().fg(AMBER),
+        _ => Style::default().fg(DIM),
+    }
+}
+
+/// A project's missions, newest first, and the selected one's details and journal.
+fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered()
+        .title(format!(" missions · {} ", app.missions_project))
+        .border_style(Style::default().fg(BORDER));
+    if app.missions.is_empty() {
+        let lines = vec![
+            Line::styled(
+                "No missions yet.",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "o starts one: a goal, and an orchestrator plans it and runs agents.",
+                Style::default().fg(DIM),
+            ),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let list_height = (app.missions.len() as u16).clamp(1, (inner.height / 3).max(3));
+    let [list, _, detail] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    // Keep the selected row in view.
+    let first = app
+        .missions_sel
+        .saturating_sub(list_height.saturating_sub(1) as usize);
+    let rows: Vec<Line> = app
+        .missions
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(list_height as usize)
+        .map(|(i, m)| {
+            let selected = i == app.missions_sel;
+            let date = if m.started_at > 0 {
+                corvx_core::knowledge::time_of(m.started_at)
+                    .trim_end_matches(" UTC")
+                    .to_string()
+            } else {
+                m.journal
+                    .as_ref()
+                    .and_then(|j| j.path.rsplit('/').next())
+                    .and_then(|n| n.get(..10))
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            let mut extra = format!("{} agent{}", m.agents, if m.agents == 1 { "" } else { "s" });
+            if m.worktrees > 0 {
+                extra.push_str(&format!(
+                    " · {} worktree{}",
+                    m.worktrees,
+                    if m.worktrees == 1 { "" } else { "s" }
+                ));
+            }
+            let width =
+                (list.width as usize).saturating_sub(2 + 17 + 12 + extra.chars().count() + 2);
+            let goal: String = m.goal.chars().take(width).collect();
+            Line::from(vec![
+                Span::styled(
+                    if selected { "▸ " } else { "  " },
+                    if selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(format!("{date:<17}"), Style::default().fg(DIM)),
+                Span::styled(format!("{:<12}", m.state()), mission_style(m.state())),
+                Span::styled(
+                    format!("{goal:<width$}"),
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(format!("  {extra}"), Style::default().fg(DIM)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(rows), list);
+
+    let Some(m) = app.missions.get(app.missions_sel) else {
+        return;
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(s) = &m.session {
+        let mut facts = vec![s.id.clone()];
+        if let Some(model) = &s.agent_model {
+            facts.push(format!("agents on {model}"));
+        }
+        if m.agents_running > 0 {
+            facts.push(format!("{} agent(s) running", m.agents_running));
+        }
+        if m.worktrees > 0 {
+            facts.push(format!(
+                "{} worktree(s) left · c removes the merged ones",
+                m.worktrees
+            ));
+        }
+        if m.running() {
+            facts.push("Enter watches it".into());
+        }
+        lines.push(Line::styled(facts.join(" · "), Style::default().fg(DIM)));
+    }
+    match &m.journal {
+        Some(j) => {
+            lines.push(Line::styled(j.path.clone(), Style::default().fg(DIM)));
+            lines.push(Line::from(""));
+            for l in j.text.lines() {
+                lines.push(if l.starts_with('#') {
+                    Line::styled(
+                        l.to_string(),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Line::raw(l.to_string())
+                });
+            }
+        }
+        None if m.running() => lines.push(Line::styled(
+            "No journal entry yet: the orchestrator writes it when the goal is met.",
+            Style::default().fg(DIM),
+        )),
+        None => lines.push(Line::styled(
+            "It wrote no journal entry.",
+            Style::default().fg(DIM),
+        )),
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.journal_scroll, 0)),
+        detail,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2597,7 +3365,7 @@ mod tests {
         let all = filter_actions("");
         assert_eq!(all.len(), ACTIONS.len());
         let found = filter_actions("proj");
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.len(), 4);
         assert!(filter_actions("zzz").is_empty());
     }
 

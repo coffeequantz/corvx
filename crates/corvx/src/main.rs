@@ -4,6 +4,7 @@
 //! wrapper over a protocol call, so scripts can do the same thing.
 
 mod mcp;
+mod missions;
 mod tui;
 
 use std::path::PathBuf;
@@ -12,7 +13,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use corvx_client::{ensure_daemon, Client};
 use corvx_core::paths;
-use corvx_proto::{methods, Project, ProjectAddParams, ProjectList, ProjectRemoveParams};
+use corvx_proto::{
+    methods, Project, ProjectAddParams, ProjectList, ProjectRemoveParams, Session, SessionList,
+    SessionState,
+};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -34,8 +38,13 @@ struct Cli {
 enum Command {
     /// Open the terminal UI (default).
     Tui,
-    /// Show daemon status.
+    /// Show daemon status (same as `corvx daemon status`).
     Status,
+    /// The daemon: whether it runs, and stopping or restarting it (to load a new build).
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
     /// Manage projects.
     Project {
         #[command(subcommand)]
@@ -59,6 +68,13 @@ enum Command {
         /// it should not decide), or you.
         #[arg(long, value_enum, default_value_t = Approver::Orchestrator)]
         approvals: Approver,
+    },
+    /// A project's missions, newest first: each orchestrator, its agents and its journal entry.
+    Missions {
+        project: String,
+        /// Print this mission's journal entry (its orchestrator's session id).
+        #[arg(long)]
+        show: Option<String>,
     },
     /// CORVX's tools for agents, as an MCP server on stdio. Started by agent sessions.
     #[command(hide = true)]
@@ -94,6 +110,25 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum DaemonCommand {
+    /// Whether it runs, since when, its sessions, and whether a newer build is on disk.
+    Status,
+    /// Stop it. Sessions in tmux keep running and are adopted by the next daemon, which
+    /// any corvx command starts.
+    Stop {
+        /// Also when sessions without tmux are running: they end with the daemon.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop it and start it again, e.g. after building a new version.
+    Restart {
+        /// Also when sessions without tmux are running: they end with the daemon.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum KnowledgeCommand {
     /// Create the project's missing knowledge files (brief, decisions, conventions, map) and
     /// point its CLAUDE.md at them, so every agent starts from them. Commits what it writes.
@@ -105,6 +140,13 @@ enum KnowledgeCommand {
         /// Decided ones too.
         #[arg(long)]
         all: bool,
+    },
+    /// Edit a knowledge file in $EDITOR (brief, decisions or conventions); committed when
+    /// it changed.
+    Edit {
+        project: String,
+        #[arg(value_parser = ["brief", "decisions", "conventions"], default_value = "brief")]
+        file: String,
     },
     /// Show a proposal in full.
     Show { id: String },
@@ -242,6 +284,10 @@ enum SessionCommand {
     },
     /// Stop a running session.
     Stop { id: String },
+    /// Remove the worktrees of a finished session and of the agents under it, with their
+    /// branches, where the work is merged into the project's current branch. Keeps anything
+    /// not merged or with uncommitted changes.
+    Cleanup { id: String },
     /// Resume an interrupted Claude Code session (e.g. after a restart), continuing its
     /// conversation. Resuming an orchestrator also resumes the lost agents it supervised.
     Resume { id: String },
@@ -285,6 +331,16 @@ enum ProjectCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Rename a project or move it to another workspace. Its id stays the same.
+    Set {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Scan a project again (stack, test and build commands, branch), e.g. after it changed.
+    Rescan { id: String },
     /// Unregister a project. Does not touch its files.
     Remove {
         /// Project id, as shown by `corvx project list`.
@@ -362,15 +418,8 @@ fn run() -> Result<()> {
             let client = connect(&data_dir)?;
             tui::run(client, data_dir)
         }
-        Command::Status => {
-            let info = connect(&data_dir)?.info()?;
-            println!(
-                "corvxd {} · protocol v{} · pid {}",
-                info.version, info.protocol_version, info.pid
-            );
-            println!("data: {}", info.data_dir);
-            Ok(())
-        }
+        Command::Status => daemon(DaemonCommand::Status, &data_dir),
+        Command::Daemon { command } => daemon(command.unwrap_or(DaemonCommand::Status), &data_dir),
         Command::Project { command } => project(command, &data_dir),
         Command::Session { command } => session(command, &data_dir),
         Command::Attention { command } => attention(command, &data_dir),
@@ -390,6 +439,7 @@ fn run() -> Result<()> {
             approvals == Approver::Human,
             &data_dir,
         ),
+        Command::Missions { project, show } => list_missions(&project, show, &data_dir),
         Command::Mcp => unreachable!("handled above"),
     }
 }
@@ -619,6 +669,14 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
             println!("stopped {id}");
             Ok(())
         }
+        SessionCommand::Cleanup { id } => {
+            let done: corvx_proto::SessionCleanup = client.call(
+                methods::SESSION_CLEANUP,
+                &SessionIdParams { id: id.clone() },
+            )?;
+            print_cleanup(&id, &done);
+            Ok(())
+        }
         SessionCommand::Resume { id } => {
             let r: corvx_proto::SessionResumed = client.call(
                 methods::SESSION_RESUME,
@@ -651,6 +709,188 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
     }
 }
 
+fn daemon(command: DaemonCommand, data_dir: &std::path::Path) -> Result<()> {
+    match command {
+        DaemonCommand::Status => {
+            let Some(mut client) = corvx_client::running_daemon(data_dir) else {
+                println!("corvxd is not running · any corvx command starts it");
+                return Ok(());
+            };
+            let info = client.info()?;
+            let up = if info.started_at > 0 {
+                format!(
+                    " · up {}",
+                    duration_label(corvx_core::store::now_secs() - info.started_at)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "corvxd {} · protocol v{} · pid {}{up}",
+                info.version, info.protocol_version, info.pid
+            );
+            println!("data:     {}", info.data_dir);
+            let list: SessionList = client.call(methods::SESSION_LIST, &json!({}))?;
+            let running: Vec<&Session> = list
+                .sessions
+                .iter()
+                .filter(|s| s.state == SessionState::Running)
+                .collect();
+            let native = running.iter().filter(|s| s.backend != "tmux").count();
+            println!(
+                "sessions: {} running{}",
+                running.len(),
+                if native > 0 {
+                    format!(" ({native} without tmux: they end when the daemon stops)")
+                } else {
+                    String::new()
+                }
+            );
+            if corvx_client::newer_build_on_disk(&info) {
+                println!("a newer build is on disk · corvx daemon restart loads it");
+            }
+            Ok(())
+        }
+        DaemonCommand::Stop { force } => {
+            check_native_sessions(data_dir, force)?;
+            match corvx_client::stop_daemon(data_dir)? {
+                Some(pid) => println!(
+                    "stopped corvxd (pid {pid}) · sessions in tmux keep running · any corvx command starts it again"
+                ),
+                None => println!("corvxd is not running"),
+            }
+            Ok(())
+        }
+        DaemonCommand::Restart { force } => {
+            check_native_sessions(data_dir, force)?;
+            let old = corvx_client::stop_daemon(data_dir)?;
+            let mut client = connect(data_dir)?;
+            let info = client.info()?;
+            let list: SessionList = client.call(methods::SESSION_LIST, &json!({}))?;
+            let running = list
+                .sessions
+                .iter()
+                .filter(|s| s.state == SessionState::Running)
+                .count();
+            match old {
+                Some(old) => println!(
+                    "restarted corvxd: pid {old} → {} · {running} session(s) running",
+                    info.pid
+                ),
+                None => println!(
+                    "started corvxd (pid {}) · {running} session(s) running",
+                    info.pid
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Refuses to stop the daemon while sessions that would end with it are running, unless forced.
+fn check_native_sessions(data_dir: &std::path::Path, force: bool) -> Result<()> {
+    let Some(mut client) = corvx_client::running_daemon(data_dir) else {
+        return Ok(());
+    };
+    let list: SessionList = client.call(methods::SESSION_LIST, &json!({}))?;
+    let native: Vec<String> = list
+        .sessions
+        .iter()
+        .filter(|s| s.state == SessionState::Running && s.backend != "tmux")
+        .map(|s| format!("{} ({})", s.id, display_name(s)))
+        .collect();
+    if native.is_empty() || force {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "these sessions run without tmux and would end with the daemon: {}\n\
+         stop them first, or pass --force",
+        native.join(", ")
+    )
+}
+
+/// "45s", "12m", "3h 05m", "2d 4h".
+fn duration_label(secs: i64) -> String {
+    let secs = secs.max(0);
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
+        s => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
+/// A project's missions, from the daemon's sessions and the project's journal.
+pub(crate) fn load_missions(client: &mut Client, project: &str) -> Result<Vec<missions::Mission>> {
+    let k: corvx_proto::Knowledge = client.call(
+        methods::KNOWLEDGE_READ,
+        &json!({"project": project, "journal": missions::JOURNAL_ENTRIES}),
+    )?;
+    let list: SessionList = client.call(
+        methods::SESSION_LIST,
+        &json!({"all": true, "project": k.project}),
+    )?;
+    Ok(missions::missions(&k.project, &list.sessions, &k.journal))
+}
+
+fn list_missions(project: &str, show: Option<String>, data_dir: &std::path::Path) -> Result<()> {
+    let mut client = connect(data_dir)?;
+    let all = load_missions(&mut client, project)?;
+    if let Some(id) = show {
+        let m = all
+            .iter()
+            .find(|m| m.session.as_ref().is_some_and(|s| s.id == id))
+            .ok_or_else(|| anyhow::anyhow!("no mission by '{id}' in {project}"))?;
+        match &m.journal {
+            Some(j) => print!("{}", j.text),
+            None => println!("{id} wrote no journal entry"),
+        }
+        return Ok(());
+    }
+    if all.is_empty() {
+        println!("no missions on {project} yet · corvx orchestrate {project} \"<goal>\"");
+        return Ok(());
+    }
+    for m in &all {
+        let date = if m.started_at > 0 {
+            corvx_core::knowledge::time_of(m.started_at)
+                .trim_end_matches(" UTC")
+                .to_string()
+        } else {
+            m.journal
+                .as_ref()
+                .and_then(|j| j.path.rsplit('/').next())
+                .and_then(|n| n.get(..10))
+                .unwrap_or("-")
+                .to_string()
+        };
+        let id = m.session.as_ref().map(|s| s.id.as_str()).unwrap_or("-");
+        let goal: String = m.goal.chars().take(60).collect();
+        println!("{date:<17} {:<12} {id:<16} {goal}", m.state());
+        let mut notes = vec![format!(
+            "{} agent{}",
+            m.agents,
+            if m.agents == 1 { "" } else { "s" }
+        )];
+        if m.agents_running > 0 {
+            notes.push(format!("{} running", m.agents_running));
+        }
+        if m.worktrees > 0 {
+            notes.push(format!(
+                "{} worktree{} left · corvx session cleanup {id}",
+                m.worktrees,
+                if m.worktrees == 1 { "" } else { "s" }
+            ));
+        }
+        notes.push(match &m.journal {
+            Some(j) => j.path.clone(),
+            None => "no journal entry".into(),
+        });
+        println!("{:<17} {}", "", notes.join(" · "));
+    }
+    Ok(())
+}
+
 fn connect(data_dir: &std::path::Path) -> Result<Client> {
     ensure_daemon(data_dir, None).context("cannot reach corvxd")
 }
@@ -672,17 +912,7 @@ fn project(command: ProjectCommand, data_dir: &std::path::Path) -> Result<()> {
             };
             let p: Project = client.call(methods::PROJECT_ADD, &params)?;
             println!("added {} ({})", p.id, p.path);
-            println!(
-                "  stack: {}",
-                if p.stack.is_empty() {
-                    "unknown".into()
-                } else {
-                    p.stack.join(", ")
-                }
-            );
-            if let Some(t) = &p.test_command {
-                println!("  test:  {t}");
-            }
+            print_scan(&p);
             println!(
                 "  next:  corvx knowledge init {}   (its knowledge files, read by every agent)",
                 p.id
@@ -744,6 +974,38 @@ fn project(command: ProjectCommand, data_dir: &std::path::Path) -> Result<()> {
             );
             Ok(())
         }
+        ProjectCommand::Set {
+            id,
+            name,
+            workspace,
+        } => {
+            if name.is_none() && workspace.is_none() {
+                anyhow::bail!("say what to change: --name and/or --workspace");
+            }
+            let p: Project = client.call(
+                methods::PROJECT_UPDATE,
+                &corvx_proto::ProjectUpdateParams {
+                    id,
+                    name,
+                    workspace,
+                    rescan: false,
+                },
+            )?;
+            println!("{}: \"{}\" in workspace {}", p.id, p.name, p.workspace);
+            Ok(())
+        }
+        ProjectCommand::Rescan { id } => {
+            let p: Project = client.call(
+                methods::PROJECT_UPDATE,
+                &corvx_proto::ProjectUpdateParams {
+                    id,
+                    rescan: true,
+                    ..Default::default()
+                },
+            )?;
+            print_scan(&p);
+            Ok(())
+        }
         ProjectCommand::Remove { id } => {
             let _: serde_json::Value = client.call(
                 methods::PROJECT_REMOVE,
@@ -753,6 +1015,34 @@ fn project(command: ProjectCommand, data_dir: &std::path::Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn print_cleanup(id: &str, done: &corvx_proto::SessionCleanup) {
+    if done.removed.is_empty() && done.kept.is_empty() {
+        println!("{id}: no worktrees left to clean up");
+    }
+    for r in &done.removed {
+        println!("removed {r}");
+    }
+    for k in &done.kept {
+        println!("kept    {k}");
+    }
+}
+
+/// What the scan found, indented under a project line.
+fn print_scan(p: &Project) {
+    let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "not detected".into());
+    println!(
+        "  stack: {}",
+        if p.stack.is_empty() {
+            "unknown".into()
+        } else {
+            p.stack.join(", ")
+        }
+    );
+    println!("  test:  {}", or(&p.test_command));
+    println!("  build: {}", or(&p.build_command));
+    println!("  branch: {}", or(&p.branch));
 }
 
 /// Reads one hook event from stdin and sends it to the daemon. Best effort: silent on any failure.
@@ -1311,7 +1601,8 @@ decisions made in this mission and why, conventions the agents should follow nex
 Only what would change how later work is done, and not what the knowledge already says, is waiting, or was \
 rejected. Usually zero to three proposals. The human accepts, edits or rejects them in the inbox. \
 8. Summarize what each agent did, which branches hold the work, which knowledge you proposed, and what the human \
-should review or merge, and call report_done with that summary (it is added to the journal too).";
+should review or merge, and call report_done with that summary. It is added to the journal, and CORVX commits the journal entry, so do not \
+commit it yourself.";
 
 /// The orchestrator's role prompt, with its model and approval policy.
 fn orchestrator_prompt(agent_model: &str, human_approves_agents: bool) -> String {
@@ -1558,6 +1849,39 @@ fn knowledge(
                     "{:<22} {:<9} {:<12} {:<12} {}",
                     p.id, p.status, p.project, p.file, p.title
                 );
+            }
+            Ok(())
+        }
+        Some(KnowledgeCommand::Edit { project, file }) => {
+            let list: ProjectList = client.call(methods::PROJECT_LIST, &json!({}))?;
+            let p = list
+                .projects
+                .into_iter()
+                .find(|p| p.id == project)
+                .ok_or_else(|| anyhow::anyhow!("no project '{project}'"))?;
+            let path = std::path::Path::new(&p.path).join(corvx_core::knowledge::rel_path(&file));
+            if !path.is_file() {
+                anyhow::bail!(
+                    "{} has no {} yet · corvx knowledge init {}",
+                    p.id,
+                    path.display(),
+                    p.id
+                );
+            }
+            if !edit_file(&path)? {
+                println!("unchanged");
+                return Ok(());
+            }
+            let done: KnowledgeInit = client.call(
+                methods::KNOWLEDGE_COMMIT,
+                &json!({"project": p.id, "file": file}),
+            )?;
+            println!(
+                "saved .corvx/{file}.md{}",
+                if done.committed { " and committed" } else { "" }
+            );
+            if let Some(note) = done.note {
+                println!("{note}");
             }
             Ok(())
         }

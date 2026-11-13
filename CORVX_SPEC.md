@@ -118,7 +118,7 @@ Node
 
 - Owns the session backend, the store, the event log and the MCP server.
 - Runs detached from any terminal, so closing the terminal that started it does not stop it.
-- Can restart or upgrade without stopping agents, because sessions live in the backend (section 7).
+- Can restart or upgrade without stopping agents, because sessions live in the backend (section 7). `corvx daemon status` says whether a newer build is on disk, and `corvx daemon restart` (or the TUI palette) loads it; both refuse while sessions without tmux run, since those would end.
 - Starts on demand from any client, or at login.
 
 ### 6.2 Protocol
@@ -232,7 +232,7 @@ Each project gets a `.corvx/` folder, committed with the code by default:
 | `brief.md` | What the project is, who it is for, current priorities | You (agents may propose edits) |
 | `decisions.md` | Architecture and product decisions, with dates and reasons | Proposals you approve |
 | `conventions.md` | How things are done here: style, patterns, testing rules, pitfalls | Proposals you approve |
-| `journal/` | One entry per mission: goal, what happened, what went wrong, what was learned | Orchestrators, at mission end |
+| `journal/` | One entry per mission: goal, what happened, what went wrong, what was learned | Orchestrators, at mission end; CORVX commits the entry when the orchestrator reports |
 | `map.md` | Generated: stack, commands, structure, key entry points (from the project scan) | CORVX, refreshed automatically |
 
 Agents read these through mechanisms their runtimes already support: for Claude Code, a reference from `CLAUDE.md`; for Codex, `AGENTS.md`; and for any agent, the `read_knowledge` tool.
@@ -244,7 +244,7 @@ Agents read these through mechanisms their runtimes already support: for Claude 
 3. At the end of a mission, the orchestrator writes a journal entry and proposes what should be remembered.
 4. Every new mission starts from the improved files.
 
-Knowledge only changes through proposals you accept, so agents cannot quietly rewrite what other agents trust.
+Knowledge only changes through proposals you accept, so agents cannot quietly rewrite what other agents trust. You can also edit any of the files yourself (`corvx knowledge edit`, or the TUI), and CORVX commits what you change.
 
 ### 10.3 Later, only with evidence
 
@@ -342,6 +342,11 @@ Daemon, protocol v0, SQLite store, project registry with a project scan, TUI she
 - Built and tested with a stand-in agent: `corvx knowledge init` creates the missing files (brief, decisions, conventions, map), adds a marked block to `CLAUDE.md` that imports them (and to an existing `AGENTS.md`, as a list), and commits what it wrote. The map is generated from git's tracked files and the project scan (stack, test and build commands, top-level structure, entry points) and rewritten when knowledge changes. `read_knowledge` returns the files, the newest journal entries, proposals waiting and rejected ones with their reasons; it reads the project's own checkout, not a worktree, so it is current. `propose_knowledge` (decisions, conventions or brief; a title, text, evidence, and optionally the exact text it replaces) opens a `proposal` item in your inbox that the agent's later state changes do not close. You accept (`y`, or `corvx knowledge accept`), edit then accept (`e`, `--edit`, in `$EDITOR`) or reject with a reason (`n`, `corvx knowledge reject`; dismissing rejects too). Accepting appends a dated section with its evidence, or makes the replacement if the text is still there, and commits only that file (and the map), leaving other work in the checkout alone. A proposal with the title of a rejected one is refused with the reason, and so is one already waiting. The orchestrator prompt reads knowledge first, cites decisions and conventions in its plan and its agents' prompts, and ends a mission with zero to three proposals. The scan now recognizes plain Python projects and standard-library tests (`python3 -m unittest`). Remaining: the done-when run below.
 - **Done when:** over five missions on a project, accepted proposals visibly change what later orchestrators do (they cite decisions and conventions in their plans).
 
+### Usability — in progress, before M4
+Multiple machines can wait; making CORVX pleasant on one machine comes first.
+- Done: setting up in the TUI (add with a preview, knowledge, brief, the mission form; see open question 7). Projects can be renamed and moved between workspaces, and scanned again (`corvx project set`, `project rescan`, `e` in the TUI; a name and workspace when adding). Mission history (`corvx missions`, `m` in the TUI): each orchestrator, its agents, its state and its journal entry. Cleaning up after a mission (`corvx session cleanup`, `c`): the worktrees and branches of its agents whose work is merged, never forcing, keeping what is unmerged or has uncommitted changes. Stopping sessions from the TUI (`x`). The journal entry is committed when the orchestrator reports. `corvx daemon status|stop|restart`. Decisions and conventions can be edited directly (`corvx knowledge edit`, the palette).
+- Next, from use: whatever the five M3 missions show is clumsy.
+
 ### M4 · Multiple machines
 - `corvx proxy` over SSH; nodes in the TUI; `start_agent` on a remote project.
 - **Done when:** an orchestrator on your laptop runs one agent locally and one on a remote machine, and both appear in one inbox.
@@ -380,7 +385,7 @@ Daemon, protocol v0, SQLite store, project registry with a project scan, TUI she
 4. **Knowledge in git.** Committed by default for now: `knowledge init` and accepting a proposal commit just the knowledge files on the checkout's current branch. Opt-out per project if that gets in the way.
 5. **Trademark check** before public launch.
 6. **Non-Anthropic models for agents** (e.g. DeepSeek through OpenRouter): through a CLI agent that supports OpenRouter (runs today as a plain session, without hooks), or through CORVX's own agent loop (deferred)?
-7. **Setting up and adding projects.** First pass done in the TUI: `a` adds a project with a preview of its scan and optional knowledge setup (Tab completes paths), `b` edits and commits the brief, `K` sets up knowledge, `o` starts a mission from a form (goal, autonomy, models, approvals), and a first run and each project show the next step. Still open: renaming a project and choosing its workspace when adding it, editing decisions and conventions directly, and a mission history view.
+7. **Setting up and adding projects.** Done in the TUI: `a` adds a project with a preview of its scan, its name and workspace, and optional knowledge setup (Tab completes paths), `b` edits and commits the brief, `K` sets up knowledge, `e` renames a project or moves it to another workspace, `o` starts a mission from a form (goal, autonomy, models, approvals), `m` shows its missions, and a first run and each project show the next step. Still open: changing a project's id or path (sessions, rules and proposals refer to the id).
 
 ## 19. Reference points
 
