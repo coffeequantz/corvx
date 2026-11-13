@@ -464,7 +464,7 @@ impl SessionManager {
             }
             methods::SESSION_SCREEN => {
                 let p: SessionScreenParams = parse(params)?;
-                to_value(self.screen(&p.id)?)
+                to_value(self.screen(&p)?)
             }
             methods::SESSION_REPORT => {
                 let p: SessionReportParams = parse(params)?;
@@ -823,13 +823,18 @@ impl SessionManager {
     }
 
     /// The visible screen of a session as plain text.
-    fn screen(&self, id: &str) -> Result<SessionScreen, ServiceError> {
+    fn screen(&self, p: &SessionScreenParams) -> Result<SessionScreen, ServiceError> {
+        let id = p.id.as_str();
         let entry = self.entries.get(id).ok_or_else(|| not_found(id))?;
         let state = lock(&entry.shared.status).state;
         let live = match &entry.backend {
-            Backend::Tmux if state == SessionState::Running => {
-                self.tmux.as_ref().and_then(|t| t.capture(id).ok())
-            }
+            Backend::Tmux if state == SessionState::Running => self.tmux.as_ref().and_then(|t| {
+                if p.history > 0 || p.ansi {
+                    t.capture_view(id, p.history, p.ansi).ok()
+                } else {
+                    t.capture(id).ok()
+                }
+            }),
             Backend::Pty { .. } => {
                 let buf = lock(&entry.shared.output);
                 let from = buf.data.len().saturating_sub(16 * 1024);

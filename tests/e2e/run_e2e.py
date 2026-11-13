@@ -484,13 +484,12 @@ def resume_after_a_restart(h: Harness):
     t = Term([str(CORVX)], h.env)
     try:
         assert t.wait_for("interrupted session", 10), "the TUI does not mention the lost session:\n" + t.text()
-        t.send(b"s")
-        assert t.wait_for("R resume", 5), t.text()
-        for _ in range(40):  # ended sessions are listed last, in start order: ours is the last
+        t.send(b"\x1b[C")  # into the missions column
+        for _ in range(20):  # sessions started by hand come after the missions
             t.send(b"j")
         t.pump(0.5)
-        selected = next((l for l in t.text().splitlines() if f"▸ " in l.split("││")[-1]), "")
-        assert sid in selected and "lost" in selected, "the lost session is not selected:\n" + t.text()
+        assert "interrupted" in t.text() and sid in t.text(), "the lost session is not selected:\n" + t.text()
+        assert "R resume" in t.text(), t.text()
         t.send(b"R")
         assert t.wait_for("resumed", 10), "no confirmation:\n" + t.text()
         t.send(b"q")
@@ -554,22 +553,32 @@ def sessions_survive_a_daemon_restart(h: Harness):
 
 
 def attach_from_the_terminal_ui(h: Harness):
-    """The sessions view lists sessions; Enter attaches; detaching returns to the TUI."""
+    """The tree lists sessions; Enter types to one in its pane; f attaches full screen."""
     sid = h.start(backend="pty", command=["cat"])
     t = Term([str(CORVX)], h.env)
     try:
         assert t.wait_for("projects", 10), "TUI did not start"
-        t.send(b"s")
-        assert t.wait_for(sid, 5), "sessions view does not list the session:\n" + t.text()
+        t.send(b"\x1b[C")  # into the missions column
+        for _ in range(20):
+            t.send(b"j")
+        assert t.wait_for(sid, 5), "the missions column does not show the session:\n" + t.text()
+        # Enter puts the keyboard in the session's pane; what you type reaches it.
         t.send(b"\r")
+        assert t.wait_for("live · typing", 5), "Enter did not go into the pane:\n" + t.text()
+        t.send(b"typed-in-the-pane\r")
+        assert t.wait_for("typed-in-the-pane", 5), t.text()
+        wait_until(lambda: "typed-in-the-pane" in h.corvx("session", "output", sid), 5, "the keys to reach it")
+        t.send(b"\x1c")  # Ctrl+\\
+        assert t.wait_for("back in the columns", 5), t.text()
+        # f attaches full screen.
+        t.send(b"f")
         assert t.wait_for("attached to", 10), "Enter did not attach:\n" + t.text()
         t.send(b"hello-from-tui\r")
         assert t.wait_for("hello-from-tui", 10), "typed text did not reach the session"
         t.send(b"\x1c")
         t.send(b"d")
-        assert t.wait_for("sessions ·", 10), "the TUI did not come back after detaching:\n" + t.text()
+        assert t.wait_for(f"detached from {sid}", 10), "the TUI did not come back after detaching:\n" + t.text()
         assert "running" in h.session_line(sid), "session stopped on detach"
-        t.send(b"\x1b")
         t.send(b"q")
         t.pump(0.5)
     finally:
@@ -1122,6 +1131,42 @@ def a_lead_starts_missions(h: Harness):
     assert "Build the widget form." in history and lead not in history, history
 
 
+def the_live_pane(h: Harness):
+    """The live pane shows a session in colour; the wheel scrolls its history; a click selects."""
+    if not tmux_available():
+        raise SkipTest("tmux is not installed")
+    script = "for i in $(seq 1 120); do printf '\\033[32mline %s\\033[0m\\n' $i; done; sleep 60"
+    sid = h.start(backend="tmux", command=["sh", "-c", script])
+    t = Term([str(CORVX)], h.env, cols=150, rows=30)
+    try:
+        assert t.wait_for("projects", 10), t.text()
+        t.send(b"\x1b[C")
+        for _ in range(20):
+            t.send(b"j")
+        assert t.wait_for("line 120", 10), "the live pane does not show the session:\n" + t.text()
+        row = next(i for i, l in enumerate(t.screen.display) if "line 120" in l)
+        col = t.screen.display[row].index("line 120")
+        assert t.screen.buffer[row][col].fg not in ("default", "white"), "no colour in the live pane"
+        # The wheel over the live pane scrolls back into the history, and forward again.
+        x, y = col + 5, row - 5
+        for _ in range(5):
+            t.send(f"\x1b[<64;{x};{y}M".encode())
+            t.pump(0.2)
+        assert t.wait_for("lines back", 5), "the wheel did not scroll the history:\n" + t.text()
+        assert "line 120" not in t.text(), t.text()
+        for _ in range(10):
+            t.send(f"\x1b[<65;{x};{y}M".encode())
+            t.pump(0.2)
+        assert t.wait_for("line 120", 5), t.text()
+        # A click on the project selects it, and its overview replaces the live pane.
+        t.send(b"\x1b[<0;4;3M\x1b[<0;4;3m")
+        assert t.wait_for("GOALS", 5), "a click on the project did not select it:\n" + t.text()
+        t.send(b"q")
+        t.pump(0.3)
+    finally:
+        t.close()
+
+
 def setting_up_in_the_terminal_ui(h: Harness):
     """Add a project, set up its knowledge, write its brief and start a mission, all in the TUI."""
     proj = h.base / "newproj"
@@ -1206,8 +1251,9 @@ def setting_up_in_the_terminal_ui(h: Harness):
         command = " ".join(started[-1]["command"]) if started else ""
         assert "--model opus" in command and "start_agent uses haiku" in command, command
         assert 'serves the project goal "Health checks"' in command, command
-        # The board selects the new mission and shows its screen live.
-        assert t.wait_for("live · orchestrator · Add a health check", 5), t.text()
+        # The tree selects the new mission and the right side shows its screen live.
+        assert t.wait_for("mission  Add a health check", 5), t.text()
+        assert "◆ Add a health check" in t.text(), t.text()
         assert t.wait_for("fake claude ready", 5), t.text()
 
         # t sends a message to the selected mission without attaching.
@@ -1218,20 +1264,21 @@ def setting_up_in_the_terminal_ui(h: Harness):
         assert t.wait_for("sent to orchestrator · Add a health check", 5), t.text()
         wait_until(lambda: "use fewer agents" in h.corvx("session", "output", orch), 5, "the message to arrive")
 
-        # From the projects column, t talks to the project's lead, starting it first.
-        t.key(b"\x1b")
+        # On the project's row, t talks to the project's lead, starting it first.
+        t.key(b"\x1b[D")
+        assert t.wait_for("GOALS", 5), "← should step out to the project:\n" + t.text()
         t.send(b"t")
         assert t.wait_for("to new lead · newproj ›", 5), t.text()
         t.send(b"what next?")
         t.send(b"\r")
         assert t.wait_for("started the lead of newproj", 10), t.text()
         lead = next(l for l in h.corvx("session", "list").splitlines() if "lead · newproj" in l).split()[0]
-        assert t.wait_for("lead newproj", 5), t.text()
-
-        # m lists the project's missions, with the one just started (and not the lead).
-        t.send(b"m")
-        assert t.wait_for("missions · newproj", 5), t.text()
-        assert "running" in t.text() and "Add a health check" in t.text(), t.text()
+        # The lead is the first row of the missions column; selecting it shows it live.
+        t.send(b"\x1b[C")
+        for _ in range(5):
+            t.send(b"k")
+        assert t.wait_for(f"lead  newproj", 5), t.text()
+        assert lead in t.text(), t.text()
         t.key(b"\x1b", b"q")
     finally:
         t.close()
@@ -1250,6 +1297,7 @@ SCENARIOS = [
     the_knowledge_loop,
     missions_cleanup_and_the_daemon,
     a_lead_starts_missions,
+    the_live_pane,
     setting_up_in_the_terminal_ui,
     real_claude_rules,
     attach_from_the_terminal_ui,

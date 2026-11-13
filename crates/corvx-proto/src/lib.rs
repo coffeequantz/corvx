@@ -747,6 +747,14 @@ pub struct SessionResumed {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionScreenParams {
     pub id: String,
+    /// Lines of history above the screen to include (tmux sessions; others return what
+    /// they have).
+    #[serde(default)]
+    pub history: u32,
+    /// Keep colours and styles as terminal escape codes, with the screen's rows as they are
+    /// drawn (not joined). For showing the screen, not for reading it.
+    #[serde(default)]
+    pub ansi: bool,
 }
 
 /// The visible screen of a session, as plain text.

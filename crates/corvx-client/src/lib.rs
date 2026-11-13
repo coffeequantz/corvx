@@ -109,7 +109,9 @@ pub fn ensure_daemon(data_dir: &Path, daemon_bin: Option<&Path>) -> Result<Clien
     paths::check_socket_path(&socket).map_err(anyhow::Error::msg)?;
     spawn_daemon(data_dir, daemon_bin)?;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The first start of a newly built binary can take several seconds on macOS, while the
+    // system checks it.
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(mut client) = Client::connect(&socket) {
             check_protocol(&mut client)?;
@@ -117,7 +119,7 @@ pub fn ensure_daemon(data_dir: &Path, daemon_bin: Option<&Path>) -> Result<Clien
         }
         if Instant::now() >= deadline {
             bail!(
-                "corvxd did not start within 5s; see {}",
+                "corvxd did not start within 15s; see {}",
                 paths::log_path(data_dir).display()
             );
         }

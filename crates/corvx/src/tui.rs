@@ -11,16 +11,18 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use corvx_client::{ensure_daemon, is_connection_error, Client};
 
-use crate::missions::Mission;
 use corvx_proto::{
     methods, AttentionItem, AttentionList, Knowledge, KnowledgeAccepted, KnowledgeInit, Project,
     ProjectList, Proposal, ProposalList, Rule, RuleList, Session, SessionList, SessionState,
 };
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
@@ -43,7 +45,6 @@ enum Mode {
     ConfirmRemove,
     Help,
     Inbox,
-    Sessions,
     /// Typing an answer to the selected question in the inbox.
     Answer,
     /// Typing an optional reason for denying the selected permission request.
@@ -54,14 +55,28 @@ enum Mode {
     Rules,
     /// The selected project's name and workspace.
     EditProject,
-    /// The selected project's missions, newest first, with the selected one's journal.
-    Missions,
-    /// Asking before stopping a session (from the sessions or missions view).
+    /// Asking before stopping the selected session.
     ConfirmStop,
     /// Typing a message to the selected session, or to the project's lead.
     Talk,
     /// Typing a new goal for the selected project.
     AddGoal,
+    /// In the selected session's pane: keys go to the session, as if attached.
+    Live,
+}
+
+/// What the mouse is over.
+#[derive(Clone, Debug, PartialEq)]
+enum Hit {
+    /// A column: 0 projects, 1 missions, 2 agents.
+    Column(usize),
+    Project(usize),
+    /// A row of the missions column, by key.
+    Mission(String),
+    /// An agent tile, by session id.
+    Agent(String),
+    /// The live pane.
+    Live,
 }
 
 /// Who a typed message goes to.
@@ -72,13 +87,49 @@ enum TalkTo {
     Session(String),
 }
 
-/// A row in the board's work column: the project's lead (or a place for one), a mission, or
-/// a session started by hand.
-#[derive(Clone)]
-struct WorkItem {
-    session: Option<Session>,
-    kind: &'static str,
+/// What a row of the tree is.
+#[derive(Clone, Debug)]
+enum RowKind {
+    Project,
+    /// The project's lead: the agent you talk to about the project. None until started.
+    Lead(Option<Session>),
+    /// An orchestrator, and the task it was given.
+    Mission(Session),
+    /// An agent working under a mission (or under any session).
+    Agent(Session),
+    /// A session started by hand.
+    Loose(Session),
+    /// Earlier missions, folded away; how many.
+    History(usize),
 }
+
+/// One row of the tree on the left: projects, then under each its lead, its missions with
+/// their agents, and its earlier missions.
+#[derive(Clone, Debug)]
+struct Row {
+    /// Stable across refreshes, so the selection stays put: "p:<project>", "lead:<project>",
+    /// "s:<session>", "h:<project>".
+    key: String,
+    project: String,
+    depth: usize,
+    kind: RowKind,
+    /// It has rows under it, and whether they are shown.
+    branch: bool,
+    open: bool,
+}
+
+impl Row {
+    fn session(&self) -> Option<&Session> {
+        match &self.kind {
+            RowKind::Lead(s) => s.as_ref(),
+            RowKind::Mission(s) | RowKind::Agent(s) | RowKind::Loose(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// Missions that ended longer ago than this fold into the project's history.
+const RECENT_SECS: i64 = 12 * 3600;
 
 #[derive(Clone, Copy, Debug)]
 enum Action {
@@ -90,7 +141,6 @@ enum Action {
     EditConventions,
     EditProject,
     Rescan,
-    Missions,
     RemoveProject,
     Refresh,
     RestartDaemon,
@@ -98,18 +148,16 @@ enum Action {
     AddGoal,
     EditGoals,
     Inbox,
-    Sessions,
     Help,
     Quit,
 }
 
-const ACTIONS: [(Action, &str); 19] = [
+const ACTIONS: [(Action, &str); 17] = [
     (Action::AddProject, "add project"),
     (Action::TalkToLead, "talk to the project's lead"),
     (Action::StartMission, "start a mission"),
     (Action::AddGoal, "add a goal"),
     (Action::EditGoals, "edit goals and guideposts"),
-    (Action::Missions, "missions: history and journals"),
     (Action::SetUpKnowledge, "set up knowledge files"),
     (Action::EditBrief, "edit the brief"),
     (Action::EditDecisions, "edit the decisions"),
@@ -123,7 +171,6 @@ const ACTIONS: [(Action, &str); 19] = [
     (Action::Refresh, "refresh"),
     (Action::RestartDaemon, "restart the daemon"),
     (Action::Inbox, "attention inbox"),
-    (Action::Sessions, "sessions"),
     (Action::Help, "help"),
     (Action::Quit, "quit"),
 ];
@@ -131,6 +178,8 @@ const ACTIONS: [(Action, &str); 19] = [
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// How often the live pane reads the screen it shows.
 const PEEK_EVERY: Duration = Duration::from_millis(800);
+/// How often while you type in it.
+const LIVE_PEEK_EVERY: Duration = Duration::from_millis(120);
 
 /// Models an orchestrator can run on, and its agents, defaults first.
 const ORCHESTRATOR_MODELS: [&str; 2] = ["opus", "sonnet"];
@@ -222,11 +271,25 @@ struct App {
     projects: Vec<Project>,
     /// Open attention items, most urgent first.
     attention: Vec<AttentionItem>,
-    /// Every session the daemon manages, in start order.
+    /// Every session the daemon knows, ended ones too, in start order.
     sessions: Vec<Session>,
-    /// How deep each session sits under its orchestrator, parallel to `sessions`.
-    session_depths: Vec<usize>,
-    sessions_sel: usize,
+    /// The column the keyboard is in: 0 projects, 1 the project's lead and missions,
+    /// 2 agents. The right side shows the selection.
+    col: usize,
+    /// The selection in the missions and agents columns, by key, and where it was (for
+    /// when it goes away).
+    col1_key: String,
+    col1_at: usize,
+    col2_key: String,
+    col2_at: usize,
+    /// The last lines of each agent tile's screen.
+    tiles: std::collections::HashMap<String, Vec<String>>,
+    /// Rows opened or closed by hand; the rest follow their default.
+    open: std::collections::HashMap<String, bool>,
+    /// Journal entries per project, read when an ended mission is selected.
+    journals: std::collections::HashMap<String, Vec<corvx_proto::JournalEntry>>,
+    /// How far the detail pane is scrolled (journal entries).
+    detail_scroll: u16,
     /// A session to attach to. The event loop hands it the terminal.
     pending_attach: Option<String>,
     /// A proposal to edit before accepting it. The event loop hands the terminal to $EDITOR.
@@ -242,22 +305,21 @@ struct App {
     preview: Option<AddPreview>,
     mission: Option<MissionForm>,
     edit: Option<ProjectEdit>,
-    /// The missions view: whose, its missions, the selected one, how far its journal scrolled.
-    missions_project: String,
-    missions: Vec<Mission>,
-    missions_sel: usize,
-    journal_scroll: u16,
     /// The session to stop once confirmed, and the view to go back to.
     stop_target: Option<(String, Mode)>,
     /// The daemon binary on disk is newer than the running daemon.
     newer_build: bool,
-    /// The board's focused column: 0 projects, 1 work (lead, missions), 2 agents.
-    focus: usize,
-    work_sel: usize,
-    agent_sel: usize,
     talk_to: Option<TalkTo>,
     /// The live pane: whose screen, and its text.
     peek: Option<(String, String)>,
+    /// The session the keyboard is in (Mode::Live).
+    live_id: Option<String>,
+    /// The live pane's inner size (columns, rows) when last drawn.
+    live_size: std::cell::Cell<(u16, u16)>,
+    /// How many lines the live pane is scrolled back into the session's history.
+    live_scroll: u16,
+    /// Where things were drawn, for the mouse: each area and what it is.
+    hits: std::cell::RefCell<Vec<(Rect, Hit)>>,
     last_peek: Instant,
     inbox_sel: usize,
     /// The rules as they apply where the rules view sets them.
@@ -276,11 +338,30 @@ struct App {
     last_refresh: Instant,
 }
 
+/// Takes over the terminal, with the mouse: the wheel scrolls what is under the pointer, and
+/// a click selects. (Hold Option, or Shift in most terminals, to select text.)
+fn init_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    );
+    terminal
+}
+
+fn restore_terminal() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
+    );
+    ratatui::restore();
+}
+
 pub fn run(client: Client, data_dir: PathBuf) -> Result<()> {
     let mut app = App::new(client, data_dir)?;
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
     let result = event_loop(&mut terminal, &mut app);
-    ratatui::restore();
+    restore_terminal();
     result
 }
 
@@ -290,11 +371,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if app.quit {
             return Ok(());
         }
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
-                }
+        // In a session's pane, keep the screen close to what is typed.
+        let live = app.mode == Mode::Live;
+        if event::poll(Duration::from_millis(if live { 30 } else { 250 }))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Event::Mouse(m) => app.on_mouse(m),
+                _ => {}
             }
         }
         if let Some(id) = app.pending_edit.take() {
@@ -304,9 +387,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 .get(&id)
                 .map(|p| p.text.clone())
                 .unwrap_or_default();
-            ratatui::restore();
+            restore_terminal();
             let edited = crate::edit_text(&text);
-            *terminal = ratatui::init();
+            *terminal = init_terminal();
             terminal.clear()?;
             match app.report(edited) {
                 Some(Some(text)) => app.accept_proposal(&id, Some(text)),
@@ -315,9 +398,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             }
         }
         if let Some((project, path, file)) = app.pending_file.take() {
-            ratatui::restore();
+            restore_terminal();
             let edited = crate::edit_file(&path);
-            *terminal = ratatui::init();
+            *terminal = init_terminal();
             terminal.clear()?;
             if let Some(changed) = app.report(edited) {
                 app.after_editing(&project, &path, file, changed);
@@ -325,9 +408,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if let Some(id) = app.pending_attach.take() {
             // Give the terminal to the session until the user detaches, then redraw.
-            ratatui::restore();
+            restore_terminal();
+            // Start from a clean screen, so the session's first lines are not drawn over ours.
+            print!("\x1b[2J\x1b[H");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             let r = crate::attach(&mut app.client, &id, &app.data_dir);
-            *terminal = ratatui::init();
+            *terminal = init_terminal();
             terminal.clear()?;
             if app.report(r).is_some() {
                 app.flash = format!("detached from {id}");
@@ -335,7 +421,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             let r = app.refresh();
             app.report(r);
         }
-        if app.last_peek.elapsed() >= PEEK_EVERY {
+        if app.last_peek.elapsed() >= if live { LIVE_PEEK_EVERY } else { PEEK_EVERY } {
             app.refresh_peek();
         }
         if app.last_refresh.elapsed() >= REFRESH_EVERY {
@@ -362,8 +448,15 @@ impl App {
             last_refresh: Instant::now(),
             attention: Vec::new(),
             sessions: Vec::new(),
-            session_depths: Vec::new(),
-            sessions_sel: 0,
+            col: 0,
+            col1_key: String::new(),
+            col1_at: 0,
+            col2_key: String::new(),
+            col2_at: 0,
+            tiles: Default::default(),
+            open: Default::default(),
+            journals: Default::default(),
+            detail_scroll: 0,
             pending_attach: None,
             pending_edit: None,
             proposals: Default::default(),
@@ -372,17 +465,14 @@ impl App {
             preview: None,
             mission: None,
             edit: None,
-            missions_project: String::new(),
-            missions: Vec::new(),
-            missions_sel: 0,
-            journal_scroll: 0,
             stop_target: None,
             newer_build: false,
-            focus: 0,
-            work_sel: 0,
-            agent_sel: 0,
             talk_to: None,
             peek: None,
+            live_id: None,
+            live_size: std::cell::Cell::new((0, 0)),
+            live_scroll: 0,
+            hits: Default::default(),
             last_peek: Instant::now(),
             inbox_sel: 0,
             rules: Vec::new(),
@@ -444,14 +534,10 @@ impl App {
             .and_then(|v| serde_json::from_value::<ProposalList>(v).ok())
             .map(|l| l.proposals.into_iter().map(|p| (p.id.clone(), p)).collect())
             .unwrap_or_default();
+        // Ended sessions too: earlier missions are part of the tree.
         let list: SessionList =
-            serde_json::from_value(self.rpc(methods::SESSION_LIST, json!({}))?)?;
-        let (sessions, depths) = session_tree(list.sessions);
-        self.sessions = sessions;
-        self.session_depths = depths;
-        if self.sessions_sel >= self.sessions.len() {
-            self.sessions_sel = self.sessions.len().saturating_sub(1);
-        }
+            serde_json::from_value(self.rpc(methods::SESSION_LIST, json!({"all": true}))?)?;
+        self.sessions = list.sessions;
         if self.inbox_sel >= self.attention.len() {
             self.inbox_sel = self.attention.len().saturating_sub(1);
         }
@@ -459,20 +545,7 @@ impl App {
             self.daemon_pid = info.pid;
             self.newer_build = corvx_client::newer_build_on_disk(&info);
         }
-        if self.mode == Mode::Missions {
-            self.load_missions();
-        }
-        if let Some(p) = self.selected_project().cloned() {
-            let n = self.work_items(&p.id).len();
-            self.work_sel = self.work_sel.min(n.saturating_sub(1));
-            let a = self.board_agents().len();
-            self.agent_sel = self.agent_sel.min(a.saturating_sub(1));
-            if self.focus == 2 && a == 0 {
-                self.focus = 1;
-            }
-        } else {
-            self.focus = 0;
-        }
+        self.settle_selection();
         self.connected = true;
         self.last_refresh = Instant::now();
         Ok(())
@@ -493,6 +566,10 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if self.mode == Mode::Live {
+            self.key_live(key);
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
             self.toggle_palette();
             return;
@@ -506,16 +583,15 @@ impl App {
             Mode::ConfirmRemove => self.key_confirm(key.code),
             Mode::Help => self.mode = Mode::Normal,
             Mode::Inbox => self.key_inbox(key.code),
-            Mode::Sessions => self.key_sessions(key.code),
             Mode::Answer => self.key_answer(key.code),
             Mode::Deny => self.key_deny(key.code),
             Mode::Reject => self.key_reject(key.code),
             Mode::Rules => self.key_rules(key.code),
             Mode::EditProject => self.key_edit(key.code),
-            Mode::Missions => self.key_missions(key.code),
             Mode::ConfirmStop => self.key_confirm_stop(key.code),
             Mode::Talk => self.key_talk(key.code),
             Mode::AddGoal => self.key_add_goal(key.code),
+            Mode::Live => {}
         }
     }
 
@@ -530,64 +606,73 @@ impl App {
     }
 
     fn key_normal(&mut self, code: KeyCode) {
-        // The board: keys that act on the selected lead, mission or agent.
-        if self.focus > 0 {
-            let selected = self.board_selected();
-            match code {
-                KeyCode::Enter => {
-                    match &selected {
-                        Some(s) if s.state == SessionState::Running => {
-                            self.pending_attach = Some(s.id.clone())
-                        }
-                        Some(s) if s.state == SessionState::Lost => {
-                            self.flash = format!("{} was interrupted · R resumes it", s.id)
-                        }
-                        Some(s) => self.flash = format!("{} has ended", crate::display_name(s)),
-                        None => self.start_talk(),
-                    }
-                    return;
-                }
-                KeyCode::Char('x') => {
-                    if let Some(s) = selected {
-                        self.ask_stop(&s, Mode::Normal);
-                    }
-                    return;
-                }
-                KeyCode::Char('c') => {
-                    if let Some(s) = selected {
-                        self.cleanup(&s.id);
-                    }
-                    return;
-                }
-                KeyCode::Char('R') => {
-                    if let Some(s) = selected {
-                        self.resume(&s);
-                    }
-                    return;
-                }
-                KeyCode::Char('A') => {
-                    if let Some(s) = selected {
-                        self.set_autopilot(&s.id, !s.autopilot);
-                    }
-                    return;
-                }
-                _ => {}
-            }
-        }
+        let row = self.selected_row();
+        let session = row.as_ref().and_then(|r| r.session().cloned());
         match code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('j') | KeyCode::Down => self.board_move(1),
-            KeyCode::Char('k') | KeyCode::Up => self.board_move(-1),
-            KeyCode::Right | KeyCode::Tab => self.board_focus(1),
-            KeyCode::Left | KeyCode::BackTab => self.board_focus(-1),
-            KeyCode::Enter if self.focus == 0 => self.board_focus(1),
-            KeyCode::Esc if self.focus > 0 => self.board_focus(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.move_row(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_row(-1),
+            KeyCode::Right if self.col < 2 => self.move_col(1),
+            KeyCode::Left => self.move_col(-1),
+            KeyCode::Esc if self.col > 0 => self.move_col(-1),
+            KeyCode::Char(' ') => {
+                if let Some(r) = row.filter(|r| r.branch) {
+                    self.open.insert(r.key, !r.open);
+                }
+            }
+            KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+            KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+            KeyCode::Char('f') => match &session {
+                Some(s) if s.state == SessionState::Running => {
+                    self.pending_attach = Some(s.id.clone())
+                }
+                _ => self.flash = "f attaches full screen to a running session".into(),
+            },
+            KeyCode::Enter => match (&row, &session) {
+                (_, Some(s)) if s.state == SessionState::Running => self.enter_live(&s.id),
+                (_, Some(s)) if s.state == SessionState::Lost => {
+                    self.flash =
+                        format!("{} was interrupted · R resumes it", crate::display_name(s))
+                }
+                (_, Some(s)) => {
+                    self.flash = format!(
+                        "{} has ended · its journal is on the right",
+                        crate::display_name(s)
+                    )
+                }
+                (Some(r), None) if matches!(r.kind, RowKind::Lead(None)) => self.start_talk(),
+                (Some(r), None) if matches!(r.kind, RowKind::Project) => self.move_col(1),
+                (Some(r), None) if r.branch => {
+                    self.open.insert(r.key.clone(), !r.open);
+                }
+                _ => {}
+            },
             KeyCode::Char('t') => self.start_talk(),
+            KeyCode::Char('x') => match &session {
+                Some(s) => self.ask_stop(s, Mode::Normal),
+                None => self.flash = "select a session to stop it".into(),
+            },
+            KeyCode::Char('c') => match &session {
+                Some(s) => self.cleanup(&s.id),
+                None => self.flash = "select a mission to clean up its worktrees".into(),
+            },
+            KeyCode::Char('R') => match &session {
+                Some(s) => self.resume(s),
+                None => self.flash = "select an interrupted session to resume it".into(),
+            },
+            KeyCode::Char('A') => match &session {
+                Some(s) => self.set_autopilot(&s.id, !s.autopilot),
+                None => self.flash = "select an agent to turn its autopilot on or off".into(),
+            },
             KeyCode::Char('g') => self.start_add_goal(),
             KeyCode::Char('G') => self.edit_knowledge("goals"),
             KeyCode::Char('a') => self.start_add(),
-            KeyCode::Char('d') => self.start_remove(),
+            KeyCode::Char('d') => match &row {
+                Some(r) if matches!(r.kind, RowKind::Project) => self.start_remove(),
+                _ => self.flash = "d removes a project: select the project's row".into(),
+            },
             KeyCode::Char('r') => {
+                self.journals.clear();
                 let r = self.refresh();
                 if self.report(r).is_some() {
                     self.flash = "refreshed".into();
@@ -595,17 +680,526 @@ impl App {
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('i') => self.open_inbox(),
-            KeyCode::Char('s') => self.open_sessions(),
             KeyCode::Char('l') => self.open_rules(),
             KeyCode::Char('o') => self.open_mission(),
             KeyCode::Char('b') => self.edit_knowledge("brief"),
             KeyCode::Char('K') => self.init_knowledge(),
             KeyCode::Char('e') => self.open_edit(),
-            KeyCode::Char('m') => self.open_missions(),
             KeyCode::Char(':') => self.toggle_palette(),
             KeyCode::Esc => self.flash.clear(),
             _ => {}
         }
+    }
+
+    /// Whether a row is open: as you left it, or by default.
+    fn is_open(&self, key: &str, default: bool) -> bool {
+        self.open.get(key).copied().unwrap_or(default)
+    }
+
+    /// The missions column for a project: its lead (or a place for one), its current
+    /// missions, sessions started by hand, and its earlier missions folded under one row.
+    fn col1_rows(&self, project: &str) -> Vec<Row> {
+        let now = now_secs();
+        let mine: Vec<&Session> = self
+            .sessions
+            .iter()
+            .filter(|s| s.project == project)
+            .collect();
+        let row = |kind: RowKind, key: String, depth: usize| Row {
+            key,
+            project: project.to_string(),
+            depth,
+            kind,
+            branch: false,
+            open: false,
+        };
+        let lead = mine
+            .iter()
+            .rev()
+            .find(|s| crate::is_lead(s) && s.state == SessionState::Running)
+            .or_else(|| {
+                mine.iter()
+                    .rev()
+                    .find(|s| crate::is_lead(s) && s.state == SessionState::Lost)
+            })
+            .map(|s| (*s).clone());
+        let mut rows = vec![row(RowKind::Lead(lead), "lead".into(), 0)];
+        let mut missions: Vec<&Session> = mine
+            .iter()
+            .copied()
+            .filter(|s| !crate::is_lead(s) && crate::missions::is_orchestrator(s, &self.sessions))
+            .collect();
+        missions.sort_by_key(|s| {
+            (
+                s.state != SessionState::Running,
+                std::cmp::Reverse(s.started_at),
+            )
+        });
+        let current = |s: &Session| {
+            matches!(s.state, SessionState::Running | SessionState::Lost)
+                || s.ended_at.unwrap_or(now) > now - RECENT_SECS
+        };
+        for m in missions.iter().filter(|s| current(s)) {
+            rows.push(row(
+                RowKind::Mission((*m).clone()),
+                format!("s:{}", m.id),
+                0,
+            ));
+        }
+        for s in mine.iter().filter(|s| {
+            s.supervisor.is_none()
+                && matches!(s.state, SessionState::Running | SessionState::Lost)
+                && !crate::is_lead(s)
+                && !crate::missions::is_orchestrator(s, &self.sessions)
+        }) {
+            rows.push(row(RowKind::Loose((*s).clone()), format!("s:{}", s.id), 0));
+        }
+        let earlier: Vec<&&Session> = missions.iter().filter(|s| !current(s)).collect();
+        if !earlier.is_empty() {
+            let key = format!("h:{project}");
+            let open = self.is_open(&key, false);
+            rows.push(Row {
+                branch: true,
+                open,
+                ..row(RowKind::History(earlier.len()), key, 0)
+            });
+            if open {
+                for m in earlier {
+                    rows.push(row(
+                        RowKind::Mission((**m).clone()),
+                        format!("s:{}", m.id),
+                        1,
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    /// The agents column: with a project selected, every agent working on it now; with a
+    /// lead, mission or session selected, the agents under it (and theirs).
+    fn col2_rows(&self) -> Vec<Row> {
+        let Some(p) = self.selected_project() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        let agent_row = |s: &Session, depth: usize| Row {
+            key: s.id.clone(),
+            project: s.project.clone(),
+            depth,
+            kind: RowKind::Agent(s.clone()),
+            branch: false,
+            open: false,
+        };
+        if self.col == 0 {
+            for s in self.sessions.iter().filter(|s| {
+                s.project == p.id
+                    && s.supervisor.is_some()
+                    && s.state == SessionState::Running
+                    && !crate::missions::is_orchestrator(s, &self.sessions)
+            }) {
+                rows.push(agent_row(s, 0));
+            }
+            return rows;
+        }
+        let Some(parent) = self.col1_row().and_then(|r| r.session().cloned()) else {
+            return rows;
+        };
+        // A lead's missions have their own row in the missions column.
+        let lead = crate::is_lead(&parent);
+        fn walk<'a>(
+            all: &'a [Session],
+            parent: &str,
+            depth: usize,
+            skip_orchestrators: bool,
+            out: &mut Vec<(&'a Session, usize)>,
+        ) {
+            let mut under: Vec<&Session> = all
+                .iter()
+                .filter(|a| a.supervisor.as_deref() == Some(parent))
+                .filter(|a| !(skip_orchestrators && crate::missions::is_orchestrator(a, all)))
+                .collect();
+            under.sort_by_key(|a| (a.state != SessionState::Running, a.started_at));
+            for a in under {
+                out.push((a, depth));
+                if depth < 5 {
+                    walk(all, &a.id, depth + 1, false, out);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&self.sessions, &parent.id, 0, lead, &mut found);
+        rows.extend(found.into_iter().map(|(s, d)| agent_row(s, d)));
+        rows
+    }
+
+    fn col1_row(&self) -> Option<Row> {
+        let p = self.selected_project()?;
+        let rows = self.col1_rows(&p.id);
+        rows.iter()
+            .find(|r| r.key == self.col1_key)
+            .or_else(|| rows.get(self.col1_at.min(rows.len().saturating_sub(1))))
+            .cloned()
+    }
+
+    fn col2_row(&self) -> Option<Row> {
+        let rows = self.col2_rows();
+        rows.iter()
+            .find(|r| r.key == self.col2_key)
+            .or_else(|| rows.get(self.col2_at.min(rows.len().saturating_sub(1))))
+            .cloned()
+    }
+
+    /// What the right side shows: the project, or the selection in the focused column.
+    fn selected_row(&self) -> Option<Row> {
+        let p = self.selected_project()?;
+        match self.col {
+            0 => Some(Row {
+                key: format!("p:{}", p.id),
+                project: p.id.clone(),
+                depth: 0,
+                kind: RowKind::Project,
+                branch: false,
+                open: false,
+            }),
+            1 => self.col1_row(),
+            _ => self.col2_row(),
+        }
+    }
+
+    /// Keeps each column's selection on a row that exists.
+    fn settle_selection(&mut self) {
+        if self.selected_project().is_none() {
+            self.col = 0;
+            return;
+        }
+        if let Some(r) = self.col1_row() {
+            let rows = self.col1_rows(&r.project);
+            self.col1_at = rows.iter().position(|x| x.key == r.key).unwrap_or(0);
+            self.col1_key = r.key;
+        }
+        let rows = self.col2_rows();
+        match self.col2_row() {
+            Some(r) => {
+                self.col2_at = rows.iter().position(|x| x.key == r.key).unwrap_or(0);
+                self.col2_key = r.key;
+            }
+            None if self.col == 2 => self.col = 1,
+            None => {}
+        }
+    }
+
+    /// After the selection changed: reset the scroll, read an ended mission's journal,
+    /// and show the new selection's screen.
+    fn selection_changed(&mut self) {
+        self.detail_scroll = 0;
+        self.live_scroll = 0;
+        if let Some(row) = self.selected_row() {
+            if let RowKind::Mission(s) = &row.kind {
+                if s.state != SessionState::Running && !self.journals.contains_key(&row.project) {
+                    let project = row.project.clone();
+                    let entries = self
+                        .rpc(
+                            methods::KNOWLEDGE_READ,
+                            json!({"project": project, "journal": crate::missions::JOURNAL_ENTRIES}),
+                        )
+                        .ok()
+                        .and_then(|v| serde_json::from_value::<Knowledge>(v).ok())
+                        .map(|k| k.journal)
+                        .unwrap_or_default();
+                    self.journals.insert(project, entries);
+                }
+            }
+        }
+        self.refresh_peek();
+    }
+
+    fn move_row(&mut self, delta: i32) {
+        let step =
+            |at: usize, len: usize| (at as i32 + delta).clamp(0, len.max(1) as i32 - 1) as usize;
+        match self.col {
+            0 => {
+                if self.projects.is_empty() {
+                    return;
+                }
+                self.selected = step(self.selected, self.projects.len());
+                self.col1_key.clear();
+                self.col1_at = 0;
+                self.col2_key.clear();
+                self.col2_at = 0;
+            }
+            1 => {
+                let Some(p) = self.selected_project() else {
+                    return;
+                };
+                let rows = self.col1_rows(&p.id);
+                let at = rows
+                    .iter()
+                    .position(|r| r.key == self.col1_key)
+                    .unwrap_or(self.col1_at);
+                let to = step(at, rows.len());
+                if let Some(r) = rows.get(to) {
+                    self.col1_key = r.key.clone();
+                    self.col1_at = to;
+                }
+                self.col2_key.clear();
+                self.col2_at = 0;
+            }
+            _ => {
+                let rows = self.col2_rows();
+                let at = rows
+                    .iter()
+                    .position(|r| r.key == self.col2_key)
+                    .unwrap_or(self.col2_at);
+                let to = step(at, rows.len());
+                if let Some(r) = rows.get(to) {
+                    self.col2_key = r.key.clone();
+                    self.col2_at = to;
+                }
+            }
+        }
+        self.selection_changed();
+    }
+
+    /// Moves the keyboard to the next column to the right (if it has anything) or left.
+    fn move_col(&mut self, delta: i32) {
+        if self.selected_project().is_none() {
+            return;
+        }
+        let to = (self.col as i32 + delta).clamp(0, 2) as usize;
+        if to == 2 && self.col == 1 {
+            // Into the agents of what is selected; nothing there, nothing to move to.
+            let saved = self.col;
+            self.col = 2;
+            let empty = self.col2_rows().is_empty();
+            self.col = saved;
+            if empty {
+                self.flash = "no agents under it".into();
+                return;
+            }
+        }
+        if to == 2 && self.col == 0 {
+            return self.move_col(1);
+        }
+        self.col = to;
+        if to == 2 {
+            self.col2_key.clear();
+            self.col2_at = 0;
+        }
+        self.selection_changed();
+    }
+
+    fn select_project(&mut self, id: &str) {
+        if let Some(i) = self.projects.iter().position(|x| x.id == id) {
+            self.selected = i;
+        }
+        self.col = 0;
+        self.selection_changed();
+    }
+
+    /// Selects a session where it is shown: the lead or a mission in the missions column,
+    /// an agent in the agents column under its mission.
+    fn reveal(&mut self, id: &str) {
+        let Some(s) = self.sessions.iter().find(|s| s.id == id).cloned() else {
+            return;
+        };
+        if let Some(i) = self.projects.iter().position(|p| p.id == s.project) {
+            self.selected = i;
+        }
+        // The topmost session that has a row in the missions column.
+        let mut chain = vec![s.clone()];
+        while let Some(sup) = chain.last().and_then(|x| x.supervisor.clone()) {
+            match self.sessions.iter().find(|x| x.id == sup) {
+                Some(x) => chain.push(x.clone()),
+                None => break,
+            }
+        }
+        let rows = self.col1_rows(&s.project);
+        let key_of = |x: &Session| {
+            if crate::is_lead(x) {
+                "lead".to_string()
+            } else {
+                format!("s:{}", x.id)
+            }
+        };
+        let owner = chain
+            .iter()
+            .find(|x| rows.iter().any(|r| r.key == key_of(x)))
+            .cloned();
+        let owner = match owner {
+            Some(o) => o,
+            None => {
+                // An earlier mission: open the list it is folded in.
+                self.open.insert(format!("h:{}", s.project), true);
+                match chain.iter().find(|x| {
+                    self.col1_rows(&s.project)
+                        .iter()
+                        .any(|r| r.key == key_of(x))
+                }) {
+                    Some(o) => o.clone(),
+                    None => return,
+                }
+            }
+        };
+        self.col1_key = key_of(&owner);
+        self.col1_at = 0;
+        if owner.id == s.id {
+            self.col = 1;
+        } else {
+            self.col = 2;
+            self.col2_key = s.id.clone();
+            self.col2_at = 0;
+        }
+        self.selection_changed();
+    }
+
+    /// The wheel scrolls what is under the pointer: a column moves its selection, the live
+    /// pane scrolls back through the session's history. A click selects.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        if !matches!(self.mode, Mode::Normal | Mode::Live) {
+            return;
+        }
+        let hit = self
+            .hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(r, _)| {
+                m.column >= r.x
+                    && m.column < r.x + r.width
+                    && m.row >= r.y
+                    && m.row < r.y + r.height
+            })
+            .map(|(_, h)| h.clone());
+        let Some(hit) = hit else {
+            return;
+        };
+        let column = match &hit {
+            Hit::Column(c) => Some(*c),
+            Hit::Project(_) => Some(0),
+            Hit::Mission(_) => Some(1),
+            Hit::Agent(_) => Some(2),
+            Hit::Live => None,
+        };
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = m.kind == MouseEventKind::ScrollUp;
+                match column {
+                    None => {
+                        self.live_scroll = if up {
+                            self.live_scroll.saturating_add(3)
+                        } else {
+                            self.live_scroll.saturating_sub(3)
+                        };
+                        self.refresh_peek();
+                    }
+                    Some(c) if self.mode == Mode::Normal => {
+                        if c != self.col && (c < 2 || !self.col2_rows().is_empty()) {
+                            self.col = c;
+                        }
+                        self.move_row(if up { -1 } else { 1 });
+                    }
+                    Some(_) => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if hit != Hit::Live && self.mode == Mode::Live {
+                    self.mode = Mode::Normal;
+                    self.live_id = None;
+                }
+                match hit {
+                    Hit::Project(i) => {
+                        self.selected = i;
+                        self.col = 0;
+                        self.col1_key.clear();
+                        self.col2_key.clear();
+                        self.selection_changed();
+                    }
+                    Hit::Mission(key) => {
+                        if self.col1_key == key && key.starts_with("h:") {
+                            let open = self.is_open(&key, false);
+                            self.open.insert(key.clone(), !open);
+                        }
+                        self.col = 1;
+                        self.col1_key = key;
+                        self.col2_key.clear();
+                        self.selection_changed();
+                    }
+                    Hit::Agent(id) => {
+                        self.col = 2;
+                        self.col2_key = id;
+                        self.selection_changed();
+                    }
+                    Hit::Live => {
+                        if let Some(s) = self.selected_row().and_then(|r| r.session().cloned()) {
+                            if s.state == SessionState::Running && self.mode != Mode::Live {
+                                self.enter_live(&s.id);
+                            }
+                        }
+                    }
+                    Hit::Column(c) => {
+                        if c != self.col {
+                            self.move_col(c as i32 - self.col as i32);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves the keyboard into a session's pane. The session gets the pane's size, so what
+    /// it draws fits.
+    fn enter_live(&mut self, id: &str) {
+        let (cols, rows) = self.live_size.get();
+        if cols > 10 && rows > 3 {
+            // (Best effort: a session that cannot be resized is still usable.)
+            let _ = self.rpc(
+                methods::SESSION_RESIZE,
+                json!({"id": id, "cols": cols, "rows": rows}),
+            );
+        }
+        self.live_id = Some(id.to_string());
+        self.mode = Mode::Live;
+        self.flash.clear();
+        self.refresh_peek();
+    }
+
+    /// Keys in a session's pane go to the session; Ctrl+\ comes back to the columns.
+    fn key_live(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4')) {
+            self.mode = Mode::Normal;
+            self.live_id = None;
+            self.flash = "back in the columns · Enter goes into the pane again".into();
+            return;
+        }
+        let Some(id) = self.live_id.clone() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let Some(bytes) = key_bytes(key.code, ctrl, alt) else {
+            return;
+        };
+        // Typing brings the pane back to the present.
+        self.live_scroll = 0;
+        let r = self.rpc(methods::SESSION_INPUT, json!({"id": id, "data": bytes}));
+        if self.report(r).is_none() {
+            // It ended, or the daemon went away: back to the columns.
+            self.mode = Mode::Normal;
+            self.live_id = None;
+            return;
+        }
+        self.refresh_peek();
+    }
+
+    /// Whose screen the detail pane shows live: the selected running session.
+    fn peek_target(&self) -> Option<String> {
+        self.selected_row()
+            .and_then(|r| r.session().cloned())
+            .filter(|s| s.state == SessionState::Running)
+            .map(|s| s.id)
     }
 
     fn key_answer(&mut self, code: KeyCode) {
@@ -821,223 +1415,51 @@ impl App {
         }
     }
 
-    fn open_sessions(&mut self) {
-        self.mode = Mode::Sessions;
-        self.flash.clear();
-    }
-
-    /// Resumes the selected session, and the lost agents under it.
-    fn resume_selected(&mut self) {
-        let Some(s) = self.sessions.get(self.sessions_sel).cloned() else {
-            return;
-        };
-        if s.state == SessionState::Running {
-            self.flash = format!("{} is running", crate::display_name(&s));
-            return;
-        }
-        let r = self.rpc(methods::SESSION_RESUME, json!({"id": s.id}));
-        if let Some(v) = self.report(r) {
-            let n = v["sessions"].as_array().map(Vec::len).unwrap_or(0);
-            self.flash = match n {
-                0 | 1 => format!("resumed {}", crate::display_name(&s)),
-                n => format!(
-                    "resumed {} and {} agent(s) under it",
-                    crate::display_name(&s),
-                    n - 1
-                ),
-            };
-            let r = self.refresh();
-            self.report(r);
-        }
-    }
-
-    fn key_sessions(&mut self, code: KeyCode) {
-        let max = self.sessions.len().saturating_sub(1);
-        match code {
-            KeyCode::Esc | KeyCode::Char('s') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.sessions_sel = (self.sessions_sel + 1).min(max)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.sessions_sel = self.sessions_sel.saturating_sub(1)
-            }
-            KeyCode::Enter => match self.sessions.get(self.sessions_sel) {
-                Some(s) if s.state == SessionState::Running => {
-                    self.pending_attach = Some(s.id.clone());
-                }
-                Some(s) if s.state == SessionState::Lost => {
-                    self.flash = format!("{} was interrupted · R resumes it", s.id)
-                }
-                Some(s) => self.flash = format!("{} has ended; nothing to attach to", s.id),
-                None => {}
-            },
-            KeyCode::Char('R') => self.resume_selected(),
-            KeyCode::Char('a') => {
-                if let Some(s) = self.sessions.get(self.sessions_sel).cloned() {
-                    self.set_autopilot(&s.id, !s.autopilot);
-                }
-            }
-            KeyCode::Char('x') => {
-                if let Some(s) = self.sessions.get(self.sessions_sel).cloned() {
-                    self.ask_stop(&s, Mode::Sessions);
-                }
-            }
-            KeyCode::Char('c') => {
-                if let Some(id) = self.sessions.get(self.sessions_sel).map(|s| s.id.clone()) {
-                    self.cleanup(&id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The board's work column for a project: its lead (or a place for one) first, then its
-    /// missions (running ones first, then the newest), then sessions started by hand.
-    fn work_items(&self, project: &str) -> Vec<WorkItem> {
-        let mine: Vec<&Session> = self
-            .sessions
-            .iter()
-            .filter(|s| s.project == project)
-            .collect();
-        let mut items = Vec::new();
-        let lead = mine
-            .iter()
-            .rev()
-            .find(|s| crate::is_lead(s) && s.state == SessionState::Running)
-            .or_else(|| mine.iter().rev().find(|s| crate::is_lead(s)));
-        items.push(WorkItem {
-            session: lead.map(|s| (*s).clone()),
-            kind: "lead",
-        });
-        let mut missions: Vec<&Session> = mine
-            .iter()
-            .copied()
-            .filter(|s| !crate::is_lead(s) && crate::missions::is_orchestrator(s, &self.sessions))
-            .collect();
-        missions.sort_by_key(|s| {
-            (
-                s.state != SessionState::Running,
-                std::cmp::Reverse(s.started_at),
-            )
-        });
-        items.extend(missions.into_iter().map(|s| WorkItem {
-            session: Some(s.clone()),
-            kind: "mission",
-        }));
-        items.extend(
-            mine.iter()
-                .filter(|s| {
-                    s.supervisor.is_none()
-                        && s.state == SessionState::Running
-                        && !crate::is_lead(s)
-                        && !crate::missions::is_orchestrator(s, &self.sessions)
-                })
-                .map(|s| WorkItem {
-                    session: Some((*s).clone()),
-                    kind: "session",
-                }),
-        );
-        items
-    }
-
-    /// The sessions under the selected work item.
-    fn board_agents(&self) -> Vec<Session> {
-        let Some(p) = self.selected_project() else {
-            return Vec::new();
-        };
-        let items = self.work_items(&p.id);
-        let Some(parent) = items
-            .get(self.work_sel)
-            .and_then(|i| i.session.as_ref())
-            .map(|s| s.id.clone())
-        else {
-            return Vec::new();
-        };
-        let mut agents: Vec<Session> = self
-            .sessions
-            .iter()
-            .filter(|s| s.supervisor.as_deref() == Some(parent.as_str()))
-            .cloned()
-            .collect();
-        agents.sort_by_key(|s| (s.state != SessionState::Running, s.started_at));
-        agents
-    }
-
-    /// The session the focused board column has selected.
-    fn board_selected(&self) -> Option<Session> {
-        let p = self.selected_project()?;
-        match self.focus {
-            1 => self.work_items(&p.id).get(self.work_sel)?.session.clone(),
-            2 => self.board_agents().get(self.agent_sel).cloned(),
-            _ => None,
-        }
-    }
-
-    /// Whose screen the live pane shows: the selection, or with the projects column
-    /// focused, the project's first running lead or mission.
-    fn peek_target(&self) -> Option<String> {
-        let p = self.selected_project()?;
-        match self.focus {
-            0 => self
-                .work_items(&p.id)
-                .into_iter()
-                .filter_map(|i| i.session)
-                .find(|s| s.state == SessionState::Running)
-                .map(|s| s.id),
-            _ => self.board_selected().map(|s| s.id),
-        }
-    }
-
     fn refresh_peek(&mut self) {
         self.last_peek = Instant::now();
-        if !matches!(self.mode, Mode::Normal | Mode::Talk) {
+        if !matches!(
+            self.mode,
+            Mode::Normal | Mode::Talk | Mode::Live | Mode::ConfirmStop
+        ) {
             return;
+        }
+        // The agent tiles: the last lines of each running agent's screen. Not while you type
+        // in a pane, when only that screen needs to keep up.
+        if self.mode != Mode::Live {
+            let ids: Vec<String> = self
+                .col2_rows()
+                .into_iter()
+                .filter_map(|r| r.session().cloned())
+                .filter(|s| s.state == SessionState::Running)
+                .map(|s| s.id)
+                .take(8)
+                .collect();
+            for id in ids {
+                if let Ok(v) = self.rpc(methods::SESSION_SCREEN, json!({"id": id})) {
+                    let text = v["text"].as_str().unwrap_or_default();
+                    self.tiles.insert(id, tile_lines(text));
+                }
+            }
         }
         let Some(id) = self.peek_target() else {
             self.peek = None;
             return;
         };
-        // (Quietly: the pane says when it has nothing to show.)
-        if let Ok(v) = self.rpc(methods::SESSION_SCREEN, json!({"id": id})) {
+        // (Quietly: the pane says when it has nothing to show.) In colour, and with enough
+        // history above the screen when scrolled back.
+        let rows = u32::from(self.live_size.get().1.max(10));
+        let history = if self.live_scroll > 0 {
+            u32::from(self.live_scroll) + rows
+        } else {
+            0
+        };
+        if let Ok(v) = self.rpc(
+            methods::SESSION_SCREEN,
+            json!({"id": id, "ansi": true, "history": history}),
+        ) {
             let text = v["text"].as_str().unwrap_or_default().to_string();
             self.peek = Some((id, text));
         }
-    }
-
-    fn board_move(&mut self, delta: i32) {
-        let step = |at: usize, len: usize| -> usize {
-            if len == 0 {
-                0
-            } else {
-                (at as i32 + delta).clamp(0, len as i32 - 1) as usize
-            }
-        };
-        match self.focus {
-            0 => {
-                self.move_sel(delta);
-                self.work_sel = 0;
-                self.agent_sel = 0;
-            }
-            1 => {
-                let n = self
-                    .selected_project()
-                    .map(|p| self.work_items(&p.id).len())
-                    .unwrap_or(0);
-                self.work_sel = step(self.work_sel, n);
-                self.agent_sel = 0;
-            }
-            _ => self.agent_sel = step(self.agent_sel, self.board_agents().len()),
-        }
-        self.refresh_peek();
-    }
-
-    fn board_focus(&mut self, delta: i32) {
-        if self.selected_project().is_none() {
-            return;
-        }
-        let max = if self.board_agents().is_empty() { 1 } else { 2 };
-        self.focus = (self.focus as i32 + delta).clamp(0, max) as usize;
-        self.refresh_peek();
     }
 
     /// Opens the message line: to the selected session, or to the project's lead.
@@ -1046,7 +1468,7 @@ impl App {
             self.flash = "add a project first: a".into();
             return;
         };
-        let target = match self.board_selected() {
+        let target = match self.selected_row().and_then(|r| r.session().cloned()) {
             Some(s) if s.state == SessionState::Running => TalkTo::Session(s.id),
             Some(s) if crate::is_lead(&s) => TalkTo::Lead(p.id),
             Some(s) => {
@@ -1271,98 +1693,6 @@ impl App {
         self.report(r);
     }
 
-    fn open_missions(&mut self) {
-        let Some(p) = self.selected_project().cloned() else {
-            self.flash = "add a project first: a".into();
-            return;
-        };
-        if self.missions_project != p.id {
-            self.missions_sel = 0;
-            self.journal_scroll = 0;
-        }
-        self.missions_project = p.id;
-        self.mode = Mode::Missions;
-        self.flash.clear();
-        self.load_missions();
-    }
-
-    fn load_missions(&mut self) {
-        // Keep the same mission selected as the list changes.
-        let selected = self
-            .missions
-            .get(self.missions_sel)
-            .and_then(|m| m.session.as_ref().map(|s| s.id.clone()));
-        let project = self.missions_project.clone();
-        let r = crate::load_missions(&mut self.client, &project);
-        if let Some(list) = self.report(r) {
-            self.missions = list;
-        }
-        if let Some(i) = selected.and_then(|id| {
-            self.missions
-                .iter()
-                .position(|m| m.session.as_ref().is_some_and(|s| s.id == id))
-        }) {
-            self.missions_sel = i;
-        }
-        self.missions_sel = self.missions_sel.min(self.missions.len().saturating_sub(1));
-    }
-
-    fn key_missions(&mut self, code: KeyCode) {
-        let max = self.missions.len().saturating_sub(1);
-        let selected = self.missions.get(self.missions_sel).cloned();
-        let session = selected.as_ref().and_then(|m| m.session.clone());
-        match code {
-            KeyCode::Esc | KeyCode::Char('m') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.missions_sel = (self.missions_sel + 1).min(max);
-                self.journal_scroll = 0;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.missions_sel = self.missions_sel.saturating_sub(1);
-                self.journal_scroll = 0;
-            }
-            KeyCode::Char('J') | KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.journal_scroll = self.journal_scroll.saturating_add(10)
-            }
-            KeyCode::Char('K') | KeyCode::PageUp => {
-                self.journal_scroll = self.journal_scroll.saturating_sub(10)
-            }
-            KeyCode::Enter => match &session {
-                Some(s) if s.state == SessionState::Running => {
-                    self.pending_attach = Some(s.id.clone())
-                }
-                Some(s) if s.state == SessionState::Lost => {
-                    self.flash = format!("{} was interrupted · R resumes it", s.id)
-                }
-                _ => self.flash = "it has ended · its journal entry is shown below".into(),
-            },
-            KeyCode::Char('R') => match &session {
-                Some(s) if s.state == SessionState::Lost => {
-                    let r = self.rpc(methods::SESSION_RESUME, json!({"id": s.id}));
-                    if self.report(r).is_some() {
-                        self.flash = format!("resumed {} and its interrupted agents", s.id);
-                        let r = self.refresh();
-                        self.report(r);
-                    }
-                }
-                _ => self.flash = "only an interrupted mission can be resumed".into(),
-            },
-            KeyCode::Char('x') => match &session {
-                Some(s) => self.ask_stop(s, Mode::Missions),
-                None => self.flash = "nothing to stop".into(),
-            },
-            KeyCode::Char('c') => match &session {
-                Some(s) => {
-                    let id = s.id.clone();
-                    self.cleanup(&id);
-                }
-                None => self.flash = "nothing to clean up".into(),
-            },
-            KeyCode::Char('o') => self.open_mission(),
-            _ => {}
-        }
-    }
-
     /// Opens the form that renames the selected project or changes its workspace.
     fn open_edit(&mut self) {
         let Some(p) = self.selected_project().cloned() else {
@@ -1539,8 +1869,6 @@ impl App {
             KeyCode::Char('a') => {
                 self.attention_action(methods::ATTENTION_ACK, json!({}), "acknowledged")
             }
-            // s goes to the sessions view, as it does from the main view.
-            KeyCode::Char('s') => self.open_sessions(),
             KeyCode::Char('z') => self.attention_action(
                 methods::ATTENTION_SNOOZE,
                 json!({"minutes": 15}),
@@ -1645,27 +1973,16 @@ impl App {
                 json!({"reason": "dismissed in the terminal UI"}),
                 "dismissed",
             ),
-            // Enter attaches to the agent the item is about, e.g. to approve a request.
-            KeyCode::Enter => {
-                if let Some(item) = self.attention.get(self.inbox_sel) {
-                    let running = self
-                        .sessions
-                        .iter()
-                        .any(|s| s.id == item.session_id && s.state == SessionState::Running);
-                    if running {
-                        self.pending_attach = Some(item.session_id.clone());
-                    } else {
-                        self.flash = format!("{} has ended; nothing to attach to", item.session_id);
-                    }
-                }
-            }
-            KeyCode::Char('p') => {
-                if let Some(item) = self.attention.get(self.inbox_sel) {
-                    let project = item.project.clone();
-                    if let Some(i) = self.projects.iter().position(|p| p.id == project) {
-                        self.selected = i;
-                    }
+            // Enter shows the session the item is about in the tree, with its screen live.
+            KeyCode::Enter | KeyCode::Char('p') => {
+                if let Some(item) = self.attention.get(self.inbox_sel).cloned() {
                     self.mode = Mode::Normal;
+                    if self.sessions.iter().any(|s| s.id == item.session_id) {
+                        self.reveal(&item.session_id);
+                    } else {
+                        let project = item.project.clone();
+                        self.select_project(&project);
+                    }
                 }
             }
             _ => {}
@@ -1811,12 +2128,6 @@ impl App {
                 self.add_project(&preview);
             }
             _ => {}
-        }
-    }
-
-    fn select_project(&mut self, id: &str) {
-        if let Some(i) = self.projects.iter().position(|x| x.id == id) {
-            self.selected = i;
         }
     }
 
@@ -2020,18 +2331,9 @@ impl App {
         let id = started.session.id;
         let r = self.refresh();
         self.report(r);
-        // Select the new mission on the board, where its agents will show up.
+        // Select the new mission in the tree; its agents show up under it.
         self.mode = Mode::Normal;
-        self.focus = 1;
-        if let Some(i) = self
-            .work_items(&m.project)
-            .iter()
-            .position(|w| w.session.as_ref().is_some_and(|s| s.id == id))
-        {
-            self.work_sel = i;
-        }
-        self.agent_sel = 0;
-        self.refresh_peek();
+        self.reveal(&id);
         self.flash = format!(
             "started orchestrator {id} on {model} ({level}) · live on the right · Enter attaches · t redirects it"
         );
@@ -2089,7 +2391,6 @@ impl App {
             Action::EditConventions => self.edit_knowledge("conventions"),
             Action::EditProject => self.open_edit(),
             Action::Rescan => self.rescan(),
-            Action::Missions => self.open_missions(),
             Action::RemoveProject => self.start_remove(),
             Action::Refresh => {
                 let r = self.refresh();
@@ -2097,13 +2398,12 @@ impl App {
             }
             Action::RestartDaemon => self.restart_daemon(),
             Action::TalkToLead => {
-                self.focus = 0;
+                self.col = 0;
                 self.start_talk();
             }
             Action::AddGoal => self.start_add_goal(),
             Action::EditGoals => self.edit_knowledge("goals"),
             Action::Inbox => self.open_inbox(),
-            Action::Sessions => self.open_sessions(),
             Action::Help => self.mode = Mode::Help,
             Action::Quit => self.quit = true,
         }
@@ -2121,15 +2421,6 @@ impl App {
         } else {
             self.mode = Mode::ConfirmRemove;
         }
-    }
-
-    fn move_sel(&mut self, delta: i32) {
-        if self.projects.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        let max = self.projects.len() as i32 - 1;
-        self.selected = (self.selected as i32 + delta).clamp(0, max) as usize;
     }
 
     fn add_project(&mut self, preview: &AddPreview) {
@@ -2321,20 +2612,32 @@ fn draw(f: &mut Frame, app: &App) {
     ])
     .areas(f.area());
 
+    app.hits.borrow_mut().clear();
     draw_top(f, top, app);
-    let [rail, main] = Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body);
-    draw_rail(f, rail, app);
+    // The inbox and the rules span every project: they get all the room beside the
+    // projects.
+    let wide_view = matches!(
+        app.mode,
+        Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject | Mode::Rules
+    );
+    let main = if wide_view {
+        let [projects, rest] = Layout::horizontal([
+            Constraint::Length((body.width / 8).clamp(14, 22)),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        draw_projects(f, projects, app);
+        rest
+    } else {
+        draw_columns(f, body, app)
+    };
     match app.mode {
         Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject => draw_inbox(f, main, app),
-        Mode::Sessions => draw_sessions(f, main, app),
         Mode::Rules => draw_rules(f, main, app),
-        Mode::Missions => draw_missions(f, main, app),
-        Mode::ConfirmStop => match app.stop_target.as_ref().map(|(_, back)| *back) {
-            Some(Mode::Missions) => draw_missions(f, main, app),
-            Some(Mode::Normal) => draw_main(f, main, app),
-            _ => draw_sessions(f, main, app),
-        },
-        _ => draw_main(f, main, app),
+        Mode::AddPreview if app.preview.is_some() => {
+            draw_preview(f, main, app.preview.as_ref().unwrap())
+        }
+        _ => draw_detail(f, main, app),
     }
     draw_status(f, status, app);
     draw_input(f, input, app);
@@ -2349,279 +2652,84 @@ fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_top(f: &mut Frame, area: Rect, app: &App) {
-    let daemon = if app.connected {
-        Span::styled(
-            format!("● corvxd pid {}", app.daemon_pid),
-            Style::default().fg(GREEN),
-        )
-    } else {
-        Span::styled(
-            "◌ daemon disconnected · retrying",
-            Style::default().fg(AMBER),
-        )
-    };
-    let line = Line::from(vec![
-        Span::styled(
-            " CORVX ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" projects {}   ", app.projects.len()),
-            Style::default().fg(DIM),
-        ),
-        Span::styled(
-            format!("{} to approve  ", count_yours_to_approve(app)),
-            Style::default().fg(AMBER),
-        ),
-        Span::styled(
-            match count_kind(app, "approval") - count_yours_to_approve(app) {
-                0 => String::new(),
-                n => format!("({n} with orchestrators)  "),
-            },
-            Style::default().fg(DIM),
-        ),
-        Span::styled(
-            format!(
-                "{} blocked  ",
-                count_kind(app, "blocked") + count_kind(app, "question")
-            ),
-            Style::default().fg(AMBER),
-        ),
-        Span::styled(
-            format!("{} waiting  ", count_kind(app, "waiting")),
-            Style::default().fg(ACCENT),
-        ),
-        Span::styled(
-            format!("{} done  ", count_kind(app, "done")),
-            Style::default().fg(GREEN),
-        ),
-        Span::styled(
-            format!("{} failed   ", count_kind(app, "failed")),
-            Style::default().fg(RED),
-        ),
-        daemon,
-        Span::styled(
-            if app.newer_build && app.connected {
-                "  ↻ newer build: restart it from : (sessions keep running)"
-            } else {
-                ""
-            },
-            Style::default().fg(AMBER),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-    let mut last_ws: Option<&str> = None;
-    for (i, p) in app.projects.iter().enumerate() {
-        if last_ws != Some(p.workspace.as_str()) {
-            lines.push(Line::styled(
-                p.workspace.to_uppercase(),
-                Style::default().fg(DIM),
-            ));
-            last_ws = Some(p.workspace.as_str());
-        }
-        let selected = i == app.selected;
-        let (marker, style) = if selected {
-            (
-                "▸ ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    // Counts are chips: coloured when there is something, quiet when there is not.
+    let chip = |n: usize, what: &str, color: Color| {
+        if n > 0 {
+            Span::styled(
+                format!(" {n} {what} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
-            ("  ", Style::default())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{}", p.id), style),
-            Span::styled(
-                format!("  {}", p.stack.first().map(String::as_str).unwrap_or("-")),
-                Style::default().fg(DIM),
-            ),
-            Span::styled(
-                match app.attention.iter().filter(|i| i.project == p.id).count() {
-                    0 => String::new(),
-                    n => format!("  !{n}"),
-                },
-                Style::default().fg(AMBER),
-            ),
-        ]));
-    }
-    if app.projects.is_empty() {
-        lines.push(Line::styled("none yet", Style::default().fg(DIM)));
-    }
-    let block = Block::bordered()
-        .title(" projects ")
-        .border_style(Style::default().fg(BORDER));
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn draw_main(f: &mut Frame, area: Rect, app: &App) {
-    if app.mode == Mode::AddPreview {
-        if let Some(p) = &app.preview {
-            draw_preview(f, area, p);
-            return;
+            Span::styled(format!(" {n} {what} "), Style::default().fg(DIM))
         }
-    }
-    let Some(p) = app.selected_project() else {
-        let block = Block::bordered()
-            .title(" project ")
-            .border_style(Style::default().fg(BORDER));
-        f.render_widget(Paragraph::new(welcome_lines()).block(block), area);
-        return;
     };
-    let [head, columns] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
-    draw_project_head(f, head, app, p);
-
-    let wide = columns.width >= 100;
-    let [work, agents, live] = if wide {
-        // The live pane gets the most room: agents' screens are wide.
-        let side = (columns.width / 4).clamp(26, 36);
-        Layout::horizontal([
-            Constraint::Length(side),
-            Constraint::Length(side),
-            Constraint::Min(0),
-        ])
-        .areas(columns)
-    } else {
-        let [a, b] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(columns);
-        [a, b, Rect::default()]
-    };
-    let border = |col: usize| Style::default().fg(if app.focus == col { ACCENT } else { BORDER });
-    let items = app.work_items(&p.id);
-    let needs = |id: &str| app.attention.iter().filter(|i| i.session_id == id).count();
-    let row_width = |r: Rect| (r.width as usize).saturating_sub(4);
-
-    // The work column: lead, missions, sessions; two lines each.
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        let selected = app.focus >= 1 && i == app.work_sel;
-        let marker = if selected { "▸ " } else { "  " };
-        let title_style = if selected {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
+    let mut spans = vec![
+        Span::styled(
+            " ◆ CORVX ",
             Style::default()
-        };
-        let w = row_width(work);
-        match &item.session {
-            None => {
-                lines.push(Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT)),
-                    Span::styled("lead", Style::default().fg(Color::Rgb(188, 140, 255))),
-                    Span::styled(" · not started", Style::default().fg(DIM)),
-                ]));
-                lines.push(Line::styled(
-                    clip("    t talks to the project: goals, next steps", w),
-                    Style::default().fg(DIM),
-                ));
-            }
-            Some(s) => {
-                let name = crate::display_name(s);
-                let name = name
-                    .trim_start_matches("orchestrator · ")
-                    .trim_start_matches(crate::LEAD_LABEL)
-                    .to_string();
-                let tag = match item.kind {
-                    "lead" => Span::styled("lead ", Style::default().fg(Color::Rgb(188, 140, 255))),
-                    "mission" => Span::styled("◆ ", Style::default().fg(ACCENT)),
-                    _ => Span::styled("· ", Style::default().fg(DIM)),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT)),
-                    tag,
-                    Span::styled(clip(&name, w.saturating_sub(7)), title_style),
-                ]));
-                let under = app
-                    .sessions
-                    .iter()
-                    .filter(|a| a.supervisor.as_deref() == Some(s.id.as_str()))
-                    .collect::<Vec<_>>();
-                let running = under
-                    .iter()
-                    .filter(|a| a.state == SessionState::Running)
-                    .count();
-                let mut facts = vec![agent_label(s)];
-                if !under.is_empty() {
-                    facts.push(format!("{running}/{} running", under.len()));
-                }
-                let n = needs(&s.id) + under.iter().map(|a| needs(&a.id)).sum::<usize>();
-                let mut spans = vec![Span::styled(
-                    clip(&format!("    {}", facts.join(" · ")), w),
-                    agent_style(s),
-                )];
-                if n > 0 {
-                    spans.push(Span::styled(format!("  !{n}"), Style::default().fg(AMBER)));
-                }
-                lines.push(Line::from(spans));
-            }
-        }
-    }
-    let per_row = 2usize;
-    let visible = (work.height.saturating_sub(2) as usize / per_row).max(1);
-    let first = app.work_sel.saturating_sub(visible.saturating_sub(1));
-    let lines: Vec<Line> = lines.into_iter().skip(first * per_row).collect();
-    f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" work ").border_style(border(1))),
-        work,
-    );
-
-    // The agents column: what each agent under the selected item is doing.
-    let under = app.board_agents();
-    let selected_item = items.get(app.work_sel).and_then(|i| i.session.clone());
-    let mut lines: Vec<Line> = Vec::new();
-    if under.is_empty() {
-        lines.push(Line::styled(
-            match &selected_item {
-                Some(s) if crate::is_lead(s) => "missions it starts show under work",
-                Some(_) => "no agents (yet)",
-                None => "",
-            },
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        chip(count_yours_to_approve(app), "to approve", AMBER),
+        Span::raw(" "),
+        chip(
+            count_kind(app, "blocked") + count_kind(app, "question"),
+            "blocked",
+            AMBER,
+        ),
+        Span::raw(" "),
+        chip(count_kind(app, "waiting"), "waiting", ACCENT),
+        Span::raw(" "),
+        chip(count_kind(app, "done"), "done", GREEN),
+        Span::raw(" "),
+        chip(count_kind(app, "failed"), "failed", RED),
+    ];
+    let with_orchestrators = count_kind(app, "approval") - count_yours_to_approve(app);
+    if with_orchestrators > 0 {
+        spans.push(Span::styled(
+            format!("  ({with_orchestrators} with orchestrators)"),
             Style::default().fg(DIM),
         ));
     }
-    let w = row_width(agents);
-    for (i, a) in under.iter().enumerate() {
-        let selected = app.focus == 2 && i == app.agent_sel;
-        let name = crate::display_name(a);
-        let name = name
-            .trim_start_matches("agent · ")
-            .trim_start_matches("orchestrator · ");
-        lines.push(Line::from(vec![
+    let left = Line::from(spans);
+    let room = (area.width as usize).saturating_sub(left.width() + 2);
+    f.render_widget(Paragraph::new(left), area);
+    let right = if !app.connected {
+        Line::styled(
+            "◌ daemon disconnected · retrying ",
+            Style::default().fg(AMBER),
+        )
+    } else if app.newer_build {
+        Line::styled(
+            "↻ newer build: restart it from :  ● corvxd ",
+            Style::default().fg(AMBER),
+        )
+    } else {
+        Line::from(vec![
+            Span::styled("● ", Style::default().fg(GREEN)),
             Span::styled(
-                if selected { "▸ " } else { "  " },
-                Style::default().fg(ACCENT),
+                format!(
+                    "corvxd {} · {} projects ",
+                    app.daemon_pid,
+                    app.projects.len()
+                ),
+                Style::default().fg(DIM),
             ),
-            Span::styled(
-                clip(name, w.saturating_sub(2)),
-                if selected {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
-        ]));
-        let n = needs(&a.id);
-        let mut spans = vec![Span::styled(
-            clip(&format!("    {}", agent_label(a)), w),
-            agent_style(a),
-        )];
-        if n > 0 {
-            spans.push(Span::styled(format!("  !{n}"), Style::default().fg(AMBER)));
-        }
-        lines.push(Line::from(spans));
-    }
-    let visible = (agents.height.saturating_sub(2) as usize / 2).max(1);
-    let first = app.agent_sel.saturating_sub(visible.saturating_sub(1));
-    let lines: Vec<Line> = lines.into_iter().skip(first * 2).collect();
-    f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" agents ").border_style(border(2))),
-        agents,
-    );
-
-    if wide {
-        draw_live(f, live, app);
-    }
+        ])
+    };
+    // Only what fits beside the counts; at least the dot.
+    let right = if right.width() <= room {
+        right
+    } else {
+        let color = if app.connected { GREEN } else { AMBER };
+        Line::styled("● ", Style::default().fg(color))
+    };
+    f.render_widget(Paragraph::new(right.right_aligned()), area);
 }
 
 /// Cuts text to `width` characters, marking the cut.
@@ -2634,177 +2742,1091 @@ fn clip(text: &str, width: usize) -> String {
     out
 }
 
-/// The live pane: the bottom of the selected session's screen, as it is now.
-fn draw_live(f: &mut Frame, area: Rect, app: &App) {
-    let target = app.peek_target();
-    let (title, text) = match (&target, &app.peek) {
-        (Some(t), Some((id, text))) if t == id => {
-            let name = app
-                .sessions
-                .iter()
-                .find(|s| s.id == *id)
-                .map(crate::display_name)
-                .unwrap_or_else(|| id.clone());
-            (
-                format!(
-                    " live · {} ",
-                    clip(&name, area.width.saturating_sub(12) as usize)
-                ),
-                text.clone(),
-            )
+/// The last few lines of a screen worth showing in a tile: not blank, and not the input box
+/// or footer lines a Claude Code screen ends with.
+fn tile_lines(screen: &str) -> Vec<String> {
+    let mut out: Vec<String> = screen
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| {
+            let t = l.trim();
+            // Box borders, the prompt line, and Claude Code's mode footer.
+            !(t.chars().all(|c| "─━│╭╮╰╯┌┐└┘ ".contains(c))
+                || t.starts_with('>')
+                || t.starts_with("│ >")
+                || t.contains("for shortcuts")
+                || t.contains("auto-accept edits")
+                || t.contains("bypass permissions"))
+        })
+        .map(|l| l.trim().to_string())
+        .collect();
+    let keep = out.len().saturating_sub(4);
+    out.drain(..keep);
+    out
+}
+
+/// Text without terminal escape sequences.
+fn strip_escapes(line: &str) -> String {
+    ansi_line(line, usize::MAX)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// One row of a terminal screen, with its colours and styles (SGR escape codes) turned into
+/// styled spans, cut to `width` characters. Other escape sequences are dropped.
+fn ansi_line(line: &str, width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    let mut text = String::new();
+    let mut shown = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut end = ' ';
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            end = d;
+                            break;
+                        }
+                        params.push(d);
+                    }
+                    if end == 'm' {
+                        if !text.is_empty() {
+                            spans.push(Span::styled(std::mem::take(&mut text), style));
+                        }
+                        style = apply_sgr(style, &params);
+                    }
+                }
+                Some(']') => {
+                    // An OSC (e.g. a link or title): up to BEL or ESC \.
+                    chars.next();
+                    while let Some(d) = chars.next() {
+                        if d == '\x07' {
+                            break;
+                        }
+                        if d == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+            continue;
         }
-        (Some(_), _) => (" live ".to_string(), String::new()),
-        (None, _) => (" live ".to_string(), String::new()),
-    };
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let lines: Vec<Line> = if target.is_none() {
-        vec![Line::styled(
-            "Nothing running here. Select a lead, mission or agent to watch it.",
-            Style::default().fg(DIM),
-        )]
+        if c.is_control() {
+            continue;
+        }
+        if shown >= width {
+            break;
+        }
+        text.push(c);
+        shown += 1;
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// A style after an SGR sequence's parameters (`1;38;5;208`, and so on).
+fn apply_sgr(mut style: Style, params: &str) -> Style {
+    let nums: Vec<u16> = if params.is_empty() {
+        vec![0]
     } else {
-        let mut rows: Vec<&str> = text.lines().collect();
-        while rows.last().is_some_and(|l| l.trim().is_empty()) {
-            rows.pop();
-        }
-        let start = rows.len().saturating_sub(inner_h);
-        rows[start..]
-            .iter()
-            .map(|l| Line::raw(l.chars().take(inner_w).collect::<String>()))
+        params
+            .split([';', ':'])
+            .map(|p| p.parse().unwrap_or(0))
             .collect()
     };
+    let basic = |n: u16| match n {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        _ => Color::Gray,
+    };
+    let bright = |n: u16| match n {
+        0 => Color::DarkGray,
+        1 => Color::LightRed,
+        2 => Color::LightGreen,
+        3 => Color::LightYellow,
+        4 => Color::LightBlue,
+        5 => Color::LightMagenta,
+        6 => Color::LightCyan,
+        _ => Color::White,
+    };
+    let mut i = 0;
+    while i < nums.len() {
+        let n = nums[i];
+        match n {
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            7 => style = style.add_modifier(Modifier::REVERSED),
+            9 => style = style.add_modifier(Modifier::CROSSED_OUT),
+            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            27 => style = style.remove_modifier(Modifier::REVERSED),
+            29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
+            30..=37 => style = style.fg(basic(n - 30)),
+            39 => style.fg = None,
+            40..=47 => style = style.bg(basic(n - 40)),
+            49 => style.bg = None,
+            90..=97 => style = style.fg(bright(n - 90)),
+            100..=107 => style = style.bg(bright(n - 100)),
+            38 | 48 => {
+                let color = match nums.get(i + 1) {
+                    Some(5) => {
+                        let c = nums.get(i + 2).copied().unwrap_or(0);
+                        i += 2;
+                        Some(Color::Indexed(c as u8))
+                    }
+                    Some(2) => {
+                        let rgb = |k: usize| nums.get(i + k).copied().unwrap_or(0) as u8;
+                        let c = Color::Rgb(rgb(2), rgb(3), rgb(4));
+                        i += 4;
+                        Some(c)
+                    }
+                    _ => None,
+                };
+                if let Some(c) = color {
+                    style = if n == 38 { style.fg(c) } else { style.bg(c) };
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    style
+}
+
+/// What a key sends to a terminal program, as the terminal would send it.
+fn key_bytes(code: KeyCode, ctrl: bool, alt: bool) -> Option<String> {
+    let base = match code {
+        KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => {
+            ((c.to_ascii_lowercase() as u8 - b'a' + 1) as char).to_string()
+        }
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "\r".into(),
+        KeyCode::Backspace => "\x7f".into(),
+        KeyCode::Tab => "\t".into(),
+        KeyCode::BackTab => "\x1b[Z".into(),
+        KeyCode::Esc => "\x1b".into(),
+        KeyCode::Up => "\x1b[A".into(),
+        KeyCode::Down => "\x1b[B".into(),
+        KeyCode::Right => "\x1b[C".into(),
+        KeyCode::Left => "\x1b[D".into(),
+        KeyCode::Home => "\x1b[H".into(),
+        KeyCode::End => "\x1b[F".into(),
+        KeyCode::PageUp => "\x1b[5~".into(),
+        KeyCode::PageDown => "\x1b[6~".into(),
+        KeyCode::Delete => "\x1b[3~".into(),
+        _ => return None,
+    };
+    Some(if alt { format!("\x1b{base}") } else { base })
+}
+
+/// The project goal a mission serves, from what it was started with.
+fn serves_of(s: &Session) -> Option<String> {
+    let marker = "serves the project goal \"";
+    s.command.iter().find_map(|a| {
+        let at = a.find(marker)? + marker.len();
+        let rest = &a[at..];
+        Some(rest[..rest.find('"')?].to_string())
+    })
+}
+
+/// A session's title: its label without the "orchestrator · " or "agent · " in front.
+fn title_of(s: &Session) -> String {
+    crate::display_name(s)
+        .trim_start_matches("orchestrator · ")
+        .trim_start_matches("agent · ")
+        .trim_start_matches(crate::LEAD_LABEL)
+        .to_string()
+}
+
+fn column_block(title: String, focused: bool) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }))
+}
+
+/// The four columns: projects, the selected project's lead and missions, the agents of
+/// what is selected, and on the right the selection itself.
+fn draw_columns(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    let w = area.width;
+    let projects_w = (w / 8).clamp(14, 22);
+    let missions_w = (w / 5).clamp(24, 34);
+    let agents_w = (w / 5).clamp(26, 38);
+    let [projects, missions, agents, rest] = Layout::horizontal([
+        Constraint::Length(projects_w),
+        Constraint::Length(missions_w),
+        Constraint::Length(agents_w),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    draw_projects(f, projects, app);
+    draw_missions_col(f, missions, app);
+    draw_agents_col(f, agents, app);
+    rest
+}
+
+fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.saturating_sub(2) as usize;
+    let mut workspaces: Vec<&str> = app.projects.iter().map(|p| p.workspace.as_str()).collect();
+    workspaces.sort();
+    workspaces.dedup();
+    let several = workspaces.len() > 1;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut last_ws: Option<&str> = None;
+    app.hits.borrow_mut().push((area, Hit::Column(0)));
+    for (i, p) in app.projects.iter().enumerate() {
+        if several && last_ws != Some(p.workspace.as_str()) {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::styled(
+                p.workspace.to_uppercase(),
+                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            ));
+            last_ws = Some(p.workspace.as_str());
+        }
+        let y = area.y + 1 + lines.len() as u16;
+        if y + 1 < area.y + area.height {
+            app.hits
+                .borrow_mut()
+                .push((Rect::new(area.x, y, area.width, 1), Hit::Project(i)));
+        }
+        let selected = i == app.selected;
+        let running = app
+            .sessions
+            .iter()
+            .filter(|s| s.project == p.id && s.state == SessionState::Running)
+            .count();
+        let needs = app.attention.iter().filter(|a| a.project == p.id).count();
+        let badge = match (running, needs) {
+            (_, n) if n > 0 => format!("▲{n}"),
+            (r, _) if r > 0 => format!("●{r}"),
+            _ => String::new(),
+        };
+        let name = clip(&p.id, width.saturating_sub(3 + badge.chars().count()));
+        let pad = width.saturating_sub(2 + name.chars().count() + badge.chars().count());
+        let base = if selected {
+            Style::default().bg(SELECTED_BG)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "▌ " } else { "  " }, base.fg(ACCENT)),
+            Span::styled(
+                name,
+                if selected {
+                    base.fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    base
+                },
+            ),
+            Span::styled(" ".repeat(pad), base),
+            Span::styled(badge, base.fg(if needs > 0 { AMBER } else { GREEN })),
+        ]));
+    }
+    if app.projects.is_empty() {
+        lines.push(Line::styled("none yet · a", Style::default().fg(DIM)));
+    }
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .title(title)
-                .title_bottom(Line::styled(
-                    " Enter attaches · t talks to it ",
-                    Style::default().fg(DIM),
-                ))
-                .border_style(Style::default().fg(BORDER)),
-        ),
+        Paragraph::new(lines).block(column_block(" projects ".into(), app.col == 0)),
         area,
     );
 }
 
-/// The top of the board: the project in a few lines, its goals, and what to do next.
-fn draw_project_head(f: &mut Frame, area: Rect, app: &App, p: &Project) {
-    let k = app.knowledge_state.get(&p.id).cloned().unwrap_or_default();
-    let dim = Style::default().fg(DIM);
-    let or = |v: &Option<String>, none: &str| v.clone().unwrap_or_else(|| none.to_string());
-    let line1 = Line::from(vec![
-        Span::styled(
-            p.name.clone(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {}", p.id), dim),
-        Span::raw(format!(
-            "   {} · test {} · {}",
-            if p.stack.is_empty() {
-                "-".to_string()
-            } else {
-                p.stack.join(", ")
-            },
-            or(&p.test_command, "not detected"),
-            or(&p.branch, "-"),
-        )),
-        Span::styled("   autonomy ", dim),
-        Span::styled(p.autonomy.clone(), level_style(&p.autonomy)),
-    ]);
-    let waiting = app.proposals.values().filter(|x| x.project == p.id).count();
-    let knowledge = if !k.wired {
-        Span::styled("knowledge not set up · K", Style::default().fg(AMBER))
-    } else if !k.brief_written {
-        Span::styled("brief not written · b", Style::default().fg(AMBER))
-    } else if waiting > 0 {
-        Span::styled(
-            format!("{waiting} to learn? in the inbox"),
-            kind_style("proposal"),
-        )
-    } else {
-        Span::styled(
-            format!(
-                "knowledge ok · {} mission{} in the journal",
-                k.journal,
-                if k.journal == 1 { "" } else { "s" }
-            ),
-            dim,
-        )
+const SELECTED_BG: Color = Color::Rgb(30, 41, 59);
+
+/// The selected project's lead and missions, two lines each.
+fn draw_missions_col(f: &mut Frame, area: Rect, app: &App) {
+    let Some(p) = app.selected_project() else {
+        f.render_widget(
+            Paragraph::new("").block(column_block(" missions ".into(), false)),
+            area,
+        );
+        return;
     };
-    let mut goal_spans = vec![Span::styled("goals  ", dim)];
-    let shown: Vec<&(String, String)> = k
-        .goals
-        .iter()
-        .filter(|(_, st)| st == "active" || st == "next")
-        .collect();
-    if shown.is_empty() {
-        goal_spans.push(Span::styled("none yet · g adds one", dim));
-    }
-    for (i, (title, status)) in shown.iter().enumerate() {
-        if i > 0 {
-            goal_spans.push(Span::styled("  ", dim));
-        }
-        let (glyph, style) = if status == "active" {
-            ("● ", Style::default().fg(GREEN))
+    let width = area.width.saturating_sub(2) as usize;
+    let rows = app.col1_rows(&p.id);
+    let sel = app.col1_row().map(|r| r.key);
+    let needs = |id: &str| app.attention.iter().filter(|i| i.session_id == id).count();
+    let dim = Style::default().fg(DIM);
+    let mut lines: Vec<Line> = Vec::new();
+    // Each item's first line, how many lines it takes, and its key: for the mouse.
+    let mut items: Vec<(usize, usize, String)> = Vec::new();
+    let mut heading: Option<&str> = None;
+    for r in &rows {
+        let selected = sel.as_deref() == Some(r.key.as_str());
+        let base = if selected && app.col == 1 {
+            Style::default().bg(SELECTED_BG)
         } else {
-            ("○ ", dim)
+            Style::default()
         };
-        goal_spans.push(Span::styled(glyph, style));
-        goal_spans.push(Span::raw(clip(title, 32)));
-    }
-    let done = k.goals.iter().filter(|(_, st)| st == "done").count();
-    let mut extra = Vec::new();
-    if done > 0 {
-        extra.push(format!("{done} done"));
-    }
-    if k.guideposts > 0 {
-        extra.push(format!(
-            "{} guidepost{}",
-            k.guideposts,
-            if k.guideposts == 1 { "" } else { "s" }
-        ));
-    }
-    if !extra.is_empty() {
-        goal_spans.push(Span::styled(format!("   ({})", extra.join(" · ")), dim));
-    }
-    let items: Vec<&AttentionItem> = app.attention.iter().filter(|i| i.project == p.id).collect();
-    let attention = if items.is_empty() {
-        Line::styled("nothing needs you", dim)
-    } else {
-        let mut kinds: Vec<(&str, usize)> = Vec::new();
-        for i in &items {
-            match kinds.iter_mut().find(|(k, _)| *k == i.kind) {
-                Some((_, n)) => *n += 1,
-                None => kinds.push((i.kind.as_str(), 1)),
+        let bar = if selected { "▌" } else { " " };
+        let indent = "  ".repeat(r.depth);
+        // Two lines: a title, and a line of facts under it.
+        let item = |first: Vec<Span<'static>>, second: Vec<Span<'static>>| -> [Line<'static>; 2] {
+            let mut a = vec![Span::styled(format!("{bar}{indent} "), base.fg(ACCENT))];
+            a.extend(
+                first
+                    .into_iter()
+                    .map(|s| Span::styled(s.content, s.style.patch(base))),
+            );
+            let used: usize = a.iter().map(|s| s.content.chars().count()).sum();
+            a.push(Span::styled(" ".repeat(width.saturating_sub(used)), base));
+            let mut b = vec![Span::styled(format!("{bar}{indent}   "), base.fg(ACCENT))];
+            let mut room = width.saturating_sub(indent.len() + 4);
+            for sp in second {
+                let text = clip(&sp.content, room);
+                room = room.saturating_sub(text.chars().count());
+                b.push(Span::styled(text, sp.style.patch(base)));
+            }
+            b.push(Span::styled(" ".repeat(room), base));
+            [Line::from(a), Line::from(b)]
+        };
+        let section = match &r.kind {
+            RowKind::Mission(_) if r.depth == 0 => Some("MISSIONS"),
+            RowKind::Loose(_) => Some("SESSIONS"),
+            RowKind::History(_) => Some(""),
+            _ => None,
+        };
+        if let Some(name) = section {
+            if heading != Some(name) {
+                lines.push(Line::from(""));
+                if !name.is_empty() {
+                    lines.push(Line::styled(
+                        format!(" {name}"),
+                        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                heading = Some(name);
             }
         }
-        let mut spans = vec![Span::styled("needs you  ", Style::default().fg(AMBER))];
-        for (kind, n) in kinds {
-            spans.push(Span::styled(
-                format!("{n} {}  ", kind_label(kind).to_lowercase()),
-                kind_style(kind),
+        let start = lines.len();
+        match &r.kind {
+            RowKind::Lead(None) => lines.extend(item(
+                vec![Span::styled("◇ lead", dim)],
+                vec![Span::styled("not started · t talks to it", dim)],
+            )),
+            RowKind::Lead(Some(s)) => lines.extend(item(
+                vec![
+                    Span::styled(
+                        "◇ lead",
+                        Style::default().fg(LEAD).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if needs(&s.id) > 0 {
+                            format!("  ▲{}", needs(&s.id))
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(AMBER),
+                    ),
+                ],
+                vec![
+                    state_glyph(s),
+                    Span::styled(short_state(s), agent_style(s)),
+                    Span::styled(" · t talks to it", dim),
+                ],
+            )),
+            RowKind::Mission(s) | RowKind::Loose(s) => {
+                let under: Vec<&Session> = app
+                    .sessions
+                    .iter()
+                    .filter(|a| a.supervisor.as_deref() == Some(s.id.as_str()))
+                    .collect();
+                let n = needs(&s.id) + under.iter().map(|a| needs(&a.id)).sum::<usize>();
+                let running = under
+                    .iter()
+                    .filter(|a| a.state == SessionState::Running)
+                    .count();
+                let mut facts = String::new();
+                if !under.is_empty() {
+                    // A small bar: one block per agent, filled while it runs.
+                    let shown = under.len().min(6);
+                    let filled = running.min(shown);
+                    facts.push_str(&format!(
+                        "  {}{}",
+                        "▰".repeat(filled),
+                        "▱".repeat(shown - filled)
+                    ));
+                }
+                if let Some(goal) = serves_of(s) {
+                    facts.push_str(&format!("  → {goal}"));
+                }
+                let badge = if n > 0 {
+                    format!(" ▲{n}")
+                } else {
+                    String::new()
+                };
+                let title_room = width.saturating_sub(indent.len() + 4 + badge.chars().count());
+                let mission = matches!(r.kind, RowKind::Mission(_));
+                lines.extend(item(
+                    vec![
+                        Span::styled(
+                            if mission { "◆ " } else { "▪ " },
+                            Style::default().fg(if s.state == SessionState::Running {
+                                ACCENT
+                            } else {
+                                DIM
+                            }),
+                        ),
+                        Span::styled(
+                            clip(&title_of(s), title_room),
+                            if selected {
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
+                            } else if s.state == SessionState::Running {
+                                Style::default()
+                            } else {
+                                dim
+                            },
+                        ),
+                        Span::styled(badge, Style::default().fg(AMBER)),
+                    ],
+                    vec![
+                        state_glyph(s),
+                        Span::styled(short_state(s), agent_style(s)),
+                        Span::styled(facts, dim),
+                    ],
+                ));
+            }
+            RowKind::History(n) => {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{bar} "), base.fg(ACCENT)),
+                    Span::styled(
+                        format!("{} earlier missions · {n}", if r.open { "▾" } else { "▸" }),
+                        dim.patch(base),
+                    ),
+                ]));
+            }
+            _ => {}
+        }
+        items.push((start, lines.len() - start, r.key.clone()));
+    }
+    // Keep the selection in view.
+    let height = area.height.saturating_sub(2) as usize;
+    let sel_end = items
+        .iter()
+        .find(|(_, _, k)| Some(k.as_str()) == sel.as_deref())
+        .map(|(s, t, _)| s + t)
+        .unwrap_or(0);
+    let skip = sel_end.saturating_sub(height);
+    {
+        let mut hits = app.hits.borrow_mut();
+        hits.push((area, Hit::Column(1)));
+        for (start, tall, key) in items {
+            if start < skip || start - skip + tall > height {
+                continue;
+            }
+            let y = area.y + 1 + (start - skip) as u16;
+            hits.push((
+                Rect::new(area.x, y, area.width, tall as u16),
+                Hit::Mission(key),
             ));
         }
-        spans.push(Span::styled("· i inbox", dim));
-        Line::from(spans)
+    }
+    let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
+    f.render_widget(
+        Paragraph::new(lines).block(column_block(format!(" {} ", p.name), app.col == 1)),
+        area,
+    );
+}
+
+/// The agents of what is selected, as tiles showing the last lines of each one's screen.
+fn draw_agents_col(f: &mut Frame, area: Rect, app: &App) {
+    let rows = app.col2_rows();
+    let title = match app.col {
+        0 => " working now ".to_string(),
+        _ => match app.col1_row().and_then(|r| r.session().cloned()) {
+            Some(s) if crate::is_lead(&s) => " under the lead ".to_string(),
+            Some(_) => format!(" agents · {} ", rows.len()),
+            None => " agents ".to_string(),
+        },
     };
-    let lines = vec![
-        line1,
+    let block = column_block(title, app.col == 2);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hits.borrow_mut().push((area, Hit::Column(2)));
+    if rows.is_empty() {
+        let text = match (app.col, app.col1_row().map(|r| r.kind)) {
+            (0, _) => "no agents running",
+            (_, Some(RowKind::Lead(_))) => "the lead's missions are in the missions column",
+            (_, Some(RowKind::Mission(_))) => "no agents (yet)",
+            _ => "",
+        };
+        f.render_widget(
+            Paragraph::new(Line::styled(format!(" {text}"), Style::default().fg(DIM)))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    const TILE: u16 = 6;
+    let fits = (inner.height / TILE).max(1) as usize;
+    let sel = app.col2_row().map(|r| r.key);
+    let at = rows
+        .iter()
+        .position(|r| Some(r.key.as_str()) == sel.as_deref())
+        .unwrap_or(0);
+    let first = at.saturating_sub(fits.saturating_sub(1));
+    for (n, r) in rows.iter().enumerate().skip(first).take(fits) {
+        let RowKind::Agent(s) = &r.kind else { continue };
+        let y = inner.y + ((n - first) as u16) * TILE;
+        let indent = (r.depth as u16 * 2).min(inner.width / 3);
+        let rect = Rect::new(
+            inner.x + indent,
+            y,
+            inner.width - indent,
+            TILE.min(inner.y + inner.height - y),
+        );
+        app.hits.borrow_mut().push((rect, Hit::Agent(s.id.clone())));
+        let selected = Some(r.key.as_str()) == sel.as_deref() && app.col == 2;
+        let w = rect.width.saturating_sub(2) as usize;
+        let state = short_state(s);
+        let name = clip(&title_of(s), w.saturating_sub(state.chars().count() + 6));
+        let needs = app
+            .attention
+            .iter()
+            .filter(|i| i.session_id == s.id)
+            .count();
+        let mut body: Vec<Line> = Vec::new();
+        if needs > 0 {
+            if let Some(item) = app.attention.iter().find(|i| i.session_id == s.id) {
+                body.push(Line::styled(
+                    clip(&format!("▲ {}", item.summary), w),
+                    Style::default().fg(AMBER),
+                ));
+            }
+        } else if let Some(d) = &s.agent_detail {
+            body.push(Line::styled(clip(d, w), agent_style(s)));
+        }
+        let tail = app.tiles.get(&s.id).cloned().unwrap_or_default();
+        let room = (TILE as usize).saturating_sub(2 + body.len());
+        for l in tail.iter().skip(tail.len().saturating_sub(room)) {
+            body.push(Line::styled(clip(l, w), Style::default().fg(DIM)));
+        }
+        let title = Line::from(vec![
+            Span::raw(" "),
+            state_glyph(s),
+            Span::styled(
+                format!("{name} "),
+                if selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+        ]);
+        let border = if selected {
+            ACCENT
+        } else if needs > 0 {
+            AMBER
+        } else {
+            BORDER
+        };
+        f.render_widget(
+            Paragraph::new(body).block(
+                Block::bordered()
+                    .border_type(if selected {
+                        BorderType::Thick
+                    } else {
+                        BorderType::Rounded
+                    })
+                    .title(title)
+                    .title(Line::styled(format!(" {state} "), agent_style(s)).right_aligned())
+                    .border_style(Style::default().fg(border)),
+            ),
+            rect,
+        );
+    }
+}
+
+const LEAD: Color = Color::Rgb(188, 140, 255);
+
+/// A glyph for a session's state: a spinner while it works, and a shape for the rest, so
+/// state never rests on colour alone.
+fn state_glyph(s: &Session) -> Span<'static> {
+    use corvx_proto::AgentState::*;
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let (glyph, color) = if s.state == SessionState::Lost {
+        ("◌", AMBER)
+    } else if s.state != SessionState::Running {
+        ("·", DIM)
+    } else {
+        match s.agent_state {
+            Working | Unknown => {
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                (SPIN[(ms / 100 % 10) as usize], GREEN)
+            }
+            Waiting | Idle => ("●", ACCENT),
+            Blocked => ("▲", AMBER),
+            Done => ("✓", GREEN),
+            Failed => ("✕", RED),
+            Stopped => ("·", DIM),
+        }
+    };
+    Span::styled(format!("{glyph} "), Style::default().fg(color))
+}
+
+/// A session's state in a word or two, for the tree.
+fn short_state(s: &Session) -> String {
+    use corvx_proto::AgentState::*;
+    if s.state != SessionState::Running {
+        return match s.state {
+            SessionState::Lost => "interrupted".into(),
+            _ => match s.ended_at {
+                Some(t) => format!("ended {}", age_label(now_secs() - t)),
+                None => "ended".into(),
+            },
+        };
+    }
+    let state = match s.agent_state {
+        Unknown => "running",
+        Working => "working",
+        Waiting => "waiting",
+        Blocked => "needs you",
+        Done => "done",
+        Failed => "failed",
+        Idle => "idle",
+        Stopped => "stopped",
+    };
+    if s.autopilot {
+        format!("auto·{state}")
+    } else {
+        state.to_string()
+    }
+}
+
+/// The right side: whatever the tree has selected.
+fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(row) = app.selected_row() else {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(" welcome ")
+            .border_style(Style::default().fg(BORDER));
+        f.render_widget(Paragraph::new(welcome_lines()).block(block), area);
+        return;
+    };
+    let Some(p) = app.projects.iter().find(|p| p.id == row.project) else {
+        return;
+    };
+    match &row.kind {
+        RowKind::Project => draw_project_detail(f, area, app, p),
+        RowKind::History(n) => {
+            let lines = vec![
+                Line::styled(
+                    format!(
+                        "{n} earlier mission{} on {}",
+                        if *n == 1 { "" } else { "s" },
+                        p.id
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    "→ opens the list; select one to read its journal entry.",
+                    Style::default().fg(DIM),
+                ),
+            ];
+            f.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" earlier missions ")
+                        .border_style(Style::default().fg(BORDER)),
+                ),
+                area,
+            );
+        }
+        RowKind::Lead(None) => {
+            let dim = Style::default().fg(DIM);
+            let lines = vec![
+                Line::styled(
+                    format!("The lead of {}", p.id),
+                    Style::default().fg(LEAD).add_modifier(Modifier::BOLD),
+                ),
+                Line::from(""),
+                Line::raw("The agent you talk to about this project, in your own words."),
+                Line::raw("It reads the brief, goals, decisions and past missions; it records new goals"),
+                Line::raw("for you to accept, starts missions for them, passes your corrections on to"),
+                Line::raw("them, and tells you how they went. It runs on a strong model until you stop it."),
+                Line::from(""),
+                Line::styled("t and say something to start it · Enter starts it with a status request", dim),
+            ];
+            f.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" lead · not started ")
+                        .border_style(Style::default().fg(BORDER)),
+                ),
+                area,
+            );
+        }
+        _ => {
+            if let Some(s) = row.session() {
+                draw_session_detail(f, area, app, &row, s);
+            }
+        }
+    }
+}
+
+/// A lead, mission or agent: what it is and does, then its screen live (or, for an ended
+/// mission, its journal entry).
+fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Session) {
+    let dim = Style::default().fg(DIM);
+    let what = match &row.kind {
+        RowKind::Lead(_) => "lead",
+        RowKind::Mission(_) => "mission",
+        RowKind::Agent(_) => "agent",
+        _ => "session",
+    };
+    let name = crate::display_name(s);
+    let name = name
+        .trim_start_matches("orchestrator · ")
+        .trim_start_matches("agent · ")
+        .trim_start_matches(crate::LEAD_LABEL)
+        .to_string();
+    let under: Vec<&Session> = app
+        .sessions
+        .iter()
+        .filter(|a| a.supervisor.as_deref() == Some(s.id.as_str()))
+        .collect();
+    let model = s
+        .command
+        .windows(2)
+        .find(|w| w[0] == "--model")
+        .map(|w| w[1].clone());
+    let mut facts = vec![s.id.clone()];
+    if let Some(m) = model {
+        facts.push(format!("on {m}"));
+    }
+    if !under.is_empty() {
+        let running = under
+            .iter()
+            .filter(|a| a.state == SessionState::Running)
+            .count();
+        facts.push(format!(
+            "{} {} ({running} running)",
+            under.len(),
+            if matches!(row.kind, RowKind::Lead(_)) {
+                "missions"
+            } else {
+                "agents"
+            }
+        ));
+    }
+    if let Some(goal) = serves_of(s) {
+        facts.push(format!("serves \"{goal}\""));
+    }
+    if s.autopilot {
+        facts.push("autopilot".into());
+    }
+    if let Some(w) = &s.worktree {
+        facts.push(format!(
+            "branch corvx/{}",
+            w.rsplit('/').next().unwrap_or(&s.id)
+        ));
+    }
+    let mut lines = vec![
         Line::from(vec![
-            knowledge,
-            Span::styled("   workspace ", dim),
-            Span::raw(p.workspace.clone()),
+            Span::styled(
+                format!("{what}  "),
+                Style::default().fg(if what == "lead" { LEAD } else { ACCENT }),
+            ),
+            Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(goal_spans),
-        attention,
-        Line::styled(next_step(app, p), Style::default().fg(GREEN)),
+        Line::styled(facts.join(" · "), dim),
+        Line::styled(agent_label(s), agent_style(s)),
     ];
+    for item in app.attention.iter().filter(|i| i.session_id == s.id) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<8}", kind_label(&item.kind)),
+                kind_style(&item.kind),
+            ),
+            Span::raw(item.summary.clone()),
+            Span::styled("  · i inbox", dim),
+        ]));
+    }
+    let head = lines.len() as u16 + 2;
+    let [top, body] = Layout::vertical([Constraint::Length(head), Constraint::Min(0)]).areas(area);
+    let typing = app.mode == Mode::Live && app.live_id.as_deref() == Some(s.id.as_str());
+    let keys = match s.state {
+        SessionState::Running if typing => {
+            " your keys go here · Ctrl+\\ back · wheel scrolls back "
+        }
+        SessionState::Running => " Enter type to it · t one message · f full screen · x stop ",
+        SessionState::Lost => " R resume · c clean up worktrees ",
+        _ => " c clean up worktrees · PgUp/PgDn scroll ",
+    };
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(" project ")
-                .border_style(Style::default().fg(if app.focus == 0 { ACCENT } else { BORDER })),
+                .border_type(BorderType::Rounded)
+                .title(format!(" {what} "))
+                .border_style(Style::default().fg(BORDER)),
+        ),
+        top,
+    );
+    let inner_h = body.height.saturating_sub(2) as usize;
+    let inner_w = body.width.saturating_sub(2) as usize;
+    app.live_size.set((inner_w as u16, inner_h as u16));
+    let (title, text): (String, Vec<Line>) = if s.state == SessionState::Running {
+        let screen = match &app.peek {
+            Some((id, text)) if *id == s.id => text.clone(),
+            _ => String::new(),
+        };
+        app.hits.borrow_mut().push((body, Hit::Live));
+        let mut rows: Vec<&str> = screen.lines().collect();
+        while rows
+            .last()
+            .is_some_and(|l| strip_escapes(l).trim().is_empty())
+        {
+            rows.pop();
+        }
+        // Scrolled back: the window ends that many lines above the bottom.
+        let back = (app.live_scroll as usize).min(rows.len().saturating_sub(inner_h));
+        let end = rows.len() - back;
+        let start = end.saturating_sub(inner_h);
+        (
+            if back > 0 {
+                format!(" live · ↑ {back} lines back · scroll down to return ")
+            } else if typing {
+                " live · typing ".into()
+            } else {
+                " live ".into()
+            },
+            rows[start..end]
+                .iter()
+                .map(|l| ansi_line(l, inner_w))
+                .collect(),
+        )
+    } else {
+        let journal = app.journals.get(&row.project).and_then(|entries| {
+            entries
+                .iter()
+                .find(|j| j.path.ends_with(&format!("-{}.md", s.id)))
+        });
+        match journal {
+            Some(j) => (
+                format!(" journal · {} ", j.path),
+                j.text
+                    .lines()
+                    .map(|l| {
+                        if l.starts_with('#') {
+                            Line::styled(
+                                l.to_string(),
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            Line::raw(l.to_string())
+                        }
+                    })
+                    .collect(),
+            ),
+            None => (
+                " ended ".into(),
+                vec![Line::styled(
+                    match (&row.kind, s.exit_code) {
+                        (RowKind::Mission(_), _) => "It wrote no journal entry.".to_string(),
+                        (_, Some(code)) => format!("It exited with code {code}."),
+                        _ => "It has ended.".to_string(),
+                    },
+                    dim,
+                )],
+            ),
+        }
+    };
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((
+                if s.state == SessionState::Running {
+                    0
+                } else {
+                    app.detail_scroll
+                },
+                0,
+            ))
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(title)
+                    .title_bottom(Line::styled(
+                        keys,
+                        if typing {
+                            Style::default().fg(GREEN)
+                        } else {
+                            dim
+                        },
+                    ))
+                    .border_style(Style::default().fg(if typing { GREEN } else { BORDER })),
+            ),
+        body,
+    );
+}
+
+/// A project: what it is, where it is heading, what needs you, and the next step.
+fn draw_project_detail(f: &mut Frame, area: Rect, app: &App, p: &Project) {
+    let k = app.knowledge_state.get(&p.id).cloned().unwrap_or_default();
+    let dim = Style::default().fg(DIM);
+    let label = |s: &str| Span::styled(format!("{s:<11}"), dim);
+    let or = |v: &Option<String>, none: &str| v.clone().unwrap_or_else(|| none.to_string());
+    let section = |s: &str| Line::styled(s.to_string(), Style::default().fg(ACCENT));
+    let waiting = app.proposals.values().filter(|x| x.project == p.id).count();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                p.name.clone(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("   {}", p.path), dim),
+        ]),
+        Line::from(vec![
+            label("stack"),
+            Span::raw(if p.stack.is_empty() {
+                "not detected".into()
+            } else {
+                p.stack.join(", ")
+            }),
+            Span::styled("   test ", dim),
+            Span::raw(or(&p.test_command, "not detected")),
+            Span::styled("   branch ", dim),
+            Span::raw(or(&p.branch, "-")),
+        ]),
+        Line::from(vec![
+            label("autonomy"),
+            Span::styled(p.autonomy.clone(), level_style(&p.autonomy)),
+            Span::styled(
+                format!(
+                    "  {}",
+                    clip(
+                        crate::level_meaning(&p.autonomy),
+                        area.width.saturating_sub(26) as usize
+                    )
+                ),
+                dim,
+            ),
+        ]),
+        Line::from(vec![
+            label("knowledge"),
+            if !k.wired {
+                Span::styled("not set up · K sets it up", Style::default().fg(AMBER))
+            } else if !k.brief_written {
+                Span::styled(
+                    "set up · brief not written yet: b",
+                    Style::default().fg(AMBER),
+                )
+            } else if waiting > 0 {
+                Span::styled(
+                    format!("{waiting} proposal(s) waiting in the inbox"),
+                    kind_style("proposal"),
+                )
+            } else {
+                Span::raw(format!(
+                    "set up · {} mission{} in the journal",
+                    k.journal,
+                    if k.journal == 1 { "" } else { "s" }
+                ))
+            },
+        ]),
+        Line::from(""),
+        section("GOALS"),
+    ];
+    if k.goals.is_empty() {
+        lines.push(Line::styled("  none yet · g adds one", dim));
+    }
+    for (title, status) in &k.goals {
+        let (glyph, style) = match status.as_str() {
+            "active" => ("●", Style::default().fg(GREEN)),
+            "next" => ("○", Style::default()),
+            "done" => ("✓", dim),
+            _ => ("×", dim),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {glyph} "), style),
+            Span::styled(
+                title.clone(),
+                if status == "done" || status == "dropped" {
+                    dim
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(format!("  {status}"), dim),
+        ]));
+    }
+    if k.guideposts > 0 {
+        lines.push(Line::styled(
+            format!(
+                "  {} guidepost{} · G edits goals and guideposts",
+                k.guideposts,
+                if k.guideposts == 1 { "" } else { "s" }
+            ),
+            dim,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(section("NEEDS YOU"));
+    let items: Vec<&AttentionItem> = app.attention.iter().filter(|i| i.project == p.id).collect();
+    if items.is_empty() {
+        lines.push(Line::styled("  nothing", dim));
+    }
+    for item in items.iter().take(6) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<8}", kind_label(&item.kind)),
+                kind_style(&item.kind),
+            ),
+            Span::raw(clip(&item.summary, area.width.saturating_sub(14) as usize)),
+        ]));
+    }
+    if items.len() > 6 {
+        lines.push(Line::styled(
+            format!("  … {} more · i inbox", items.len() - 6),
+            dim,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(next_step(app, p), Style::default().fg(GREEN)));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(format!(" {} ", p.id))
+                .title_bottom(Line::styled(
+                    " o mission · t lead · g goal · b brief · e edit · l rules ",
+                    dim,
+                ))
+                .border_style(Style::default().fg(BORDER)),
         ),
         area,
     );
@@ -2997,6 +4019,7 @@ fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
         Style::default().fg(DIM),
     ));
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(" add this project? ")
         .border_style(Style::default().fg(GREEN));
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -3125,6 +4148,7 @@ fn draw_mission(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(format!(" start a mission on {} ", m.project))
                 .border_style(Style::default().fg(GREEN)),
         ),
@@ -3142,29 +4166,35 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::ConfirmRemove => ("CONFIRM", AMBER),
         Mode::Help => ("HELP", ACCENT),
         Mode::Inbox => ("INBOX", ACCENT),
-        Mode::Sessions => ("SESSIONS", ACCENT),
         Mode::Answer => ("ANSWER", GREEN),
         Mode::Deny => ("DENY", RED),
         Mode::Reject => ("REJECT", RED),
         Mode::Rules => ("RULES", ACCENT),
         Mode::EditProject => ("EDIT", GREEN),
-        Mode::Missions => ("MISSIONS", ACCENT),
         Mode::ConfirmStop => ("CONFIRM", AMBER),
         Mode::Talk => ("TALK", Color::Rgb(188, 140, 255)),
         Mode::AddGoal => ("GOAL", GREEN),
+        Mode::Live => ("LIVE", GREEN),
     };
     let hint = if !app.flash.is_empty() {
         app.flash.clone()
     } else {
         match app.mode {
-            Mode::Normal if app.focus > 0 => {
-                "j/k move · ←/→ column · Enter attach · t talk · x stop · c clean up · R resume · A autopilot · Esc back"
-                    .into()
-            }
-            Mode::Normal => {
-                "j/k move · → into the work · t talk · o mission · g goal · m missions · b brief · e edit · i inbox · : more · ? help"
-                    .into()
-            }
+            Mode::Normal => match app.selected_row().map(|r| r.kind) {
+                Some(RowKind::Project) => {
+                    "j/k project · → its missions · o mission · t lead · g goal · b brief · e edit · i inbox · : more · ? help"
+                        .into()
+                }
+                Some(RowKind::Lead(None)) => {
+                    "t talk to the lead (starts it) · Enter start it · j/k move · ← back · ? help".into()
+                }
+                Some(RowKind::History(_)) => "Enter opens or closes · j/k move · ← back · ? help".into(),
+                Some(_) => {
+                    "Enter type to it · t one message · f full screen · → its agents · ← back · x stop · c clean up · R resume · ? help"
+                        .into()
+                }
+                None => "a adds a project · ? help · q quit".into(),
+            },
             Mode::AddPath => {
                 "type the project's path · Tab completes · Enter look at it · Esc cancel".into()
             }
@@ -3176,11 +4206,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 "type · Tab other field · ←/→ pick a workspace · Enter save (and rescan) · Esc cancel"
                     .into()
             }
-            Mode::Missions => {
-                "j/k move · J/K scroll journal · Enter attach · c clean up worktrees · x stop · R resume · o new · Esc"
-                    .into()
-            }
             Mode::ConfirmStop => "y stop it · any other key cancels".into(),
+            Mode::Live => format!(
+                "Ctrl+\\ back to the columns · wheel scrolls back · typing goes to {}",
+                app.live_id
+                    .as_ref()
+                    .and_then(|id| app.sessions.iter().find(|s| s.id == *id))
+                    .map(crate::display_name)
+                    .unwrap_or_default()
+            ),
             Mode::Talk => "say it in your words · Enter sends · Esc cancels".into(),
             Mode::AddGoal => {
                 "the goal, in a few words · Enter adds it (active) · G edits goals.md for more · Esc"
@@ -3194,7 +4228,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Mode::Help => "any key closes".into(),
             Mode::Inbox => match app.attention.get(app.inbox_sel).map(|i| i.kind.as_str()) {
                 Some("approval") => {
-                    "y approve · Y always · n deny · A autopilot · Enter attach · j/k move · Esc"
+                    "y approve · Y always · n deny · A autopilot · Enter show it · j/k move · Esc"
                         .into()
                 }
                 Some("suggestion") => {
@@ -3204,15 +4238,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                     "y accept · e edit, then accept · n reject · z snooze · j/k move · Esc".into()
                 }
                 Some("question") => {
-                    "r answer · Enter attach · a ack · z snooze · x dismiss · j/k move · Esc".into()
+                    "r answer · Enter show it · a ack · z snooze · x dismiss · j/k move · Esc".into()
                 }
-                _ => "j/k move · Enter attach · a ack · z snooze · x dismiss · p project · Esc"
+                _ => "j/k move · Enter show it · a ack · z snooze · x dismiss · Esc"
                     .into(),
             },
-            Mode::Sessions => {
-                "j/k move · Enter attach (Ctrl+\\ then d to come back) · R resume · a autopilot · x stop · c clean up · Esc"
-                    .into()
-            }
             Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
             Mode::Deny => "why, or what to do instead (optional) · Enter deny · Esc cancel".into(),
             Mode::Reject => {
@@ -3234,8 +4264,28 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(hint, Style::default().fg(DIM)),
     ]);
+    let mut line = line;
+    if app.flash.is_empty() {
+        // "Enter type to it · t one message": each key stands out from what it does.
+        for (i, part) in hint.split(" · ").enumerate() {
+            if i > 0 {
+                line.spans.push(Span::styled("  ", Style::default()));
+            }
+            let (key, what) = part.split_once(' ').unwrap_or((part, ""));
+            line.spans.push(Span::styled(
+                key.to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+            if !what.is_empty() {
+                line.spans
+                    .push(Span::styled(format!(" {what}"), Style::default().fg(DIM)));
+            }
+        }
+    } else {
+        line.spans
+            .push(Span::styled(hint, Style::default().fg(Color::Gray)));
+    }
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -3315,6 +4365,7 @@ fn draw_palette(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(" commands ")
                 .border_style(Style::default().fg(BORDER)),
         ),
@@ -3326,41 +4377,35 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let rect = centered(area, 78, 29);
     f.render_widget(Clear, rect);
     let rows = [
-        ("j / k, ↑ ↓", "move selection"),
-        (
-            "→ ← / Tab",
-            "move between projects, work (lead, missions) and agents",
-        ),
-        (
-            "t",
-            "talk: to the selected session, or to the project's lead",
-        ),
+        ("j / k, ↑ ↓", "move up and down in a column"),
+        ("→ / ←", "next column (missions, agents) · back"),
         (
             "Enter",
-            "on work or an agent: attach (Ctrl+\\ then d returns)",
+            "type to the selected session in its pane (Ctrl+\\ returns)",
         ),
+        ("f", "attach full screen (Ctrl+\\ then d returns)"),
+        ("t", "message the selected session; on a project, its lead"),
         (
-            "  on work",
-            "x stop · c clean up worktrees · R resume · A autopilot",
+            "x c R A",
+            "stop · clean up worktrees · resume · autopilot on/off",
         ),
-        ("g / G", "add a goal · edit goals and guideposts in $EDITOR"),
+        ("PgUp / PgDn", "scroll an ended mission's journal"),
         ("a", "add a project directory (Tab completes the path)"),
         ("o", "start a mission on the selected project"),
-        ("m", "its missions: history, journals, clean up worktrees"),
+        ("g / G", "add a goal · edit goals and guideposts in $EDITOR"),
         ("b", "edit its brief in $EDITOR (committed when saved)"),
         (
             "e",
             "rename it or move it to another workspace (rescans it)",
         ),
         ("K", "set up its knowledge files, read by every agent"),
-        ("d", "remove the selected project (files untouched)"),
+        ("d", "on a project's row: remove it (files untouched)"),
         ("r", "refresh from the daemon"),
         (
             ": or Ctrl+K",
             "palette: decisions, conventions, rescan, restart daemon …",
         ),
-        ("i", "attention inbox: what needs you"),
-        ("s", "sessions: Enter attaches, Ctrl+\\ then d returns"),
+        ("i", "inbox: what needs you; Enter shows it in the tree"),
         (
             "  in inbox",
             "y approve · Y always · n deny · A autopilot · z snooze",
@@ -3368,10 +4413,6 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (
             "  proposals",
             "y accept · e edit, then accept · n reject, with why",
-        ),
-        (
-            "  in sessions",
-            "R resume · a autopilot on/off · x stop · c clean up",
         ),
         (
             "l",
@@ -3397,6 +4438,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(" keys ")
                 .border_style(Style::default().fg(BORDER)),
         ),
@@ -3464,6 +4506,7 @@ fn kind_style(kind: &str) -> Style {
 /// The inbox: every open item across projects, most urgent first.
 fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(format!(" inbox · {} open ", app.attention.len()))
         .border_style(Style::default().fg(BORDER));
     if app.attention.is_empty() {
@@ -3574,6 +4617,7 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(title)
                 .border_style(kind_style(&item.kind)),
         );
@@ -3637,6 +4681,7 @@ fn draw_proposal(
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(format!(" {agent} proposes to remember "))
                 .border_style(kind_style("proposal")),
         );
@@ -3656,42 +4701,6 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Orders sessions as a tree: each orchestrator followed by the agents it supervises,
-/// running sessions before ended ones at each level. Returns the sessions and their depths.
-fn session_tree(sessions: Vec<Session>) -> (Vec<Session>, Vec<usize>) {
-    use std::collections::HashSet;
-    fn visit(
-        parent: Option<&str>,
-        depth: usize,
-        all: &[Session],
-        ids: &HashSet<String>,
-        order: &mut Vec<Session>,
-        depths: &mut Vec<usize>,
-    ) {
-        let mut level: Vec<&Session> = all
-            .iter()
-            .filter(|s| match (parent, s.supervisor.as_deref()) {
-                (None, None) => true,
-                // A supervisor that is not in the list (e.g. long gone) makes this a root.
-                (None, Some(sup)) => !ids.contains(sup),
-                (Some(p), Some(sup)) => p == sup,
-                _ => false,
-            })
-            .collect();
-        level.sort_by_key(|s| s.state != SessionState::Running);
-        for s in level {
-            order.push(s.clone());
-            depths.push(depth);
-            visit(Some(&s.id), depth + 1, all, ids, order, depths);
-        }
-    }
-    let ids: HashSet<String> = sessions.iter().map(|s| s.id.clone()).collect();
-    let mut order = Vec::with_capacity(sessions.len());
-    let mut depths = Vec::with_capacity(sessions.len());
-    visit(None, 0, &sessions, &ids, &mut order, &mut depths);
-    (order, depths)
 }
 
 fn agent_label(s: &Session) -> String {
@@ -3762,6 +4771,7 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
         .map(|p| format!("for {p}"))
         .unwrap_or_else(|| "for every project".into());
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(format!(" rules {scope} "))
         .border_style(Style::default().fg(BORDER));
     let mut lines = Vec::new();
@@ -3838,62 +4848,6 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
-    let running = app
-        .sessions
-        .iter()
-        .filter(|s| s.state == SessionState::Running)
-        .count();
-    let block = Block::bordered()
-        .title(format!(" sessions · {running} running "))
-        .border_style(Style::default().fg(BORDER));
-    if app.sessions.is_empty() {
-        let lines = vec![
-            Line::styled(
-                "No sessions yet.",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                "o on a project starts a mission: an orchestrator and its agents.",
-                Style::default().fg(DIM),
-            ),
-        ];
-        f.render_widget(Paragraph::new(lines).block(block), area);
-        return;
-    }
-    let lines: Vec<Line> = app
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let selected = i == app.sessions_sel;
-            let marker_style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            let depth = app.session_depths.get(i).copied().unwrap_or(0);
-            let branch = if depth == 0 {
-                String::new()
-            } else {
-                format!("{}└ ", "  ".repeat(depth - 1))
-            };
-            let name = crate::display_name(s);
-            let name: String = format!("{branch}{name}").chars().take(28).collect();
-            let state: String = agent_label(s).chars().take(20).collect();
-            let project: String = s.project.chars().take(10).collect();
-            Line::from(vec![
-                Span::styled(if selected { "▸ " } else { "  " }, marker_style),
-                Span::raw(format!("{name:<29}")),
-                Span::styled(format!("{project:<11}"), Style::default().fg(ACCENT)),
-                Span::styled(format!("{state:<21}"), agent_style(s)),
-                Span::styled(s.id.clone(), Style::default().fg(DIM)),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
 /// Renaming a project or moving it to another workspace.
 fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
     let Some(e) = &app.edit else {
@@ -3952,6 +4906,7 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
+                .border_type(BorderType::Rounded)
                 .title(format!(" edit {} ", e.id))
                 .border_style(Style::default().fg(GREEN)),
         ),
@@ -3959,163 +4914,49 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn mission_style(state: &str) -> Style {
-    match state {
-        "running" => Style::default().fg(ACCENT),
-        "done" => Style::default().fg(GREEN),
-        "failed" => Style::default().fg(RED),
-        "interrupted" => Style::default().fg(AMBER),
-        _ => Style::default().fg(DIM),
-    }
-}
-
-/// A project's missions, newest first, and the selected one's details and journal.
-fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered()
-        .title(format!(" missions · {} ", app.missions_project))
-        .border_style(Style::default().fg(BORDER));
-    if app.missions.is_empty() {
-        let lines = vec![
-            Line::styled(
-                "No missions yet.",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                "o starts one: a goal, and an orchestrator plans it and runs agents.",
-                Style::default().fg(DIM),
-            ),
-        ];
-        f.render_widget(Paragraph::new(lines).block(block), area);
-        return;
-    }
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let list_height = (app.missions.len() as u16).clamp(1, (inner.height / 3).max(3));
-    let [list, _, detail] = Layout::vertical([
-        Constraint::Length(list_height),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
-
-    // Keep the selected row in view.
-    let first = app
-        .missions_sel
-        .saturating_sub(list_height.saturating_sub(1) as usize);
-    let rows: Vec<Line> = app
-        .missions
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(list_height as usize)
-        .map(|(i, m)| {
-            let selected = i == app.missions_sel;
-            let date = if m.started_at > 0 {
-                corvx_core::knowledge::time_of(m.started_at)
-                    .trim_end_matches(" UTC")
-                    .to_string()
-            } else {
-                m.journal
-                    .as_ref()
-                    .and_then(|j| j.path.rsplit('/').next())
-                    .and_then(|n| n.get(..10))
-                    .unwrap_or("-")
-                    .to_string()
-            };
-            let mut extra = format!("{} agent{}", m.agents, if m.agents == 1 { "" } else { "s" });
-            if m.worktrees > 0 {
-                extra.push_str(&format!(
-                    " · {} worktree{}",
-                    m.worktrees,
-                    if m.worktrees == 1 { "" } else { "s" }
-                ));
-            }
-            let width =
-                (list.width as usize).saturating_sub(2 + 17 + 12 + extra.chars().count() + 2);
-            let goal: String = m.goal.chars().take(width).collect();
-            Line::from(vec![
-                Span::styled(
-                    if selected { "▸ " } else { "  " },
-                    if selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    },
-                ),
-                Span::styled(format!("{date:<17}"), Style::default().fg(DIM)),
-                Span::styled(format!("{:<12}", m.state()), mission_style(m.state())),
-                Span::styled(
-                    format!("{goal:<width$}"),
-                    if selected {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
-                ),
-                Span::styled(format!("  {extra}"), Style::default().fg(DIM)),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(rows), list);
-
-    let Some(m) = app.missions.get(app.missions_sel) else {
-        return;
-    };
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(s) = &m.session {
-        let mut facts = vec![s.id.clone()];
-        if let Some(model) = &s.agent_model {
-            facts.push(format!("agents on {model}"));
-        }
-        if m.agents_running > 0 {
-            facts.push(format!("{} agent(s) running", m.agents_running));
-        }
-        if m.worktrees > 0 {
-            facts.push(format!(
-                "{} worktree(s) left · c removes the merged ones",
-                m.worktrees
-            ));
-        }
-        if m.running() {
-            facts.push("Enter watches it".into());
-        }
-        lines.push(Line::styled(facts.join(" · "), Style::default().fg(DIM)));
-    }
-    match &m.journal {
-        Some(j) => {
-            lines.push(Line::styled(j.path.clone(), Style::default().fg(DIM)));
-            lines.push(Line::from(""));
-            for l in j.text.lines() {
-                lines.push(if l.starts_with('#') {
-                    Line::styled(
-                        l.to_string(),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Line::raw(l.to_string())
-                });
-            }
-        }
-        None if m.running() => lines.push(Line::styled(
-            "No journal entry yet: the orchestrator writes it when the goal is met.",
-            Style::default().fg(DIM),
-        )),
-        None => lines.push(Line::styled(
-            "It wrote no journal entry.",
-            Style::default().fg(DIM),
-        )),
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.journal_scroll, 0)),
-        detail,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_colours_become_styles() {
+        let line = ansi_line(
+            "\x1b[1;32mok\x1b[0m plain \x1b[38;5;208mor\x1b[38;2;1;2;3mrgb\x1b[39m",
+            80,
+        );
+        let parts: Vec<(&str, Style)> = line
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(parts[0].0, "ok");
+        assert_eq!(parts[0].1.fg, Some(Color::Green));
+        assert!(parts[0].1.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(parts[1], (" plain ", Style::default()));
+        assert_eq!(parts[2].1.fg, Some(Color::Indexed(208)));
+        assert_eq!(parts[3].1.fg, Some(Color::Rgb(1, 2, 3)));
+        // Cut to the width, escapes not counted; other sequences dropped.
+        assert_eq!(
+            strip_escapes("\x1b[2K\x1b[31mabc\x1b]8;;http://x\x07def"),
+            "abcdef"
+        );
+        let cut: String = ansi_line("\x1b[31mabcdef", 3)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(cut, "abc");
+    }
+
+    #[test]
+    fn keys_are_sent_as_a_terminal_sends_them() {
+        assert_eq!(key_bytes(KeyCode::Char('a'), false, false).unwrap(), "a");
+        assert_eq!(key_bytes(KeyCode::Char('c'), true, false).unwrap(), "\x03");
+        assert_eq!(key_bytes(KeyCode::Enter, false, false).unwrap(), "\r");
+        assert_eq!(key_bytes(KeyCode::Up, false, false).unwrap(), "\x1b[A");
+        assert_eq!(key_bytes(KeyCode::Char('b'), false, true).unwrap(), "\x1bb");
+        assert!(key_bytes(KeyCode::F(5), false, false).is_none());
+    }
 
     #[test]
     fn palette_filters_by_label() {
@@ -4131,52 +4972,6 @@ mod tests {
         let area = Rect::new(0, 0, 50, 10);
         let r = centered(area, 100, 100);
         assert!(r.x + r.width <= area.width && r.y + r.height <= area.height);
-    }
-
-    #[test]
-    fn sessions_are_listed_as_a_tree() {
-        use corvx_proto::{AgentState, Session};
-        let mk = |id: &str, sup: Option<&str>, running: bool| Session {
-            id: id.into(),
-            project: "p".into(),
-            command: vec!["claude".into()],
-            runtime: None,
-            backend: "tmux".into(),
-            supervisor: sup.map(String::from),
-            worktree: None,
-            label: None,
-            state: if running {
-                SessionState::Running
-            } else {
-                SessionState::Stopped
-            },
-            pid: None,
-            started_at: 0,
-            ended_at: None,
-            exit_code: None,
-            agent_state: AgentState::Unknown,
-            agent_detail: None,
-            agent_source: None,
-            runtime_session: None,
-            autopilot: false,
-            agent_model: None,
-            human_approves_agents: false,
-        };
-        let input = vec![
-            mk("old", None, false),
-            mk("orch", None, true),
-            mk("backend", Some("orch"), true),
-            mk("frontend", Some("orch"), true),
-            mk("orphan", Some("gone"), true),
-            mk("sub", Some("backend"), true),
-        ];
-        let (order, depths) = session_tree(input);
-        let ids: Vec<&str> = order.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["orch", "backend", "sub", "frontend", "orphan", "old"]
-        );
-        assert_eq!(depths, vec![0, 1, 2, 1, 0, 0]);
     }
 
     #[test]

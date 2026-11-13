@@ -252,6 +252,20 @@ impl Tmux {
         self.run(["capture-pane", "-p", "-J", "-t", name])
     }
 
+    /// The screen with `history` lines above it, as drawn: one line per row, with colours
+    /// as escape codes when `ansi`.
+    pub fn capture_view(&self, name: &str, history: u32, ansi: bool) -> Result<String, String> {
+        let start = format!("-{history}");
+        let mut args = vec!["capture-pane", "-p", "-t", name];
+        if history > 0 {
+            args.extend(["-S", start.as_str()]);
+        }
+        if ansi {
+            args.push("-e");
+        }
+        self.run(args)
+    }
+
     /// Every pane on CORVX's server, by session name. Empty when the server is not running.
     pub fn panes(&self) -> HashMap<String, PaneState> {
         let Ok(out) = self.run([

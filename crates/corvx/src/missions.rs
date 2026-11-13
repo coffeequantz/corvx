@@ -25,12 +25,6 @@ pub(crate) struct Mission {
 }
 
 impl Mission {
-    pub fn running(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|s| s.state == SessionState::Running)
-    }
-
     /// A word for where it stands: running, done, failed, stopped, interrupted.
     pub fn state(&self) -> &'static str {
         let Some(s) = &self.session else {
