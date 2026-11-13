@@ -291,6 +291,8 @@ impl Store {
     ///
     /// An agent can have at most one open item per kind. Items of other kinds are
     /// resolved, because the agent has moved on. Working and idle states resolve everything.
+    /// Waiting after a report keeps the open done or failed item: the agent's turn ends once it
+    /// has reported, and the report is what the human should see.
     pub fn set_session_attention(
         &self,
         session_id: &str,
@@ -300,6 +302,17 @@ impl Store {
         severity: u8,
         now: i64,
     ) -> Result<()> {
+        if state == "waiting" {
+            let reported: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attention WHERE session_id = ?1
+                               AND kind IN ('done', 'failed') AND status IN ('open', 'snoozed'))",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            if reported {
+                return Ok(());
+            }
+        }
         self.conn.execute(
             "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2, note = 'agent moved on'
              WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != ?3 AND kind != 'question'",
@@ -975,6 +988,16 @@ mod attention_tests {
         raise(&store, "s1", "done", 20);
         let kinds: Vec<_> = store
             .list_attention(false, 30)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.kind)
+            .collect();
+        assert_eq!(kinds, vec!["done"]);
+
+        // Its turn ends after the report: the report stays, no "waiting" item.
+        raise(&store, "s1", "waiting", 30);
+        let kinds: Vec<_> = store
+            .list_attention(false, 35)
             .unwrap()
             .into_iter()
             .map(|i| i.kind)

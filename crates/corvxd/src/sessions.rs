@@ -1285,15 +1285,13 @@ impl SessionManager {
         let file = dir.join(format!("{}-{}.md", date_of(started), p.session));
         let mut text = String::new();
         if !file.exists() {
-            let name = entry
-                .session
-                .label
-                .clone()
-                .unwrap_or_else(|| p.session.clone());
+            // (The session's label is cut short for lists; the entries say what the goal was.)
             text.push_str(&format!(
-                "# {name}\n\nSession {} · started {}\n",
+                "# {} mission · {}\n\nSession {} · started {}\n",
+                project.id,
+                date_of(started),
                 p.session,
-                date_of(started)
+                time_of(started)
             ));
         }
         let title = p.title.as_deref().unwrap_or("Entry");
@@ -1391,7 +1389,8 @@ impl SessionManager {
                         .decide_approval(&item.id, "allow", None, now_secs())?;
                     core.store().append_event(
                         "attention.auto_approved",
-                        &json!({"session": p.id, "request": item.summary}),
+                        &json!({"session": p.id, "request": item.summary, "by": "autopilot",
+                                "set_by": p.by.as_deref().unwrap_or("human")}),
                     )?;
                 }
             }
