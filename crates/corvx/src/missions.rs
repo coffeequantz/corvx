@@ -59,7 +59,7 @@ pub(crate) fn missions(
 ) -> Vec<Mission> {
     let mut out: Vec<Mission> = sessions
         .iter()
-        .filter(|s| s.project == project && s.supervisor.is_none() && is_orchestrator(s, sessions))
+        .filter(|s| s.project == project && !crate::is_lead(s) && is_orchestrator(s, sessions))
         .map(|s| {
             let agents: Vec<&Session> = sessions
                 .iter()
@@ -139,13 +139,15 @@ fn date_secs(date: &str) -> i64 {
 }
 
 /// An orchestrator gets a model for its agents and is named so; one from before either
-/// existed is known by the agents it supervises.
-fn is_orchestrator(s: &Session, sessions: &[Session]) -> bool {
+/// existed is known as a top-level session with agents under it. You start orchestrators,
+/// or a project lead does.
+pub(crate) fn is_orchestrator(s: &Session, sessions: &[Session]) -> bool {
     s.agent_model.is_some()
         || crate::display_name(s).starts_with("orchestrator")
-        || sessions
-            .iter()
-            .any(|a| a.supervisor.as_deref() == Some(s.id.as_str()))
+        || (s.supervisor.is_none()
+            && sessions
+                .iter()
+                .any(|a| a.supervisor.as_deref() == Some(s.id.as_str())))
 }
 
 /// The session a journal file belongs to: `.corvx/journal/<date>-<session>.md`.

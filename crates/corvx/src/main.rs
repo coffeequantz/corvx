@@ -69,6 +69,24 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Approver::Orchestrator)]
         approvals: Approver,
     },
+    /// Talk to a project's lead: the long-lived agent that keeps the overview, records goals
+    /// and starts missions. Starts it if it is not running; otherwise sends it your message.
+    Lead {
+        project: String,
+        /// What to tell it. Starting it without a message asks it for a status.
+        message: Vec<String>,
+        /// Its model, when starting it.
+        #[arg(long, default_value = DEFAULT_ORCHESTRATOR_MODEL)]
+        model: String,
+    },
+    /// A project's goals and guideposts (.corvx/goals.md). Lists them when given no subcommand.
+    #[command(args_conflicts_with_subcommands = true)]
+    Goals {
+        #[command(subcommand)]
+        command: Option<GoalsCommand>,
+        /// Project id.
+        project: Option<String>,
+    },
     /// A project's missions, newest first: each orchestrator, its agents and its journal entry.
     Missions {
         project: String,
@@ -110,6 +128,27 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum GoalsCommand {
+    /// Add a goal (active unless you say otherwise).
+    Add {
+        project: String,
+        title: String,
+        /// What done looks like, and why it matters.
+        #[arg(long)]
+        detail: Option<String>,
+        #[arg(long, value_parser = ["active", "next", "done", "dropped"])]
+        status: Option<String>,
+    },
+    /// Change a goal's status.
+    Set {
+        project: String,
+        title: String,
+        #[arg(value_parser = ["active", "next", "done", "dropped"])]
+        status: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum DaemonCommand {
     /// Whether it runs, since when, its sessions, and whether a newer build is on disk.
     Status,
@@ -145,7 +184,7 @@ enum KnowledgeCommand {
     /// it changed.
     Edit {
         project: String,
-        #[arg(value_parser = ["brief", "decisions", "conventions"], default_value = "brief")]
+        #[arg(value_parser = ["brief", "goals", "decisions", "conventions"], default_value = "brief")]
         file: String,
     },
     /// Show a proposal in full.
@@ -311,7 +350,7 @@ enum Approver {
 
 /// Strong models plan and review; cheaper ones execute under their supervision.
 pub(crate) const DEFAULT_ORCHESTRATOR_MODEL: &str = "opus";
-const DEFAULT_AGENT_MODEL: &str = "sonnet";
+pub(crate) const DEFAULT_AGENT_MODEL: &str = "sonnet";
 
 #[derive(Subcommand)]
 enum ProjectCommand {
@@ -440,6 +479,23 @@ fn run() -> Result<()> {
             &data_dir,
         ),
         Command::Missions { project, show } => list_missions(&project, show, &data_dir),
+        Command::Goals { command, project } => goals(command, project, &data_dir),
+        Command::Lead {
+            project,
+            message,
+            model,
+        } => {
+            let mut client = connect(&data_dir)?;
+            let message = message.join(" ");
+            match talk_to_lead(&mut client, &project, &model, &message)? {
+                Talked::Started(id) => {
+                    println!("started the lead of {project}: {id} on {model}");
+                    println!("  talk to it: corvx lead {project} <message> · corvx session attach {id} · t in the TUI");
+                }
+                Talked::Sent(id) => println!("sent to the lead of {project} ({id})"),
+            }
+            Ok(())
+        }
         Command::Mcp => unreachable!("handled above"),
     }
 }
@@ -818,6 +874,81 @@ fn duration_label(secs: i64) -> String {
         s if s < 86_400 => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
         s => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
     }
+}
+
+fn goals(
+    command: Option<GoalsCommand>,
+    project: Option<String>,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let mut client = connect(data_dir)?;
+    let (project, title, status, detail) = match command {
+        None => {
+            let Some(project) = project else {
+                anyhow::bail!("which project? corvx goals <project>");
+            };
+            let k: corvx_proto::Knowledge = client.call(
+                methods::KNOWLEDGE_READ,
+                &json!({"project": project, "journal": 0}),
+            )?;
+            print!("{}", describe_goals(&k));
+            return Ok(());
+        }
+        Some(GoalsCommand::Add {
+            project,
+            title,
+            detail,
+            status,
+        }) => (project, title, status, detail),
+        Some(GoalsCommand::Set {
+            project,
+            title,
+            status,
+        }) => (project, title, Some(status), None),
+    };
+    let done: corvx_proto::KnowledgeAccepted = client.call(
+        methods::KNOWLEDGE_GOAL,
+        &corvx_proto::KnowledgeGoalParams {
+            project,
+            title: title.clone(),
+            status,
+            detail,
+        },
+    )?;
+    println!(
+        "{title}: written to {}{}",
+        done.file,
+        if done.committed { " and committed" } else { "" }
+    );
+    if let Some(note) = done.note {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+/// A project's goals and guideposts, as text.
+pub(crate) fn describe_goals(k: &corvx_proto::Knowledge) -> String {
+    let mut out = String::new();
+    if k.guideposts.is_empty() {
+        out.push_str("guideposts: none yet (corvx knowledge edit <project> goals)\n");
+    } else {
+        out.push_str("guideposts:\n");
+        for g in &k.guideposts {
+            out.push_str(&format!("  - {g}\n"));
+        }
+    }
+    if k.goals.is_empty() {
+        out.push_str(&format!(
+            "goals: none yet · corvx goals add {} \"<goal>\"\n",
+            k.project
+        ));
+    } else {
+        out.push_str("goals:\n");
+        for g in &k.goals {
+            out.push_str(&format!("  {:<8} {}\n", g.status, g.title));
+        }
+    }
+    out
 }
 
 /// A project's missions, from the daemon's sessions and the project's journal.
@@ -1581,8 +1712,9 @@ const ORCHESTRATOR_PROMPT: &str = "You are an orchestrator working through CORVX
 you plan, delegate to coding agents, review their work, and keep the human informed.
 
 How to work:
-1. Read the project: read_knowledge first (its brief, decisions, conventions, map and the latest mission journals), \
-then its README and whatever else you need. Break the goal into pieces that can be done independently by separate \
+1. Read the project: read_knowledge first (its brief, goals and guideposts, decisions, conventions, map and the latest \
+mission journals), then its README and whatever else you need. Follow the guideposts. If the mission serves one of \
+the goals, say which. Break the goal into pieces that can be done independently by separate \
 agents. In your plan, name the decisions and conventions that shape it, and what earlier missions taught that you \
 are applying.
 2. If agents must agree on an interface (an API, a data format), write that contract to a file in the repository \
@@ -1599,7 +1731,8 @@ and what was learned that the next mission on this project should know. \
 7. Propose what should be remembered with propose_knowledge, one point per proposal, each with its evidence: \
 decisions made in this mission and why, conventions the agents should follow next time, pitfalls that cost time. \
 Only what would change how later work is done, and not what the knowledge already says, is waiting, or was \
-rejected. Usually zero to three proposals. The human accepts, edits or rejects them in the inbox. \
+rejected. Usually zero to three proposals. If the mission completed a goal in goals.md, propose marking it done \
+(file goals, replacing its heading). The human accepts, edits or rejects them in the inbox. \
 8. Summarize what each agent did, which branches hold the work, which knowledge you proposed, and what the human \
 should review or merge, and call report_done with that summary. It is added to the journal, and CORVX commits the journal entry, so do not \
 commit it yourself.";
@@ -1611,7 +1744,13 @@ fn orchestrator_prompt(agent_model: &str, human_approves_agents: bool) -> String
 start_agent uses {agent_model} unless you pass model. Pick haiku for mechanical work (renames, formatting, \
 docs, simple tests) and a stronger model (opus) only for a piece that needs it (tricky design, hard debugging)."
     );
-    let approvals = if human_approves_agents {
+    let approvals = approvals_policy(human_approves_agents);
+    format!("{ORCHESTRATOR_PROMPT}\n\n{models}\n\n{approvals}")
+}
+
+/// Who decides the permission requests of the sessions an orchestrator (or lead) supervises.
+fn approvals_policy(human_approves_agents: bool) -> String {
+    if human_approves_agents {
         // (The project's autonomy level, which the human can change at any time, decides how
         // many requests reach anyone at all; see below.)
         "Approvals: the human decides your agents' permission requests. When wait_for reports an approval, \
@@ -1631,8 +1770,7 @@ or plan work that does not need them. A request a rule denies fails with the rul
 The project's autonomy level, which the human sets and may change at any time, decides how much reaches you: \
 at supervised every request goes to the human and you cannot set_autopilot; at autonomous or full most \
 requests are approved without asking.".to_string()
-    };
-    format!("{ORCHESTRATOR_PROMPT}\n\n{models}\n\n{approvals}")
+    }
 }
 
 /// A readable name for a session: its label, or one derived from its command for sessions
@@ -1680,11 +1818,15 @@ fn orchestrate(
     let mut client = connect(data_dir)?;
     let started = start_orchestrator(
         &mut client,
-        project,
-        goal,
-        model,
-        agent_model,
-        human_approves_agents,
+        &Mission {
+            project,
+            goal,
+            model,
+            agent_model,
+            human_approves_agents,
+            serves: None,
+            supervisor: None,
+        },
     )?;
     println!(
         "started orchestrator {} on {model}; its agents default to {agent_model}",
@@ -1711,42 +1853,59 @@ pub(crate) struct Started {
     pub wired: bool,
 }
 
-/// Starts an orchestrator session on a project. Shared by `corvx orchestrate` and the TUI.
+/// What a mission is started with.
+pub(crate) struct Mission<'a> {
+    pub project: &'a str,
+    pub goal: &'a str,
+    pub model: &'a str,
+    pub agent_model: &'a str,
+    pub human_approves_agents: bool,
+    /// The project goal (from goals.md) it serves.
+    pub serves: Option<&'a str>,
+    /// A project lead that started it; None when you did.
+    pub supervisor: Option<String>,
+}
+
+/// Starts an orchestrator session on a project. Shared by `corvx orchestrate`, the TUI and a
+/// project lead's `start_mission`.
 pub(crate) fn start_orchestrator(
     client: &mut corvx_client::Client,
-    project: &str,
-    goal: &str,
-    model: &str,
-    agent_model: &str,
-    human_approves_agents: bool,
+    m: &Mission,
 ) -> Result<Started> {
     use corvx_proto::{methods, Session, SessionStartParams};
+    let prompt = match m.serves {
+        Some(goal) => format!(
+            "{}\n\n(This mission serves the project goal \"{goal}\" in .corvx/goals.md.)",
+            m.goal
+        ),
+        None => m.goal.to_string(),
+    };
     let args = vec![
         "--append-system-prompt".to_string(),
-        orchestrator_prompt(agent_model, human_approves_agents),
+        orchestrator_prompt(m.agent_model, m.human_approves_agents),
         "--model".into(),
-        model.to_string(),
-        goal.to_string(),
+        m.model.to_string(),
+        prompt,
     ];
     let params = SessionStartParams {
-        project: project.to_string(),
+        project: m.project.to_string(),
         // `CORVX_AGENT_COMMAND` replaces the agent program, e.g. with a test stand-in.
         command: std::env::var("CORVX_AGENT_COMMAND").unwrap_or_else(|_| "claude".into()),
         args,
         runtime: Some("claude".into()),
         backend: None,
-        supervisor: None,
+        supervisor: m.supervisor.clone(),
         worktree: false,
-        label: Some(format!("orchestrator · {}", short_label(goal))),
+        label: Some(format!("orchestrator · {}", short_label(m.goal))),
         autopilot: false,
-        agent_model: Some(agent_model.to_string()),
-        human_approves_agents,
+        agent_model: Some(m.agent_model.to_string()),
+        human_approves_agents: m.human_approves_agents,
     };
     let knowledge: Option<corvx_proto::Knowledge> = client
         .call(
             methods::KNOWLEDGE_READ,
             &corvx_proto::KnowledgeReadParams {
-                project: project.to_string(),
+                project: m.project.to_string(),
                 journal: Some(0),
             },
         )
@@ -1756,6 +1915,142 @@ pub(crate) fn start_orchestrator(
         session,
         wired: knowledge.map_or(true, |k| k.wired),
     })
+}
+
+/// The label that marks a project's lead.
+pub(crate) const LEAD_LABEL: &str = "lead · ";
+
+/// Whether a session is a project lead: the long-lived agent you talk to about a project.
+pub(crate) fn is_lead(s: &corvx_proto::Session) -> bool {
+    s.label
+        .as_deref()
+        .is_some_and(|l| l.starts_with(LEAD_LABEL))
+}
+
+pub(crate) enum Talked {
+    Started(String),
+    Sent(String),
+}
+
+/// The project's running lead, if it has one.
+pub(crate) fn running_lead<'a>(
+    sessions: &'a [corvx_proto::Session],
+    project: &str,
+) -> Option<&'a corvx_proto::Session> {
+    sessions
+        .iter()
+        .rev()
+        .find(|s| s.project == project && is_lead(s) && s.state == SessionState::Running)
+}
+
+/// Sends a message to the project's lead, starting the lead (with the message as its first
+/// one) when none runs. An interrupted lead is resumed rather than replaced.
+pub(crate) fn talk_to_lead(
+    client: &mut corvx_client::Client,
+    project: &str,
+    model: &str,
+    message: &str,
+) -> Result<Talked> {
+    let list: SessionList = client.call(methods::SESSION_LIST, &json!({"project": project}))?;
+    if let Some(lead) = running_lead(&list.sessions, project) {
+        if message.trim().is_empty() {
+            anyhow::bail!(
+                "the lead of {project} is running ({}): say something to it",
+                lead.id
+            );
+        }
+        let _: serde_json::Value = client.call(
+            methods::SESSION_INPUT,
+            &json!({"id": lead.id, "data": format!("{}\r", message.trim())}),
+        )?;
+        return Ok(Talked::Sent(lead.id.clone()));
+    }
+    if let Some(lost) = list
+        .sessions
+        .iter()
+        .rev()
+        .find(|s| s.project == project && is_lead(s) && s.state == SessionState::Lost)
+    {
+        anyhow::bail!(
+            "the lead of {project} ({}) was interrupted: corvx session resume {} continues its conversation",
+            lost.id,
+            lost.id
+        );
+    }
+    let lead = start_lead(client, project, model, Some(message))?;
+    Ok(Talked::Started(lead.id))
+}
+
+/// What a new lead is asked first, when you start it without saying anything.
+pub(crate) const LEAD_FIRST: &str =
+    "Read the project and give me a short status: the goals, recent missions, what is waiting for me, and what you suggest next.";
+
+/// Starts a project's lead: a long-lived session on a strong model that you talk to. It
+/// keeps the overview, records goals, and starts missions (orchestrators under it).
+pub(crate) fn start_lead(
+    client: &mut corvx_client::Client,
+    project: &str,
+    model: &str,
+    first: Option<&str>,
+) -> Result<corvx_proto::Session> {
+    use corvx_proto::{methods, Session, SessionStartParams};
+    let first = first
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .unwrap_or(LEAD_FIRST);
+    let params = SessionStartParams {
+        project: project.to_string(),
+        command: std::env::var("CORVX_AGENT_COMMAND").unwrap_or_else(|_| "claude".into()),
+        args: vec![
+            "--append-system-prompt".to_string(),
+            lead_prompt(),
+            "--model".into(),
+            model.to_string(),
+            first.to_string(),
+        ],
+        runtime: Some("claude".into()),
+        backend: None,
+        supervisor: None,
+        worktree: false,
+        label: Some(format!("{LEAD_LABEL}{project}")),
+        autopilot: false,
+        // The model missions' agents get unless an orchestrator picks another.
+        agent_model: Some(DEFAULT_AGENT_MODEL.to_string()),
+        human_approves_agents: false,
+    };
+    client.call::<_, Session>(methods::SESSION_START, &params)
+}
+
+const LEAD_PROMPT: &str = "You are the lead for this project, working through CORVX. The human talks to you about \
+the project: where it is heading, what to do next, how the work is going. You keep the overview and start missions. \
+You do not write code, and you do not run coding agents yourself: each mission has its own orchestrator for that.
+
+How to work:
+1. Read the project first: read_knowledge (its brief, goals and guideposts, decisions, conventions, map and recent \
+mission journals) and list_agents (missions you started that still run). Answer the human from that.
+2. When the human gives you a goal or a direction, make sure you understand it (ask here; the human is in this \
+conversation), then start a mission with start_mission. Its goal must be complete on its own (the orchestrator cannot \
+see this conversation): what to achieve, what done looks like, the guideposts and decisions that matter, and anything \
+the human told you. Name the project goal it serves. Start one mission at a time unless pieces are truly independent. \
+Say which missions you started and why.
+3. Watch your missions with wait_for, with short timeouts (about 20 seconds) so the human can reach you between \
+calls. A mission's orchestrator runs its own agents and decides their requests; you see when a mission is waiting, \
+done or failed. When it is waiting, read_screen to see why, and answer with send_message if you can; otherwise ask \
+the human here.
+4. When the human redirects work (\"you're using too many agents\", \"focus on X first\"), pass it on with \
+send_message to the orchestrator concerned, as a clear instruction, and tell the human you did.
+5. Goals: when the human states a new goal, or changes or drops one, record it with propose_knowledge (file goals); \
+the human accepts it in the CORVX inbox. When a mission completes a goal, propose marking it done. Follow the \
+guideposts in everything you start.
+6. When a mission ends, tell the human in plain words what was done, what to review or merge, and what you suggest \
+next. Do not call report_done and do not stop on your own: you keep running until the human stops you.";
+
+fn lead_prompt() -> String {
+    format!(
+        "{LEAD_PROMPT}\n\nModels: missions' orchestrators run on opus unless you pass model, and their agents on \
+{DEFAULT_AGENT_MODEL} unless you pass agent_model.\n\n{}",
+        approvals_policy(false).replace("your agents'", "your missions' orchestrators'")
+    )
 }
 
 /// `corvx knowledge`: a project's knowledge files and the proposals to change them.

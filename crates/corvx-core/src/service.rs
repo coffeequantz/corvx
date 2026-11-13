@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use corvx_proto::{
     codes, methods, rule_actions, AttentionAnswerParams, AttentionDismissParams, AttentionIdParams,
     AttentionList, AttentionListParams, AttentionSnoozeParams, DaemonInfo, KnowledgeAcceptParams,
-    KnowledgeCommitParams, KnowledgeInitParams, KnowledgeProposalsParams, KnowledgeProposeParams,
-    KnowledgeReadParams, KnowledgeRejectParams, Project, ProjectAddParams, ProjectAutonomyParams,
-    ProjectList, ProjectRemoveParams, ProjectUpdateParams, ProposalList, RuleList, RulesAddParams,
-    RulesListParams, RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
+    KnowledgeCommitParams, KnowledgeGoalParams, KnowledgeInitParams, KnowledgeProposalsParams,
+    KnowledgeProposeParams, KnowledgeReadParams, KnowledgeRejectParams, Project, ProjectAddParams,
+    ProjectAutonomyParams, ProjectList, ProjectRemoveParams, ProjectUpdateParams, ProposalList,
+    RuleList, RulesAddParams, RulesListParams, RulesRemoveParams, RulesSetParams, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -179,6 +179,11 @@ impl Core {
                 let p: KnowledgeRejectParams = parse(params)?;
                 knowledge::reject(&self.store, &p.id, p.reason.as_deref(), now_secs())?;
                 Ok(json!({"rejected": p.id}))
+            }
+            methods::KNOWLEDGE_GOAL => {
+                let p: KnowledgeGoalParams = parse(params)?;
+                let done = knowledge::set_goal(&self.store, &p)?;
+                Ok(serde_json::to_value(done).expect("KnowledgeAccepted serializes"))
             }
             methods::PROJECT_UPDATE => {
                 let p: ProjectUpdateParams = parse(params)?;

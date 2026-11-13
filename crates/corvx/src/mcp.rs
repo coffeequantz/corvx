@@ -274,6 +274,42 @@ impl Server {
                           "note": "Use wait_for to learn when it needs you."}),
                 )
             }
+            "start_mission" => {
+                let me = self
+                    .me
+                    .clone()
+                    .ok_or_else(|| anyhow!("start_mission only works inside a CORVX session"))?;
+                let goal = s("goal").ok_or_else(|| anyhow!("goal is required"))?;
+                let project = match s("project") {
+                    Some(p) => p,
+                    None => self.my_project()?,
+                };
+                let model = s("model").unwrap_or_else(|| crate::DEFAULT_ORCHESTRATOR_MODEL.into());
+                let agent_model =
+                    s("agent_model").unwrap_or_else(|| crate::DEFAULT_AGENT_MODEL.into());
+                let serves = s("serves");
+                let human = s("approvals").as_deref() == Some("human");
+                if self.client.is_none() {
+                    self.client = Some(ensure_daemon(&self.data_dir, None)?);
+                }
+                let started = crate::start_orchestrator(
+                    self.client.as_mut().unwrap(),
+                    &crate::Mission {
+                        project: &project,
+                        goal: &goal,
+                        model: &model,
+                        agent_model: &agent_model,
+                        human_approves_agents: human,
+                        serves: serves.as_deref(),
+                        supervisor: Some(me),
+                    },
+                )?;
+                self.arm(&started.session.id, AgentState::Unknown);
+                Ok(
+                    json!({"id": started.session.id, "model": model, "agent_model": agent_model,
+                          "note": "Its orchestrator plans the work and runs agents. wait_for reports when it is waiting, done or failed; send_message redirects it."}),
+                )
+            }
             "list_agents" => {
                 let list = self.supervised()?;
                 Ok(json!(list.iter().map(describe).collect::<Vec<_>>()))
@@ -380,11 +416,14 @@ impl Server {
                     .ok_or_else(|| anyhow!("report_done only works inside a CORVX session"))?;
                 let summary = s("summary").ok_or_else(|| anyhow!("summary is required"))?;
                 let outcome = s("outcome").unwrap_or_else(|| "done".into());
-                // An orchestrator's report closes its mission's journal entry.
-                let top_level = self
-                    .sessions()?
-                    .iter()
-                    .any(|x| x.id == me && x.supervisor.is_none());
+                // An orchestrator's report closes its mission's journal entry, whether you or
+                // a project lead started it (an orchestrator gets a model for its agents), and
+                // so does any top-level session's. An agent's and the lead's do not.
+                let top_level = self.sessions()?.iter().any(|x| {
+                    x.id == me
+                        && (x.supervisor.is_none() || x.agent_model.is_some())
+                        && !crate::is_lead(x)
+                });
                 let journal = if top_level {
                     let title = if outcome == "failed" {
                         "Failed"
@@ -609,6 +648,18 @@ fn pretty(v: &Value) -> String {
 fn tools() -> Value {
     json!([
         {
+            "name": "start_mission",
+            "description": "For a project lead: start a mission, an orchestrator that plans the goal, runs its own coding agents in worktrees, and reports when done. It cannot see your conversation, so the goal must be complete: what to achieve, what done looks like, the guideposts and decisions that matter, and what the human said. wait_for reports the mission; send_message redirects it.",
+            "inputSchema": {"type": "object", "properties": {
+                "goal": {"type": "string", "description": "The mission's goal, complete on its own."},
+                "serves": {"type": "string", "description": "The title of the project goal (in goals.md) it serves."},
+                "project": {"type": "string", "description": "Default: your own project."},
+                "model": {"type": "string", "description": "The orchestrator's model. Default: opus."},
+                "agent_model": {"type": "string", "description": "Its agents' model unless it picks another. Default: sonnet."},
+                "approvals": {"type": "string", "enum": ["orchestrator", "human"], "description": "Who decides its agents' permission requests. Default: its orchestrator."}
+            }, "required": ["goal"]}
+        },
+        {
             "name": "list_projects",
             "description": "List the projects CORVX knows, with their paths, stack and test command.",
             "inputSchema": {"type": "object", "properties": {}}
@@ -685,7 +736,7 @@ fn tools() -> Value {
             "name": "propose_knowledge",
             "description": "Propose an addition or edit to a project's knowledge, for the human to accept, edit or reject in the inbox. Accepted proposals are written to .corvx/<file>.md and every later agent starts from them. Propose only what would change how later work is done: a decision with its reason, a convention, a pitfall. One proposal per point. Do not repeat what the files already say, what is waiting, or what was rejected.",
             "inputSchema": {"type": "object", "properties": {
-                "file": {"type": "string", "enum": ["decisions", "conventions", "brief"], "description": "decisions: architecture and product choices, with the reason. conventions: how things are done here (style, patterns, testing, pitfalls). brief: what the project is and its priorities (the human's; propose edits sparingly)."},
+                "file": {"type": "string", "enum": ["decisions", "conventions", "goals", "brief"], "description": "decisions: architecture and product choices, with the reason. conventions: how things are done here (style, patterns, testing, pitfalls). goals: a new goal (title = the goal, text = what done looks like and why), or, with replaces, marking one done (replace its \"### Title · active\" heading with \"### Title · done\"); the human's, so propose sparingly. brief: what the project is and its priorities (the human's; propose edits sparingly)."},
                 "title": {"type": "string", "description": "One line, e.g. 'Time comes from server.now()'."},
                 "text": {"type": "string", "description": "Markdown, short: the rule or decision, and why."},
                 "evidence": {"type": "string", "description": "Where it comes from: the mission, review finding or correction, e.g. 'mission s12: two agents each wrote their own clock'."},
@@ -728,6 +779,8 @@ fn describe_knowledge(k: &Knowledge) -> Value {
         .collect();
     json!({
         "project": k.project,
+        "goals": k.goals.iter().map(|g| json!({"title": g.title, "status": g.status, "detail": g.detail})).collect::<Vec<_>>(),
+        "guideposts": k.guideposts,
         "files": files,
         "journal": k.journal.iter().map(|e| json!({"path": e.path, "text": e.text})).collect::<Vec<_>>(),
         "journal_entries_in_all": k.journal_count,

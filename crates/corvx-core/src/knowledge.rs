@@ -2,6 +2,8 @@
 //! from, and the proposals that change them.
 //!
 //! - `brief.md`: what the project is and what matters now. Yours; agents may propose edits.
+//! - `goals.md`: where it is heading (goals, each with a status) and the guideposts every
+//!   mission follows. Yours; agents may propose goals or mark one done.
 //! - `decisions.md`, `conventions.md`: changed only through proposals the human accepts.
 //! - `map.md`: generated from the project's files (stack, commands, structure, entry points).
 //! - `journal/`: one file per mission, written by orchestrators (see the daemon).
@@ -15,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use corvx_proto::{
-    codes, knowledge_files, JournalEntry, Knowledge, KnowledgeAccepted, KnowledgeFile,
-    KnowledgeInit, KnowledgeProposeParams, Project, Proposal,
+    codes, goal_status, knowledge_files, Goal, JournalEntry, Knowledge, KnowledgeAccepted,
+    KnowledgeFile, KnowledgeGoalParams, KnowledgeInit, KnowledgeProposeParams, Project, Proposal,
 };
 use serde_json::json;
 
@@ -96,6 +98,8 @@ pub fn read(store: &Store, project: &str, journal: usize) -> Result<Knowledge, S
         exists: abs(root, "map").is_file(),
         text: map_text(&p),
     });
+    let goals_text = fs::read_to_string(abs(root, knowledge_files::GOALS)).unwrap_or_default();
+    let (goals, guideposts) = parse_goals(&goals_text);
     let entries = journal_files(root);
     let journal_entries = entries
         .iter()
@@ -112,11 +116,165 @@ pub fn read(store: &Store, project: &str, journal: usize) -> Result<Knowledge, S
         project: p.id.clone(),
         path: p.path.clone(),
         files,
+        goals,
+        guideposts,
         journal: journal_entries,
         journal_count: entries.len(),
         open: store.list_proposals(Some(&p.id), false)?,
         rejected: store.rejected_proposals(&p.id, 20)?,
         wired: wired(root),
+    })
+}
+
+/// The goals and guideposts in a `goals.md`. Goals are `### Title · status` headings under
+/// `## Goals` (a heading without a known status is active); guideposts are the `- ` lines
+/// under `## Guideposts`. Placeholder lines in parentheses are not counted.
+pub fn parse_goals(text: &str) -> (Vec<Goal>, Vec<String>) {
+    let mut goals: Vec<Goal> = Vec::new();
+    let mut guideposts = Vec::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            section = h.trim().to_lowercase();
+            continue;
+        }
+        if section.starts_with("guidepost") {
+            if let Some(g) = line.trim().strip_prefix("- ") {
+                if !g.trim().is_empty() {
+                    guideposts.push(g.trim().to_string());
+                }
+            }
+        } else if section.starts_with("goal") {
+            if let Some(h) = line.strip_prefix("### ") {
+                let (title, status) = split_goal_heading(h);
+                goals.push(Goal {
+                    title,
+                    status,
+                    detail: String::new(),
+                });
+            } else if let Some(g) = goals.last_mut() {
+                let t = line.trim();
+                let placeholder = t.starts_with('(') && t.ends_with(')');
+                if !t.is_empty() && !placeholder {
+                    if !g.detail.is_empty() {
+                        g.detail.push('\n');
+                    }
+                    g.detail.push_str(t);
+                }
+            }
+        }
+    }
+    (goals, guideposts)
+}
+
+/// "Click stats · active" → ("Click stats", "active").
+fn split_goal_heading(h: &str) -> (String, String) {
+    if let Some((title, status)) = h.rsplit_once(" · ") {
+        let status = status.trim().to_lowercase();
+        if goal_status::ALL.contains(&status.as_str()) {
+            return (title.trim().to_string(), status);
+        }
+    }
+    (h.trim().to_string(), goal_status::ACTIVE.to_string())
+}
+
+/// Adds a goal, or changes the status (and detail) of the goal with that title. Commits
+/// `goals.md`.
+pub fn set_goal(store: &Store, p: &KnowledgeGoalParams) -> Result<KnowledgeAccepted, ServiceError> {
+    let project = project_of(store, &p.project)?;
+    let root = Path::new(&project.path);
+    let title = p.title.trim();
+    if title.is_empty() || title.contains('\n') || title.len() > MAX_TITLE {
+        return Err(invalid(format!(
+            "a goal needs a title: one line, at most {MAX_TITLE} characters"
+        )));
+    }
+    if let Some(s) = &p.status {
+        if !goal_status::ALL.contains(&s.as_str()) {
+            return Err(invalid(format!(
+                "unknown status '{s}': one of {}",
+                goal_status::ALL.join(", ")
+            )));
+        }
+    }
+    let path = abs(root, knowledge_files::GOALS);
+    let dir = root.join(".corvx");
+    fs::create_dir_all(&dir).map_err(|e| io_error(&dir, e))?;
+    let current =
+        fs::read_to_string(&path).unwrap_or_else(|_| header(knowledge_files::GOALS, &project.name));
+    let key = normalize(title);
+    let mut lines: Vec<String> = current.lines().map(str::to_string).collect();
+    let mut in_goals = false;
+    let mut found = None;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(h) = line.strip_prefix("## ") {
+            in_goals = h.trim().to_lowercase().starts_with("goal");
+        } else if in_goals {
+            if let Some(h) = line.strip_prefix("### ") {
+                if normalize(&split_goal_heading(h).0) == key {
+                    found = Some(i);
+                }
+            }
+        }
+    }
+    let status;
+    let out = match found {
+        Some(i) => {
+            let (old_title, old_status) = split_goal_heading(lines[i].trim_start_matches("### "));
+            status = p.status.clone().unwrap_or(old_status);
+            lines[i] = format!("### {old_title} · {status}");
+            if let Some(detail) = p.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                // The detail runs to the next heading.
+                let end = (i + 1..lines.len())
+                    .find(|&j| lines[j].starts_with("#"))
+                    .unwrap_or(lines.len());
+                lines.splice(
+                    i + 1..end,
+                    ["".to_string(), detail.to_string(), "".to_string()],
+                );
+            }
+            let mut text = lines.join("\n");
+            text.push('\n');
+            text
+        }
+        None => {
+            status = p
+                .status
+                .clone()
+                .unwrap_or_else(|| goal_status::ACTIVE.into());
+            let mut text = current.clone();
+            if !text.to_lowercase().contains("\n## goals")
+                && !text.to_lowercase().starts_with("## goals")
+            {
+                text = format!("{}\n\n## Goals\n", text.trim_end());
+            }
+            let detail = p.detail.as_deref().map(str::trim).unwrap_or("");
+            let mut section = format!("### {title} · {status}\n");
+            if !detail.is_empty() {
+                section.push_str(&format!("\n{detail}\n"));
+            }
+            let mut text = text.trim_end().to_string();
+            text.push_str("\n\n");
+            text.push_str(&section);
+            text
+        }
+    };
+    fs::write(&path, out).map_err(|e| io_error(&path, e))?;
+    let rel = rel_path(knowledge_files::GOALS);
+    let (committed, note) = commit(
+        root,
+        std::slice::from_ref(&rel),
+        &format!("Goals: {title} ({status})"),
+    );
+    store.append_event(
+        "knowledge.goal",
+        &json!({"project": project.id, "title": title, "status": status,
+                "new": found.is_none(), "committed": committed}),
+    )?;
+    Ok(KnowledgeAccepted {
+        file: rel,
+        committed,
+        note,
     })
 }
 
@@ -311,6 +469,17 @@ fn header(file: &str, name: &str) -> String {
             "# Decisions\n\nArchitecture and product decisions for {name}, with dates and reasons. \
              Changed through proposals accepted in CORVX.\n"
         ),
+        knowledge_files::GOALS => format!(
+            "# Goals\n\nWhere {name} is heading, and what guides the work. Yours: change it any \
+             time (CORVX commits it). Orchestrators read it, say which goal a mission serves, and \
+             may propose new goals or marking one done.\n\n\
+             ## Guideposts\n\n\
+             (Principles every mission follows, one per line starting with \"- \". For example: \
+             - Keep it dependency-free.)\n\n\
+             ## Goals\n\n\
+             (One \"### Title · status\" heading per goal; the status is active, next, done or \
+             dropped. Below it: what done looks like, and why it matters.)\n"
+        ),
         knowledge_files::CONVENTIONS => format!(
             "# Conventions\n\nHow things are done in {name}: style, patterns, testing rules, pitfalls. \
              Changed through proposals accepted in CORVX.\n"
@@ -339,17 +508,33 @@ fn wiring(for_claude: bool) -> String {
             .join("\n")
     };
     let intro = if for_claude {
-        "What has been learned about this project. Follow it, and cite the decisions and \
-         conventions that shape your plan."
+        "Where this project is heading and what has been learned about it. Follow the \
+         guideposts in goals.md, and cite the decisions and conventions that shape your plan."
     } else {
-        "Read these before you start: what has been learned about this project. Follow it, and \
-         cite the decisions and conventions that shape your plan."
+        "Read these before you start: where this project is heading and what has been learned \
+         about it. Follow the guideposts in goals.md, and cite the decisions and conventions \
+         that shape your plan."
     };
     format!(
         "{WIRE_START}\n## Project knowledge\n\n{intro}\n\n{files}\n\nPast missions are in \
          `.corvx/journal/`. To change these files, propose the change with CORVX's \
          `propose_knowledge` tool; do not edit them yourself.\n{WIRE_END}\n"
     )
+}
+
+/// The text with CORVX's block replaced by `block`, or None if it is already the same.
+fn replace_block(text: &str, block: &str) -> Option<String> {
+    let start = text.find(WIRE_START)?;
+    let end = text[start..].find(WIRE_END)? + start + WIRE_END.len();
+    let end = if text[end..].starts_with('\n') {
+        end + 1
+    } else {
+        end
+    };
+    if &text[start..end] == block {
+        return None;
+    }
+    Some(format!("{}{}{}", &text[..start], block, &text[end..]))
 }
 
 /// Appends `text` to a file, starting on a new line.
@@ -386,7 +571,12 @@ pub fn init(store: &Store, project: &str) -> Result<KnowledgeInit, ServiceError>
     for (file, for_claude) in [("CLAUDE.md", true), ("AGENTS.md", false)] {
         let path = root.join(file);
         let current = fs::read_to_string(&path).ok();
-        if current.as_deref().is_some_and(|t| t.contains(WIRE_START)) {
+        if let Some(text) = current.as_deref().filter(|t| t.contains(WIRE_START)) {
+            // Set up before: bring the block up to date (e.g. a knowledge file added since).
+            if let Some(updated) = replace_block(text, &wiring(for_claude)) {
+                fs::write(&path, updated).map_err(|e| io_error(&path, e))?;
+                written.push(file.to_string());
+            }
             continue;
         }
         match current {
@@ -651,6 +841,12 @@ pub fn accept(
             fs::write(&path, current.replacen(old.as_str(), &text, 1))
                 .map_err(|e| io_error(&path, e))?;
         }
+        None if p.file == knowledge_files::GOALS => {
+            // A proposed goal becomes a goal heading; it is active once you accept it.
+            let current = current.unwrap_or_else(|| header(&p.file, &project.name));
+            let section = format!("### {} · {}\n\n{}\n", p.title, goal_status::ACTIVE, text);
+            append(&path, Some(current), &section)?;
+        }
         None => {
             let current = current.unwrap_or_else(|| header(&p.file, &project.name));
             let mut section = format!("## {}\n\n{}\n", p.title, text);
@@ -854,6 +1050,125 @@ mod tests {
     }
 
     #[test]
+    fn goals_are_parsed_added_and_changed() {
+        let (dir, store) = setup();
+        let root = dir.path();
+        init(&store, "app").unwrap();
+        // The template has placeholders only.
+        let k = read(&store, "app", 0).unwrap();
+        assert!(
+            k.goals.is_empty() && k.guideposts.is_empty(),
+            "{:?} {:?}",
+            k.goals,
+            k.guideposts
+        );
+        assert_eq!(k.files[1].name, "goals");
+
+        let add = |title: &str, status: Option<&str>, detail: Option<&str>| {
+            set_goal(
+                &store,
+                &KnowledgeGoalParams {
+                    project: "app".into(),
+                    title: title.into(),
+                    status: status.map(Into::into),
+                    detail: detail.map(Into::into),
+                },
+            )
+            .unwrap()
+        };
+        let done = add(
+            "Click stats",
+            None,
+            Some("Each link shows its clicks per day."),
+        );
+        assert!(done.committed, "{done:?}");
+        assert!(last_commit(root).starts_with("Goals: Click stats (active)"));
+        add("Rate limiting", Some("next"), None);
+        // The same title (any case) changes the goal instead of adding another.
+        add("click STATS", Some("done"), None);
+        let goals_md = fs::read_to_string(root.join(".corvx/goals.md")).unwrap();
+        fs::write(
+            root.join(".corvx/goals.md"),
+            goals_md.replace(
+                "## Guideposts\n",
+                "## Guideposts\n\n- No new dependencies.\n- Keep the API stable.\n",
+            ),
+        )
+        .unwrap();
+        let k = read(&store, "app", 0).unwrap();
+        let summary: Vec<(String, String)> = k
+            .goals
+            .iter()
+            .map(|g| (g.title.clone(), g.status.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Click stats".to_string(), "done".to_string()),
+                ("Rate limiting".to_string(), "next".to_string())
+            ]
+        );
+        assert_eq!(k.goals[0].detail, "Each link shows its clicks per day.");
+        assert_eq!(
+            k.guideposts,
+            vec!["No new dependencies.", "Keep the API stable."]
+        );
+
+        let bad = set_goal(
+            &store,
+            &KnowledgeGoalParams {
+                project: "app".into(),
+                title: "X".into(),
+                status: Some("someday".into()),
+                detail: None,
+            },
+        );
+        assert!(bad.is_err());
+
+        // An accepted goal proposal becomes an active goal.
+        let p = propose(
+            &store,
+            &propose_params("goals", "Custom codes", "Users pick a code."),
+            5,
+        )
+        .unwrap();
+        accept(&store, &p.id, None, 6).unwrap();
+        let k = read(&store, "app", 0).unwrap();
+        assert!(
+            k.goals
+                .iter()
+                .any(|g| g.title == "Custom codes" && g.status == "active"),
+            "{:?}",
+            k.goals
+        );
+    }
+
+    #[test]
+    fn init_brings_an_old_block_up_to_date() {
+        let (dir, store) = setup();
+        let root = dir.path();
+        init(&store, "app").unwrap();
+        // As set up before goals existed.
+        let claude = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            claude.replace("@.corvx/goals.md\n", ""),
+        )
+        .unwrap();
+        fs::remove_file(root.join(".corvx/goals.md")).unwrap();
+        git(root, &["commit", "-qam", "old"]);
+        let done = init(&store, "app").unwrap();
+        assert!(done.written.contains(&"CLAUDE.md".to_string()), "{done:?}");
+        assert!(
+            done.written.contains(&".corvx/goals.md".to_string()),
+            "{done:?}"
+        );
+        let claude = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        assert!(claude.contains("@.corvx/goals.md"), "{claude}");
+        assert_eq!(claude.matches(WIRE_START).count(), 1, "{claude}");
+    }
+
+    #[test]
     fn an_existing_claude_md_keeps_its_text_and_gets_the_block() {
         let (dir, store) = setup();
         let root = dir.path();
@@ -916,7 +1231,7 @@ mod tests {
         assert!(accept(&store, &p.id, None, 200).is_err(), "only once");
 
         let k = read(&store, "app", 2).unwrap();
-        assert!(k.files[2].text.contains("RFC 7807"));
+        assert!(k.files[3].text.contains("RFC 7807"));
         assert!(k.open.is_empty());
     }
 
@@ -1023,7 +1338,7 @@ mod tests {
         assert_eq!(texts, ["new", "mid"]);
         assert!(!k.wired);
         assert!(!k.files[0].exists);
-        assert!(k.files[3].text.contains("# Map of App"));
+        assert!(k.files[4].text.contains("# Map of App"));
     }
 
     #[test]

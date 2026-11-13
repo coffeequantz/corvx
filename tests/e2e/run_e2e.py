@@ -921,9 +921,9 @@ def the_knowledge_loop(h: Harness):
         m.notify("notifications/initialized")
         k = m.tool("read_knowledge")
         paths = [f["path"] for f in k["files"]]
-        assert paths == [".corvx/brief.md", ".corvx/decisions.md", ".corvx/conventions.md",
-                         ".corvx/map.md"], paths
-        assert "- test: `cargo test`" in k["files"][3]["text"], k["files"][3]
+        assert paths == [".corvx/brief.md", ".corvx/goals.md", ".corvx/decisions.md",
+                         ".corvx/conventions.md", ".corvx/map.md"], paths
+        assert "- test: `cargo test`" in k["files"][4]["text"], k["files"][4]
 
         propose = lambda file, title, text: m.tool("propose_knowledge", {
             "file": file, "title": title, "text": text, "evidence": f"mission {sid}"})
@@ -972,7 +972,7 @@ def the_knowledge_loop(h: Harness):
 
         # What the next agent reads.
         k = m.tool("read_knowledge")
-        conventions = k["files"][2]["text"]
+        conventions = k["files"][3]["text"]
         assert "Run `cargo fmt` before committing." in conventions, conventions
         assert "Name each test after the behaviour it shows." in conventions, conventions
         assert "Name tests after" not in conventions, conventions
@@ -1059,6 +1059,69 @@ def missions_cleanup_and_the_daemon(h: Harness):
     assert "2 agents" in h.corvx("missions", "e2e")
 
 
+def a_lead_starts_missions(h: Harness):
+    """Goals, a project lead you talk to, and the missions it starts under itself."""
+    git = lambda *a: subprocess.run(["git", "-C", str(h.project), "-c", "user.name=e2e",
+                                     "-c", "user.email=e2e@e2e", *a],
+                                    check=True, capture_output=True, text=True).stdout
+    if not (h.project / ".git").exists():
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-q", "-m", "init")
+    h.corvx("knowledge", "init", "e2e")
+    assert "@.corvx/goals.md" in (h.project / "CLAUDE.md").read_text()
+    h.corvx("goals", "add", "e2e", "Ship the widget", "--detail", "Users can make widgets.")
+    h.corvx("goals", "add", "e2e", "Dark mode", "--status", "next")
+    listed = h.corvx("goals", "e2e")
+    assert "active   Ship the widget" in listed and "next     Dark mode" in listed, listed
+
+    env = {**h.env, "CORVX_AGENT_COMMAND": str(FAKE_CLAUDE)}
+    corvx = lambda *a: subprocess.run([str(CORVX), *a], env=env, capture_output=True, text=True, timeout=60)
+    out = corvx("lead", "e2e").stdout
+    assert "started the lead of e2e" in out, out
+    lead = out.split(": ")[1].split()[0]
+    h.sessions.append(lead)
+    started = [e for e in events_of(h, "session.started") if e.get("id") == lead][-1]
+    assert "Read the project and give me a short status" in " ".join(started["command"]), started
+    # Talking to a running lead sends the message; it does not start another.
+    assert "sent to the lead of e2e" in corvx("lead", "e2e", "focus", "on", "the", "widget").stdout
+    wait_until(lambda: "focus on the widget" in h.corvx("session", "output", lead), 5, "the message to reach the lead")
+    assert sum("lead · e2e" in l for l in h.corvx("session", "list").splitlines()) == 1
+
+    m = Mcp({**env, "CORVX_SESSION_ID": lead})
+    try:
+        m.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "e2e", "version": "0"}})
+        m.notify("notifications/initialized")
+        k = m.tool("read_knowledge", {})
+        assert [g["title"] for g in k["goals"]] == ["Ship the widget", "Dark mode"], k["goals"]
+        mission = m.tool("start_mission", {"goal": "Build the widget form", "serves": "Ship the widget"})
+        orch = mission["id"]
+        h.sessions.append(orch)
+        started = [e for e in events_of(h, "session.started") if e.get("id") == orch][-1]
+        command = " ".join(started["command"])
+        assert 'serves the project goal "Ship the widget"' in command and "--model opus" in command, command
+        assert any(a["id"] == orch for a in m.tool("list_agents")), "the lead supervises its mission"
+    finally:
+        m.close()
+
+    # The mission's orchestrator reports; its journal entry is written and committed, and the
+    # mission shows in the history (the lead does not).
+    o = Mcp({**env, "CORVX_SESSION_ID": orch})
+    try:
+        o.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "e2e", "version": "0"}})
+        o.notify("notifications/initialized")
+        o.tool("journal", {"title": "Mission", "text": "**Goal:** Build the widget form."})
+        done = o.tool("report_done", {"summary": "The form is built."})
+        assert done["journal"], done
+    finally:
+        o.close()
+    assert git("log", "-1", "--format=%s").startswith("Journal: e2e mission")
+    history = h.corvx("missions", "e2e")
+    assert "Build the widget form." in history and lead not in history, history
+
+
 def setting_up_in_the_terminal_ui(h: Harness):
     """Add a project, set up its knowledge, write its brief and start a mission, all in the TUI."""
     proj = h.base / "newproj"
@@ -1098,7 +1161,16 @@ def setting_up_in_the_terminal_ui(h: Harness):
         assert t.wait_for("brief saved and committed", 10), t.text()
         assert (proj / ".corvx" / "brief.md").read_text() == "# New\n\nA small server.\n"
         assert "Knowledge: update brief" in git("log", "-1", "--format=%s")
-        assert t.wait_for("next: o starts a mission", 5), t.text()
+        assert t.wait_for("next: g adds a goal", 5), t.text()
+
+        # g adds a goal; it shows on the board and in goals.md, committed.
+        t.send(b"g")
+        t.send(b"Health checks")
+        t.send(b"\r")
+        assert t.wait_for('goal "Health checks" added and committed', 5), t.text()
+        assert "### Health checks · active" in (proj / ".corvx" / "goals.md").read_text()
+        assert "Goals: Health checks (active)" in git("log", "-1", "--format=%s")
+        assert t.wait_for("● Health checks", 5), t.text()
 
         # e renames the project and moves it to another workspace; its id stays.
         t.send(b"e")
@@ -1115,8 +1187,10 @@ def setting_up_in_the_terminal_ui(h: Harness):
 
         t.send(b"o")
         assert t.wait_for("start a mission on newproj", 5), t.text()
-        assert "0 decisions · 0 conventions · 0 past missions" in t.text(), t.text()
+        assert " Health checks " in t.text(), "the mission form should offer the goal:\n" + t.text()
+        assert "0 guideposts · 0 decisions · 0 conventions · 0 past missions" in t.text(), t.text()
         t.send(b"Add a health check")
+        t.send(b"\t")
         t.send(b"\t")
         t.send(b"\x1b[C")  # autonomy: guided -> autonomous
         t.send(b"\t")
@@ -1131,16 +1205,39 @@ def setting_up_in_the_terminal_ui(h: Harness):
         started = [e for e in events_of(h, "session.started") if e.get("id") == orch]
         command = " ".join(started[-1]["command"]) if started else ""
         assert "--model opus" in command and "start_agent uses haiku" in command, command
+        assert 'serves the project goal "Health checks"' in command, command
+        # The board selects the new mission and shows its screen live.
+        assert t.wait_for("live · orchestrator · Add a health check", 5), t.text()
+        assert t.wait_for("fake claude ready", 5), t.text()
 
-        # m lists the project's missions, with the one just started.
-        t.key(b"\x1b", b"m")
+        # t sends a message to the selected mission without attaching.
+        t.send(b"t")
+        assert t.wait_for("to orchestrator · Add a health check ›", 5), t.text()
+        t.send(b"use fewer agents")
+        t.send(b"\r")
+        assert t.wait_for("sent to orchestrator · Add a health check", 5), t.text()
+        wait_until(lambda: "use fewer agents" in h.corvx("session", "output", orch), 5, "the message to arrive")
+
+        # From the projects column, t talks to the project's lead, starting it first.
+        t.key(b"\x1b")
+        t.send(b"t")
+        assert t.wait_for("to new lead · newproj ›", 5), t.text()
+        t.send(b"what next?")
+        t.send(b"\r")
+        assert t.wait_for("started the lead of newproj", 10), t.text()
+        lead = next(l for l in h.corvx("session", "list").splitlines() if "lead · newproj" in l).split()[0]
+        assert t.wait_for("lead newproj", 5), t.text()
+
+        # m lists the project's missions, with the one just started (and not the lead).
+        t.send(b"m")
         assert t.wait_for("missions · newproj", 5), t.text()
         assert "running" in t.text() and "Add a health check" in t.text(), t.text()
         t.key(b"\x1b", b"q")
     finally:
         t.close()
-        if orch:
-            h.corvx("session", "stop", orch, check=False)
+        for sid in h.corvx("session", "list").splitlines()[1:]:
+            if "newproj" in sid:
+                h.corvx("session", "stop", sid.split()[0], check=False)
         h.corvx("project", "remove", "newproj", check=False)
 
 
@@ -1152,6 +1249,7 @@ SCENARIOS = [
     autonomy_trust_and_journal,
     the_knowledge_loop,
     missions_cleanup_and_the_daemon,
+    a_lead_starts_missions,
     setting_up_in_the_terminal_ui,
     real_claude_rules,
     attach_from_the_terminal_ui,
