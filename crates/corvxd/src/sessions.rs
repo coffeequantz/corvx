@@ -1857,7 +1857,9 @@ fn sync_attention(
         AgentState::Waiting => (
             "waiting",
             1,
-            "waiting for your next instruction".to_string(),
+            detail
+                .unwrap_or("waiting for your next instruction")
+                .to_string(),
         ),
         AgentState::Done => (
             "done",
@@ -1951,15 +1953,31 @@ fn map_hook(event: &str, payload: &Value) -> Option<(AgentState, Option<String>)
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("needs your attention");
-            if is_idle_notification(payload, message) {
+            if is_permission_notification(payload, message) {
+                Some((AgentState::Blocked, Some(message.to_string())))
+            } else if is_idle_notification(payload, message) {
                 Some((AgentState::Waiting, None))
             } else {
-                Some((AgentState::Blocked, Some(message.to_string())))
+                // Anything else ("… needs your input: …", "… finished") is Claude waiting
+                // for you, not asking permission; what it says is worth showing.
+                Some((AgentState::Waiting, Some(message.to_string())))
             }
         }
         // The turn is over. Whether the task is done is for the agent or its supervisor to say.
         "Stop" => Some((AgentState::Waiting, None)),
         _ => None,
+    }
+}
+
+/// A notification that a permission dialog is waiting. (The request itself arrives as a
+/// PermissionRequest hook; this is Claude Code's reminder of it.)
+fn is_permission_notification(payload: &Value, message: &str) -> bool {
+    match payload.get("notification_type").and_then(Value::as_str) {
+        Some(kind) => kind == "permission_prompt",
+        None => {
+            let m = message.to_lowercase();
+            m.contains("permission") || m.starts_with("allow ") || m.contains("approve")
+        }
     }
 }
 
@@ -2779,9 +2797,32 @@ mod tests {
             AgentState::Working
         );
         assert_eq!(map_hook("Stop", &json!({})).unwrap().0, AgentState::Waiting);
-        let (state, detail) = map_hook("Notification", &json!({})).unwrap();
+        // Permission prompts block; other notifications mean it waits for you.
+        let (state, _) = map_hook(
+            "Notification",
+            &json!({"message": "Claude needs your permission to use Bash"}),
+        )
+        .unwrap();
         assert_eq!(state, AgentState::Blocked);
-        assert_eq!(detail.as_deref(), Some("needs your attention"));
+        let (state, _) = map_hook(
+            "Notification",
+            &json!({"message": "x", "notification_type": "permission_prompt"}),
+        )
+        .unwrap();
+        assert_eq!(state, AgentState::Blocked);
+        let (state, detail) = map_hook(
+            "Notification",
+            &json!({"message": "Project state overview finished"}),
+        )
+        .unwrap();
+        assert_eq!(state, AgentState::Waiting);
+        assert_eq!(detail.as_deref(), Some("Project state overview finished"));
+        let (state, detail) = map_hook(
+            "Notification",
+            &json!({"message": "Claude is waiting for your input", "notification_type": "idle_prompt"}),
+        )
+        .unwrap();
+        assert_eq!((state, detail), (AgentState::Waiting, None));
         assert!(map_hook("SessionEnd", &json!({})).is_none());
     }
 

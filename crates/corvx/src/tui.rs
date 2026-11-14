@@ -488,7 +488,7 @@ impl App {
             .count();
         if lost > 0 {
             app.flash =
-                format!("{lost} interrupted session(s) · press s, then R on one to resume it");
+                format!("{lost} interrupted session(s) · select one in its project's missions, then R resumes it");
         }
         Ok(app)
     }
@@ -2751,13 +2751,19 @@ fn tile_lines(screen: &str) -> Vec<String> {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| {
             let t = l.trim();
-            // Box borders, the prompt line, and Claude Code's mode footer.
+            // Box borders, the prompt line, and Claude Code's mode footer and hints.
             !(t.chars().all(|c| "─━│╭╮╰╯┌┐└┘ ".contains(c))
                 || t.starts_with('>')
+                || t.starts_with('❯')
+                || t.starts_with('⏵')
                 || t.starts_with("│ >")
                 || t.contains("for shortcuts")
+                || t.contains("shift+tab")
+                || t.contains("tmux detected")
                 || t.contains("auto-accept edits")
-                || t.contains("bypass permissions"))
+                || t.contains("accept edits on")
+                || t.contains("bypass permissions")
+                || t.contains("/effort"))
         })
         .map(|l| l.trim().to_string())
         .collect();
@@ -3847,8 +3853,7 @@ fn next_step(app: &App, p: &Project) -> String {
         "next: g adds a goal (where it is heading) · t talks to its lead · o starts a mission"
             .into()
     } else if running {
-        "t talks to the selected session or the lead · →/Tab moves into the work · o starts a mission"
-            .into()
+        "→ moves into the missions · t talks to the lead · o starts a mission".into()
     } else {
         "next: t asks the lead what to do next, or o starts a mission".into()
     }
@@ -4692,7 +4697,8 @@ fn age_label(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
-        s => format!("{}h", s / 3600),
+        s if s < 48 * 3600 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
     }
 }
 
