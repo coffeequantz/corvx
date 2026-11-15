@@ -4,6 +4,8 @@ Build without boundaries.
 
 CORVX is a local-first control plane for AI coding agents: it runs them durably, knows what each one is doing, routes decisions to you, and remembers what it learns about every project. Design: [`CORVX_SPEC.md`](CORVX_SPEC.md) (v0.3). Interaction design: [`CORVX_UX.md`](CORVX_UX.md). Clickable prototype (pre-v0.3): `prototype/index.html`.
 
+![CORVX in use: a project's lead starts a mission, its agents work side by side, a permission request is approved from the columns, and the finished mission reports to the inbox](docs/demo.gif)
+
 > Status: M2 (orchestration through MCP) is done; M3 (the knowledge loop) is built and waiting for its five-mission trial; a usability pass comes before M4 (multiple machines). Not ready for general use.
 
 ## Layout
