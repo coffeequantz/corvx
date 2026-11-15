@@ -12,7 +12,9 @@ members = [
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
-# License not chosen yet; see CORVX_SPEC.md. Do not publish until decided.
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/coffeequantz/corvx"
+# Not on crates.io (yet).
 publish = false
 
 [workspace.dependencies]

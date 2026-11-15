@@ -4,7 +4,7 @@ Build without boundaries.
 
 CORVX is a local-first control plane for AI coding agents: it runs them durably, knows what each one is doing, routes decisions to you, and remembers what it learns about every project. Design: [`CORVX_SPEC.md`](CORVX_SPEC.md) (v0.3). Interaction design: [`CORVX_UX.md`](CORVX_UX.md). Clickable prototype (pre-v0.3): `prototype/index.html`.
 
-> Status: M2 (orchestration through MCP) is done; M3 (the knowledge loop) is built and waiting for its five-mission trial; a usability pass comes before M4 (multiple machines). Not ready for general use. No license has been chosen yet.
+> Status: M2 (orchestration through MCP) is done; M3 (the knowledge loop) is built and waiting for its five-mission trial; a usability pass comes before M4 (multiple machines). Not ready for general use.
 
 ## Layout
 
@@ -89,3 +89,9 @@ Data lives in `~/.local/share/corvx` (owner-only). Override with `CORVX_HOME` or
 ## Protocol
 
 One JSON object per line over the daemon's socket. Methods are listed in `crates/corvx-proto/src/lib.rs`. Start with `daemon.info`, which returns the protocol version.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in CORVX by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

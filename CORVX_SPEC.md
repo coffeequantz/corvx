@@ -369,7 +369,7 @@ Multiple machines can wait; making CORVX pleasant on one machine comes first.
 
 | # | Decision | Since |
 |---|---|---|
-| 1 | Community-ready: the protocol and tools are documented and public in design. **The repository is not public yet.** | v0.2, v0.3 |
+| 1 | Community-ready: the protocol and tools are documented and public in design. The repository is public at github.com/coffeequantz/corvx. | v0.2, v0.3 |
 | 2 | Core language Rust | v0.2 |
 | 3 | Orchestration is agent-driven through MCP tools; CORVX is not a workflow engine | v0.3 |
 | 4 | Knowledge as plain files with proposals; structure later, with evidence | v0.3 |
@@ -379,16 +379,16 @@ Multiple machines can wait; making CORVX pleasant on one machine comes first.
 | 8 | Detach / prefix key `Ctrl+\` | v0.3 (replaces `Ctrl+B`) |
 | 9 | Name CORVX; domain acquired | v0.2 |
 | 10 | `waiting` items for your own sessions go in the inbox at severity 1; the presentation can be refined later | v0.3 |
+| 11 | License: MIT OR Apache-2.0, at the user's option (the Rust convention; Apache-2.0 adds a patent grant) | v0.3 |
 
 ### 18.2 Open
 
-1. **License.** Needed before the repository goes public.
-2. **Windows.** WSL with tmux, or a holder-process backend?
-3. **Default orchestrator runtime and budget defaults.** Models are settled for now: opus for orchestrators, sonnet for agents (fable for the hardest orchestration, at about twice opus's price).
-4. **Knowledge in git.** Committed by default for now: `knowledge init` and accepting a proposal commit just the knowledge files on the checkout's current branch. Opt-out per project if that gets in the way.
-5. **Trademark check** before public launch.
-6. **Non-Anthropic models for agents** (e.g. DeepSeek through OpenRouter): through a CLI agent that supports OpenRouter (runs today as a plain session, without hooks), or through CORVX's own agent loop (deferred)?
-7. **Setting up and adding projects.** Done in the TUI: `a` adds a project with a preview of its scan, its name and workspace, and optional knowledge setup (Tab completes paths), `b` edits and commits the brief, `K` sets up knowledge, `e` renames a project or moves it to another workspace, `o` starts a mission from a form (goal, autonomy, models, approvals), `m` shows its missions, and a first run and each project show the next step. Still open: changing a project's id or path (sessions, rules and proposals refer to the id).
+1. **Windows.** WSL with tmux, or a holder-process backend?
+2. **Default orchestrator runtime and budget defaults.** Models are settled for now: opus for orchestrators, sonnet for agents (fable for the hardest orchestration, at about twice opus's price).
+3. **Knowledge in git.** Committed by default for now: `knowledge init` and accepting a proposal commit just the knowledge files on the checkout's current branch. Opt-out per project if that gets in the way.
+4. **Trademark check** before public launch.
+5. **Non-Anthropic models for agents** (e.g. DeepSeek through OpenRouter): through a CLI agent that supports OpenRouter (runs today as a plain session, without hooks), or through CORVX's own agent loop (deferred)?
+6. **Setting up and adding projects.** Done in the TUI: `a` adds a project with a preview of its scan, its name and workspace, and optional knowledge setup (Tab completes paths), `b` edits and commits the brief, `K` sets up knowledge, `e` renames a project or moves it to another workspace, `o` starts a mission from a form (goal, autonomy, models, approvals), `m` shows its missions, and a first run and each project show the next step. Still open: changing a project's id or path (sessions, rules and proposals refer to the id).
 
 ## 19. Reference points
 
