@@ -762,6 +762,10 @@ pub struct SessionScreenParams {
 pub struct SessionScreen {
     pub text: String,
     pub state: SessionState,
+    /// The program asked for mouse input (e.g. Claude Code, which then scrolls its own
+    /// history with the wheel). Reported for screens read with `ansi`.
+    #[serde(default)]
+    pub mouse: bool,
 }
 
 /// An agent reporting on its own task, e.g. through the `report_done` tool.

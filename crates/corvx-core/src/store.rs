@@ -522,6 +522,46 @@ impl Store {
             .optional()?)
     }
 
+    /// The open item of a kind for a session, if any.
+    pub fn open_item(&self, session_id: &str, kind: &str) -> Result<Option<AttentionItem>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM attention WHERE session_id = ?1 AND kind = ?2
+                 AND status IN ('open', 'snoozed') ORDER BY created_at DESC LIMIT 1",
+                params![session_id, kind],
+                attention_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Opens a "trust" item: Claude Code asks whether to trust the session's folder, before
+    /// its hooks run. Returns the new item's id.
+    pub fn open_trust(
+        &self,
+        session_id: &str,
+        project: &str,
+        summary: &str,
+        now: i64,
+    ) -> Result<String> {
+        let id = self.fresh_attention_id(now)?;
+        self.conn.execute(
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
+             VALUES (?1, 'trust', 3, ?2, ?3, ?4, 'open', ?5, ?5)",
+            params![id, project, session_id, summary, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Closes an item that was answered (in the inbox, or in the session itself).
+    pub fn resolve_item(&self, id: &str, note: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2, note = ?3
+             WHERE id = ?1 AND status IN ('open', 'snoozed')",
+            params![id, now, note],
+        )? > 0)
+    }
+
     /// Adds a rule; returns its id (`r1`, `r2`, ...).
     pub fn add_rule(
         &self,

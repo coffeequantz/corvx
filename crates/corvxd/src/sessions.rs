@@ -192,6 +192,10 @@ pub struct SessionManager {
     approval_listeners: HashMap<String, Instant>,
     /// Where Claude Code keeps its conversations (`~/.claude/projects`), for resuming.
     claude_projects: Option<PathBuf>,
+    /// When each new Claude session's screen was last looked at for the trust question.
+    trust_checked: HashMap<String, Instant>,
+    /// Sessions whose trust question was answered: it is not raised again.
+    trust_answered: std::collections::HashSet<String>,
 }
 
 impl SessionManager {
@@ -231,6 +235,8 @@ impl SessionManager {
             default_backend,
             approval_listeners: HashMap::new(),
             claude_projects: claude_projects_dir(),
+            trust_checked: HashMap::new(),
+            trust_answered: Default::default(),
         }
     }
 
@@ -381,7 +387,115 @@ impl SessionManager {
     /// client asks about them. Called by the daemon on a timer.
     pub fn tick(&mut self, core: &Core) -> Result<(), ServiceError> {
         self.poll_tmux();
+        self.check_trust(core)?;
         self.record_ends(core)
+    }
+
+    /// Claude Code asks whether to trust a folder before its hooks run, so no hook reports
+    /// it. Until a new Claude session's hooks start, CORVX looks at its screen every two
+    /// seconds: the question opens a "trust" item, and the item closes once it is gone.
+    fn check_trust(&mut self, core: &Core) -> Result<(), ServiceError> {
+        let Some(tmux) = self.tmux.as_ref() else {
+            return Ok(());
+        };
+        let now = now_secs();
+        let mut seen = Vec::new();
+        let mut answered = Vec::new();
+        for (id, entry) in &self.entries {
+            if self.trust_answered.contains(id) {
+                continue;
+            }
+            let fresh = entry.session.runtime.as_deref() == Some("claude")
+                && matches!(entry.backend, Backend::Tmux)
+                && entry.session.started_at > now - 15 * 60;
+            if !fresh {
+                continue;
+            }
+            let status = lock(&entry.shared.status);
+            if status.state != SessionState::Running || status.agent_source.is_some() {
+                continue;
+            }
+            drop(status);
+            if self
+                .trust_checked
+                .get(id)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+            {
+                continue;
+            }
+            seen.push(id.clone());
+            let asking = tmux
+                .capture(id)
+                .map(|t| trust_question(&t))
+                .unwrap_or(false);
+            let open = core.store().open_item(id, "trust")?;
+            match (asking, open) {
+                (true, None) => {
+                    let cwd = entry
+                        .session
+                        .worktree
+                        .clone()
+                        .or_else(|| {
+                            core.store()
+                                .get_project(&entry.session.project)
+                                .ok()
+                                .flatten()
+                                .map(|p| p.path)
+                        })
+                        .unwrap_or_default();
+                    let item = core.store().open_trust(
+                        id,
+                        &entry.session.project,
+                        &format!("trust this folder? Claude Code asks before it starts in {cwd}"),
+                        now,
+                    )?;
+                    core.store()
+                        .append_event("attention.trust", &json!({"id": item, "session": id}))?;
+                }
+                (false, Some(item)) => {
+                    core.store()
+                        .resolve_item(&item.id, "answered in the session", now)?;
+                    answered.push(id.clone());
+                }
+                _ => {}
+            }
+        }
+        for id in seen {
+            self.trust_checked.insert(id, Instant::now());
+        }
+        self.trust_answered.extend(answered);
+        Ok(())
+    }
+
+    /// Answers Claude Code's trust question in a session: moves to "Yes, I trust this
+    /// folder" and confirms, or declines (Claude then exits).
+    fn answer_trust(&mut self, id: &str, trust: bool) -> Result<(), ServiceError> {
+        if !trust {
+            return self.input(id, b"\x1b");
+        }
+        if self.tmux.is_none() {
+            return Err(internal("tmux is not available"));
+        }
+        // Enter on the default choice would exit Claude; make sure "Yes" is selected first.
+        for _ in 0..4 {
+            let screen = self
+                .tmux
+                .as_ref()
+                .and_then(|t| t.capture(id).ok())
+                .unwrap_or_default();
+            if screen.contains("❯ Yes, I trust this folder") || screen.contains("> Yes, I trust")
+            {
+                return self.input(id, b"\r");
+            }
+            if !trust_question(&screen) {
+                return Ok(());
+            }
+            self.input(id, b"\x1b[B")?;
+            thread::sleep(Duration::from_millis(250));
+        }
+        Err(internal(
+            "could not select 'Yes' on the trust question; answer it in the session",
+        ))
     }
 
     /// Marks tmux sessions whose command has exited, or which have disappeared.
@@ -827,10 +941,14 @@ impl SessionManager {
         let id = p.id.as_str();
         let entry = self.entries.get(id).ok_or_else(|| not_found(id))?;
         let state = lock(&entry.shared.status).state;
+        let mut mouse = false;
         let live = match &entry.backend {
             Backend::Tmux if state == SessionState::Running => self.tmux.as_ref().and_then(|t| {
                 if p.history > 0 || p.ansi {
-                    t.capture_view(id, p.history, p.ansi).ok()
+                    t.capture_view(id, p.history, p.ansi).ok().map(|(text, m)| {
+                        mouse = p.ansi && m;
+                        text
+                    })
                 } else {
                     t.capture(id).ok()
                 }
@@ -854,7 +972,7 @@ impl SessionManager {
                 strip_ansi(&String::from_utf8_lossy(&bytes))
             }
         };
-        Ok(SessionScreen { text, state })
+        Ok(SessionScreen { text, state, mouse })
     }
 
     /// An agent reports the outcome of its task (the `report_done` tool).
@@ -1215,6 +1333,32 @@ impl SessionManager {
                     format!("no open suggestion '{}'", p.id),
                 ));
             }
+            return Ok(());
+        }
+        // Claude Code's question whether to trust a folder: only the human answers it.
+        if let Some(item) = core
+            .store()
+            .get_attention(&p.id)?
+            .filter(|i| i.kind == "trust" && (i.status == "open" || i.status == "snoozed"))
+        {
+            if p.by.is_some() || p.decision == "escalate" {
+                return Err(ServiceError::Rpc(
+                    codes::NOT_SUPERVISOR,
+                    "whether to trust a folder is the human's to decide".into(),
+                ));
+            }
+            let trust = p.decision != "deny";
+            self.answer_trust(&item.session_id, trust)?;
+            self.trust_answered.insert(item.session_id.clone());
+            core.store().resolve_item(
+                &item.id,
+                if trust { "trusted" } else { "not trusted" },
+                now_secs(),
+            )?;
+            core.store().append_event(
+                "attention.trust_answered",
+                &json!({"id": item.id, "session": item.session_id, "trust": trust}),
+            )?;
             return Ok(());
         }
         let item = core
@@ -1988,6 +2132,11 @@ fn is_idle_notification(payload: &Value, message: &str) -> bool {
         Some(kind) => kind == "idle_prompt",
         None => message.to_lowercase().contains("waiting for your input"),
     }
+}
+
+/// Whether a screen shows Claude Code's question whether to trust the folder.
+fn trust_question(screen: &str) -> bool {
+    screen.contains("trust this folder") || screen.contains("trust the files in this folder")
 }
 
 /// A permission request in one line, e.g. "Bash: npm test · Run the tests".

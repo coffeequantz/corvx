@@ -180,6 +180,12 @@ const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const PEEK_EVERY: Duration = Duration::from_millis(800);
 /// How often while you type in it.
 const LIVE_PEEK_EVERY: Duration = Duration::from_millis(120);
+/// How often right after a key or the wheel reached the session, while it redraws.
+const FAST_PEEK_EVERY: Duration = Duration::from_millis(25);
+/// How long after that the pane keeps reading that often.
+const FAST_PEEK_FOR: Duration = Duration::from_millis(400);
+/// At most this many wheel steps go to a session at once.
+const MAX_WHEEL_STEPS: i32 = 12;
 
 /// Models an orchestrator can run on, and its agents, defaults first.
 const ORCHESTRATOR_MODELS: [&str; 2] = ["opus", "sonnet"];
@@ -318,6 +324,17 @@ struct App {
     live_size: std::cell::Cell<(u16, u16)>,
     /// How many lines the live pane is scrolled back into the session's history.
     live_scroll: u16,
+    /// The live session asked for mouse input: the wheel goes to it, to scroll its own view.
+    peek_mouse: bool,
+    /// Where the live pane's text was drawn, and the screen row it starts at.
+    live_area: std::cell::Cell<(Rect, usize)>,
+    /// Wheel steps over the live pane not yet sent (up is positive), and where the last was.
+    wheel: Option<(i32, u16, u16)>,
+    /// The live pane scrolled through tmux's history and needs reading again.
+    pane_stale: bool,
+    /// Until when the pane reads the screen quickly, while the session redraws.
+    fast_peek_until: Instant,
+    last_pane_peek: Instant,
     /// Where things were drawn, for the mouse: each area and what it is.
     hits: std::cell::RefCell<Vec<(Rect, Hit)>>,
     last_peek: Instant,
@@ -373,12 +390,28 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         // In a session's pane, keep the screen close to what is typed.
         let live = app.mode == Mode::Live;
-        if event::poll(Duration::from_millis(if live { 30 } else { 250 }))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-                Event::Mouse(m) => app.on_mouse(m),
-                _ => {}
+        let fast = Instant::now() < app.fast_peek_until;
+        let wait = match (fast, live) {
+            (true, _) => 10,
+            (false, true) => 30,
+            (false, false) => 250,
+        };
+        if event::poll(Duration::from_millis(wait))? {
+            // Take everything that is already waiting before drawing again: a trackpad sends
+            // dozens of wheel events a second, and handling them one by one falls behind.
+            let mut n = 0;
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Mouse(m) => app.on_mouse(m),
+                    _ => {}
+                }
+                n += 1;
+                if app.quit || n >= 256 || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
+            app.flush_wheel();
         }
         if let Some(id) = app.pending_edit.take() {
             // Give the terminal to the editor, then accept what the human wrote.
@@ -421,7 +454,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             let r = app.refresh();
             app.report(r);
         }
-        if app.last_peek.elapsed() >= if live { LIVE_PEEK_EVERY } else { PEEK_EVERY } {
+        if fast && app.last_pane_peek.elapsed() >= FAST_PEEK_EVERY {
+            app.refresh_pane();
+        } else if app.last_peek.elapsed() >= if live { LIVE_PEEK_EVERY } else { PEEK_EVERY } {
             app.refresh_peek();
         }
         if app.last_refresh.elapsed() >= REFRESH_EVERY {
@@ -472,6 +507,12 @@ impl App {
             live_id: None,
             live_size: std::cell::Cell::new((0, 0)),
             live_scroll: 0,
+            peek_mouse: false,
+            live_area: std::cell::Cell::new((Rect::default(), 0)),
+            wheel: None,
+            pane_stale: false,
+            fast_peek_until: Instant::now(),
+            last_pane_peek: Instant::now(),
             hits: Default::default(),
             last_peek: Instant::now(),
             inbox_sel: 0,
@@ -647,6 +688,11 @@ impl App {
                 }
                 _ => {}
             },
+            KeyCode::Char(c @ ('y' | 'Y' | 'n')) => {
+                if !self.decide_here(c) {
+                    self.flash = "nothing to approve here".into();
+                }
+            }
             KeyCode::Char('t') => self.start_talk(),
             KeyCode::Char('x') => match &session {
                 Some(s) => self.ask_stop(s, Mode::Normal),
@@ -1085,13 +1131,23 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 match column {
+                    None if self.peek_mouse && self.peek_target().is_some() => {
+                        // Claude Code (and other full-screen programs) scroll their own view:
+                        // hand them the wheel, at the same place on their screen. Collected
+                        // here and sent together once the waiting events are read.
+                        let (area, first) = self.live_area.get();
+                        let x = m.column.saturating_sub(area.x) + 1;
+                        let y = (m.row.saturating_sub(area.y) as usize + first + 1) as u16;
+                        let steps = self.wheel.map_or(0, |w| w.0) + if up { 1 } else { -1 };
+                        self.wheel = Some((steps, x, y));
+                    }
                     None => {
                         self.live_scroll = if up {
                             self.live_scroll.saturating_add(3)
                         } else {
                             self.live_scroll.saturating_sub(3)
                         };
-                        self.refresh_peek();
+                        self.pane_stale = true;
                     }
                     Some(c) if self.mode == Mode::Normal => {
                         if c != self.col && (c < 2 || !self.col2_rows().is_empty()) {
@@ -1191,7 +1247,82 @@ impl App {
             self.live_id = None;
             return;
         }
-        self.refresh_peek();
+        self.soon_redrawn();
+    }
+
+    /// The first request under the selection you can answer with y or n: a permission request
+    /// or a trust question from the selected session or anything under it (on a project, any
+    /// in the project).
+    fn pending_decision(&self) -> Option<AttentionItem> {
+        let row = self.selected_row()?;
+        let decidable = |i: &&AttentionItem| i.kind == "approval" || i.kind == "trust";
+        if matches!(row.kind, RowKind::Project) {
+            return self
+                .attention
+                .iter()
+                .filter(decidable)
+                .find(|i| i.project == row.project)
+                .cloned();
+        }
+        let root = row.session()?.id.clone();
+        let mut ids = vec![root];
+        let mut i = 0;
+        while i < ids.len() {
+            let parent = ids[i].clone();
+            ids.extend(
+                self.sessions
+                    .iter()
+                    .filter(|s| s.supervisor.as_deref() == Some(parent.as_str()))
+                    .map(|s| s.id.clone()),
+            );
+            i += 1;
+        }
+        self.attention
+            .iter()
+            .filter(decidable)
+            .find(|item| ids.contains(&item.session_id))
+            .cloned()
+    }
+
+    /// Answers the request under the selection: y allow, Y always, n deny.
+    fn decide_here(&mut self, key: char) -> bool {
+        let Some(item) = self.pending_decision() else {
+            return false;
+        };
+        let decision = match (key, item.kind.as_str()) {
+            ('n', _) => "deny",
+            ('Y', "approval") => "always",
+            _ => "allow",
+        };
+        let r = self.rpc(
+            methods::ATTENTION_DECIDE,
+            json!({"id": item.id, "decision": decision}),
+        );
+        if self.report(r).is_some() {
+            let who = self
+                .sessions
+                .iter()
+                .find(|s| s.id == item.session_id)
+                .map(title_of)
+                .unwrap_or_default();
+            self.flash = match (decision, item.kind.as_str()) {
+                ("deny", "trust") => format!("{who}: folder not trusted · Claude Code exits"),
+                (_, "trust") => format!("{who}: folder trusted · Claude Code starts"),
+                ("deny", _) => format!(
+                    "{who}: denied · {} · i inbox to add a reason next time",
+                    clip(&item.summary, 50)
+                ),
+                ("always", _) => format!(
+                    "{who}: approved, and won't ask again · {}",
+                    clip(&item.summary, 50)
+                ),
+                _ => format!("{who}: approved · {}", clip(&item.summary, 60)),
+            };
+            let r = self.refresh();
+            self.report(r);
+            self.refresh_peek();
+        }
+        true
     }
 
     /// Whose screen the detail pane shows live: the selected running session.
@@ -1415,6 +1546,33 @@ impl App {
         }
     }
 
+    /// Sends the wheel steps collected over the live pane as one input, and reads the pane
+    /// again: quickly for a moment, while the session redraws.
+    fn flush_wheel(&mut self) {
+        if let Some((steps, x, y)) = self.wheel.take() {
+            if steps != 0 {
+                if let Some(id) = self.peek_target() {
+                    let code = if steps > 0 { 64 } else { 65 };
+                    let one = format!("\x1b[<{code};{x};{y}M");
+                    let data =
+                        one.repeat(steps.unsigned_abs().min(MAX_WHEEL_STEPS as u32) as usize);
+                    let r = self.rpc(methods::SESSION_INPUT, json!({"id": id, "data": data}));
+                    self.report(r);
+                    self.soon_redrawn();
+                }
+            }
+        }
+        if std::mem::take(&mut self.pane_stale) {
+            self.refresh_pane();
+        }
+    }
+
+    /// Something reached the session: read its screen quickly for a moment.
+    fn soon_redrawn(&mut self) {
+        self.fast_peek_until = Instant::now() + FAST_PEEK_FOR;
+        self.refresh_pane();
+    }
+
     fn refresh_peek(&mut self) {
         self.last_peek = Instant::now();
         if !matches!(
@@ -1441,6 +1599,12 @@ impl App {
                 }
             }
         }
+        self.refresh_pane();
+    }
+
+    /// Reads the screen the live pane shows, and nothing else.
+    fn refresh_pane(&mut self) {
+        self.last_pane_peek = Instant::now();
         let Some(id) = self.peek_target() else {
             self.peek = None;
             return;
@@ -1458,6 +1622,7 @@ impl App {
             json!({"id": id, "ansi": true, "history": history}),
         ) {
             let text = v["text"].as_str().unwrap_or_default().to_string();
+            self.peek_mouse = v["mouse"].as_bool().unwrap_or(false);
             self.peek = Some((id, text));
         }
     }
@@ -1899,6 +2064,18 @@ impl App {
                         self.input.clear();
                     }
                 },
+                Some(item) if item.kind == "trust" => {
+                    let (decision, done) = if c == 'n' {
+                        ("deny", "not trusted · Claude Code exits")
+                    } else {
+                        ("allow", "trusted · Claude Code starts")
+                    };
+                    self.attention_action(
+                        methods::ATTENTION_DECIDE,
+                        json!({"decision": decision}),
+                        done,
+                    )
+                }
                 Some(item) if item.kind == "proposal" => {
                     if c == 'n' {
                         self.mode = Mode::Reject;
@@ -2689,7 +2866,11 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         chip(count_kind(app, "failed"), "failed", RED),
     ];
-    let with_orchestrators = count_kind(app, "approval") - count_yours_to_approve(app);
+    let with_orchestrators = app
+        .attention
+        .iter()
+        .filter(|i| i.kind == "approval" && orchestrators(i))
+        .count();
     if with_orchestrators > 0 {
         spans.push(Span::styled(
             format!("  ({with_orchestrators} with orchestrators)"),
@@ -3444,6 +3625,11 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let Some(p) = app.projects.iter().find(|p| p.id == row.project) else {
         return;
     };
+    // Something under the selection waits for a yes or no: it comes first.
+    let area = match app.pending_decision() {
+        Some(item) => draw_decision(f, area, app, &item),
+        None => area,
+    };
     match &row.kind {
         RowKind::Project => draw_project_detail(f, area, app, p),
         RowKind::History(n) => {
@@ -3502,6 +3688,94 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+}
+
+/// A request waiting for a yes or no, above the rest of the detail. Returns the room left.
+fn draw_decision(f: &mut Frame, area: Rect, app: &App, item: &AttentionItem) -> Rect {
+    let [top, rest] = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
+    let who = app
+        .sessions
+        .iter()
+        .find(|s| s.id == item.session_id)
+        .map(|s| {
+            let what = if crate::is_lead(s) {
+                "lead"
+            } else if crate::missions::is_orchestrator(s, &app.sessions) {
+                "orchestrator"
+            } else {
+                "agent"
+            };
+            format!("{what} · {}", title_of(s))
+        })
+        .unwrap_or_else(|| item.session_id.clone());
+    let w = top.width.saturating_sub(4) as usize;
+    let key = |k: &str, what: &str| {
+        vec![
+            Span::styled(
+                format!(" {k} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(AMBER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {what}   "), Style::default().fg(Color::Gray)),
+        ]
+    };
+    let mut keys = vec![Span::raw(" ")];
+    keys.extend(key(
+        "y",
+        if item.kind == "trust" {
+            "trust it"
+        } else {
+            "approve"
+        },
+    ));
+    if item.kind == "approval" {
+        keys.extend(key("Y", "always"));
+    }
+    keys.extend(key(
+        "n",
+        if item.kind == "trust" {
+            "don't (Claude exits)"
+        } else {
+            "deny"
+        },
+    ));
+    if item.kind == "approval" && orchestrators(item) {
+        keys.push(Span::styled(
+            "its orchestrator is deciding; you can decide first",
+            Style::default().fg(DIM),
+        ));
+    }
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " ▲ ",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                clip(&item.summary, w.saturating_sub(3)),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::styled(
+            format!("   {}", clip(&who, w.saturating_sub(3))),
+            Style::default().fg(DIM),
+        ),
+        Line::from(keys),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Thick)
+                .title(format!(" {} ", kind_label(&item.kind)))
+                .border_style(Style::default().fg(AMBER)),
+        ),
+        top,
+    );
+    rest
 }
 
 /// A lead, mission or agent: what it is and does, then its screen live (or, for an ended
@@ -3622,6 +3896,10 @@ fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Sess
         let back = (app.live_scroll as usize).min(rows.len().saturating_sub(inner_h));
         let end = rows.len() - back;
         let start = end.saturating_sub(inner_h);
+        app.live_area.set((
+            Rect::new(body.x + 1, body.y + 1, inner_w as u16, inner_h as u16),
+            start,
+        ));
         (
             if back > 0 {
                 format!(" live · ↑ {back} lines back · scroll down to return ")
@@ -4181,8 +4459,19 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::AddGoal => ("GOAL", GREEN),
         Mode::Live => ("LIVE", GREEN),
     };
+    let pending = if app.mode == Mode::Normal {
+        app.pending_decision()
+    } else {
+        None
+    };
     let hint = if !app.flash.is_empty() {
         app.flash.clone()
+    } else if let Some(item) = pending {
+        if item.kind == "trust" {
+            "y trust the folder · n don't · j/k move · ? help".to_string()
+        } else {
+            "y approve · Y always · n deny · Enter type to it · j/k move · ? help".to_string()
+        }
     } else {
         match app.mode {
             Mode::Normal => match app.selected_row().map(|r| r.kind) {
@@ -4475,7 +4764,7 @@ fn orchestrators(item: &AttentionItem) -> bool {
 fn count_yours_to_approve(app: &App) -> usize {
     app.attention
         .iter()
-        .filter(|i| i.kind == "approval" && !orchestrators(i))
+        .filter(|i| (i.kind == "approval" && !orchestrators(i)) || i.kind == "trust")
         .count()
 }
 
@@ -4485,6 +4774,7 @@ fn kind_label(kind: &str) -> &'static str {
         "waiting" => "WAITING",
         "question" => "QUESTION",
         "approval" => "APPROVE?",
+        "trust" => "TRUST?",
         "suggestion" => "SUGGEST",
         "proposal" => "LEARN?",
         "done" => "DONE",
@@ -4499,6 +4789,7 @@ fn kind_style(kind: &str) -> Style {
         "waiting" => ACCENT,
         "question" => AMBER,
         "approval" => AMBER,
+        "trust" => AMBER,
         "suggestion" => GREEN,
         "proposal" => Color::Rgb(188, 140, 255),
         "done" => GREEN,

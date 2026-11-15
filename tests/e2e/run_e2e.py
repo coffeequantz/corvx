@@ -1158,9 +1158,84 @@ def the_live_pane(h: Harness):
             t.send(f"\x1b[<65;{x};{y}M".encode())
             t.pump(0.2)
         assert t.wait_for("line 120", 5), t.text()
+        # A program that asks for the mouse (as Claude Code does) gets the wheel itself, to
+        # scroll its own view.
+        wheel_app = h.base / "wheel_app.py"
+        wheel_app.write_text(
+            "import os, sys, termios, tty\n"
+            "sys.stdout.write('\\x1b[?1049h\\x1b[?1000h\\x1b[?1006hwheel-app ready\\n'); sys.stdout.flush()\n"
+            "tty.setraw(0)\n"
+            "seen, ups = b'', 0\n"
+            "while True:\n"
+            "    seen += os.read(0, 1024)\n"
+            "    while b'M' in seen:\n"
+            "        one, seen = seen.split(b'M', 1)\n"
+            "        ups += one.startswith(b'\\x1b[<64;')\n"
+            "    sys.stdout.write(f'wheel-ups:{ups}\\r\\n'); sys.stdout.flush()\n"
+        )
+        wheeled = h.start(backend="tmux", command=["python3", str(wheel_app)])
+        assert t.wait_for("python3", 10), "the new session is not listed:\n" + t.text()
+        for _ in range(20):
+            t.send(b"j")
+        assert t.wait_for("wheel-app ready", 10), t.text()
+        row = next(i for i, l in enumerate(t.screen.display) if "wheel-app ready" in l)
+        # A burst, as a trackpad sends it: every step arrives, each one whole.
+        t.send(f"\x1b[<64;{col + 5};{row + 1}M".encode() * 5)
+        assert t.wait_for("wheel-ups:5", 10), "the wheel did not reach the program:\n" + t.text()
+        h.corvx("session", "stop", wheeled, check=False)
+
         # A click on the project selects it, and its overview replaces the live pane.
         t.send(b"\x1b[<0;4;3M\x1b[<0;4;3m")
         assert t.wait_for("GOALS", 5), "a click on the project did not select it:\n" + t.text()
+        t.send(b"q")
+        t.pump(0.3)
+    finally:
+        t.close()
+
+
+def deciding_from_the_columns(h: Harness):
+    """Claude Code's trust question and a permission request, both answered with y on the
+    selected row, without the inbox or attaching."""
+    if not tmux_available():
+        raise SkipTest("tmux is not installed")
+    # A stand-in for Claude Code on its first run in a folder: it asks, then waits for Enter.
+    asker = h.base / "trust_question.sh"
+    asker.write_text(
+        "#!/bin/sh\n"
+        "printf 'Do you trust the files in this folder?\\n\\n  No, exit\\n\\342\\235\\257 Yes, I trust this folder\\n'\n"
+        "read answer\n"
+        "echo trusted-and-started\n"
+        "sleep 60\n"
+    )
+    asker.chmod(0o755)
+    trusting = h.start(runtime="claude", backend="tmux", command=[str(asker)])
+    wait_until(lambda: item_for_session(h, trusting, "trust"), 15, "the trust question to reach the inbox")
+    t = Term([str(CORVX)], h.env, cols=150, rows=32)
+    try:
+        assert t.wait_for("projects", 10), t.text()
+        assert t.wait_for("1 to approve", 10), "the trust question is not counted:\n" + t.text()
+        # On the project's row the question shows on the right, with its keys.
+        assert t.wait_for("TRUST?", 5), t.text()
+        assert "y  trust it" in t.text() or "y trust it" in t.text(), t.text()
+        t.send(b"y")
+        assert t.wait_for("folder trusted", 10), t.text()
+        wait_until(lambda: "trusted-and-started" in h.corvx("session", "output", trusting), 10,
+                   "the answer to reach the session")
+        assert not item_for_session(h, trusting, "trust"), "the trust item stays open"
+
+        # A permission request from an agent: y on its row approves it.
+        agent = h.start(runtime="claude", command=[str(FAKE_CLAUDE)])
+        time.sleep(1.0)
+        h.corvx("session", "input", agent, "request", "--enter")
+        wait_until(lambda: item_id(h, "approval", "make test") is not None, 10, "approval item")
+        assert t.wait_for("needs you", 10), "the agent is not listed:\n" + t.text()
+        t.send(b"\x1b[C")  # into the missions column
+        for _ in range(20):
+            t.send(b"j")
+        assert t.wait_for("APPROVE?", 5), "the request is not shown with the session:\n" + t.text()
+        t.send(b"y")
+        wait_until(lambda: "allowed by hook" in output_of(h, agent), 10, "the approval to reach the agent")
+        assert t.wait_for("approved", 5), t.text()
         t.send(b"q")
         t.pump(0.3)
     finally:
@@ -1298,6 +1373,7 @@ SCENARIOS = [
     missions_cleanup_and_the_daemon,
     a_lead_starts_missions,
     the_live_pane,
+    deciding_from_the_columns,
     setting_up_in_the_terminal_ui,
     real_claude_rules,
     attach_from_the_terminal_ui,

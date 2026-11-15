@@ -196,32 +196,33 @@ impl Tmux {
         Ok(pid)
     }
 
-    /// Sends text as typed input. Line breaks become Enter; other control characters are
-    /// sent as raw key codes.
+    /// Sends text as typed input. Line breaks become Enter. A stretch with other control
+    /// characters (an escape sequence: a key, the wheel) goes as raw bytes in one call, so
+    /// the program reads it whole and not as Esc followed by text.
     pub fn send_text(&self, name: &str, text: &str) -> Result<(), String> {
-        let mut literal = String::new();
-        let flush = |literal: &mut String| -> Result<(), String> {
-            if !literal.is_empty() {
-                self.run(["send-keys", "-t", name, "-l", literal.as_str()])?;
-                literal.clear();
+        for (i, part) in text.split(['\r', '\n']).enumerate() {
+            if i > 0 {
+                self.run(["send-keys", "-t", name, "Enter"])?;
             }
-            Ok(())
-        };
-        for ch in text.chars() {
-            match ch {
-                '\r' | '\n' => {
-                    flush(&mut literal)?;
-                    self.run(["send-keys", "-t", name, "Enter"])?;
+            if part.is_empty() {
+                continue;
+            }
+            if part.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) {
+                for chunk in part.as_bytes().chunks(2048) {
+                    let mut args = vec![
+                        "send-keys".to_string(),
+                        "-t".into(),
+                        name.into(),
+                        "-H".into(),
+                    ];
+                    args.extend(chunk.iter().map(|b| format!("{b:02x}")));
+                    self.run(args)?;
                 }
-                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                    flush(&mut literal)?;
-                    let hex = format!("{:02x}", c as u32);
-                    self.run(["send-keys", "-t", name, "-H", hex.as_str()])?;
-                }
-                c => literal.push(c),
+            } else {
+                self.run(["send-keys", "-t", name, "-l", part])?;
             }
         }
-        flush(&mut literal)
+        Ok(())
     }
 
     pub fn resize(&self, name: &str, cols: u16, rows: u16) -> Result<(), String> {
@@ -253,8 +254,14 @@ impl Tmux {
     }
 
     /// The screen with `history` lines above it, as drawn: one line per row, with colours
-    /// as escape codes when `ansi`.
-    pub fn capture_view(&self, name: &str, history: u32, ansi: bool) -> Result<String, String> {
+    /// as escape codes when `ansi`. And whether the program asked for the mouse, read in
+    /// the same call.
+    pub fn capture_view(
+        &self,
+        name: &str,
+        history: u32,
+        ansi: bool,
+    ) -> Result<(String, bool), String> {
         let start = format!("-{history}");
         let mut args = vec!["capture-pane", "-p", "-t", name];
         if history > 0 {
@@ -263,7 +270,21 @@ impl Tmux {
         if ansi {
             args.push("-e");
         }
-        self.run(args)
+        args.extend([
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            name,
+            "#{mouse_any_flag}",
+        ]);
+        let mut out = self.run(args)?;
+        // The flag is the last line.
+        let body = out.trim_end_matches('\n').len();
+        let cut = out[..body].rfind('\n').map_or(0, |i| i + 1);
+        let mouse = out[cut..].trim() == "1";
+        out.truncate(cut);
+        Ok((out, mouse))
     }
 
     /// Every pane on CORVX's server, by session name. Empty when the server is not running.
