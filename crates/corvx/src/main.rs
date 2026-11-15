@@ -1918,7 +1918,7 @@ pub(crate) fn start_orchestrator(
 }
 
 /// The label that marks a project's lead.
-pub(crate) const LEAD_LABEL: &str = "lead · ";
+pub(crate) const LEAD_LABEL: &str = corvx_proto::LEAD_LABEL;
 
 /// Whether a session is a project lead: the long-lived agent you talk to about a project.
 pub(crate) fn is_lead(s: &corvx_proto::Session) -> bool {

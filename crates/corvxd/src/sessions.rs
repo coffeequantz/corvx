@@ -1005,7 +1005,42 @@ impl SessionManager {
             "session.reported",
             &json!({"id": p.id, "outcome": p.outcome, "summary": p.summary}),
         )?;
-        sync_attention(core, &entry.session, state, Some(&p.summary), None)
+        sync_attention(core, &entry.session, state, Some(&p.summary), None)?;
+        // A mission the lead started reports to the lead. You hear of it too, so the work
+        // that happened on its own does not go unseen: a note, nothing to decide.
+        let led = entry.session.supervisor.as_deref().is_some_and(|sup| {
+            self.entries.get(sup).is_some_and(|e| {
+                e.session
+                    .label
+                    .as_deref()
+                    .is_some_and(|l| l.starts_with(corvx_proto::LEAD_LABEL))
+            })
+        });
+        if led {
+            let mission = entry
+                .session
+                .label
+                .as_deref()
+                .map(|l| l.trim_start_matches("orchestrator · "))
+                .unwrap_or("a mission");
+            let (word, severity) = match state {
+                AgentState::Done => ("done", 1),
+                _ => ("failed", 2),
+            };
+            let summary = format!("lead's mission {word} · {mission}: {}", p.summary);
+            let id = core.store().open_report(
+                &entry.session.id,
+                &entry.session.project,
+                &summary,
+                severity,
+                now_secs(),
+            )?;
+            core.store().append_event(
+                "attention.reported",
+                &json!({"id": id, "session": p.id, "outcome": p.outcome}),
+            )?;
+        }
+        Ok(())
     }
 
     /// A session asks a human a question. Returns the question's attention item id.
@@ -4289,6 +4324,61 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ServiceError::Rpc(c, _) if c == codes::SESSION_NOT_FOUND));
         for id in [&l3, &l2, &l1] {
+            f.mgr
+                .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn missions_the_lead_started_leave_you_a_note() {
+        let mut f = fixture();
+        let lead = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "label": "lead · p"}),
+        )
+        .unwrap();
+        let mission = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": lead,
+                   "label": "orchestrator · HEAD requests"}),
+        )
+        .unwrap();
+        let agent = start_with(
+            &mut f,
+            json!({"command": "sleep", "args": ["30"], "supervisor": mission}),
+        )
+        .unwrap();
+        let report = |f: &mut Fixture, id: &str, outcome: &str| {
+            f.mgr
+                .handle(
+                    &f.core,
+                    methods::SESSION_REPORT,
+                    json!({"id": id, "outcome": outcome, "summary": "merged as 8b905d5"}),
+                )
+                .unwrap();
+        };
+        // An agent reporting to its orchestrator is not news for you.
+        report(&mut f, &agent, "done");
+        assert!(open_kinds(&f, &agent).is_empty());
+        report(&mut f, &mission, "done");
+        let item = open_items(&f)
+            .into_iter()
+            .find(|i| i.session_id == mission)
+            .unwrap();
+        assert_eq!(item.kind, "report");
+        assert_eq!(item.severity, 1);
+        assert_eq!(
+            item.summary,
+            "lead's mission done · HEAD requests: merged as 8b905d5"
+        );
+        // It stays while the mission's session moves on, and when it is stopped.
+        send_hook(&mut f, &mission, "Stop", json!({}));
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": mission}))
+            .unwrap();
+        assert_eq!(open_kinds(&f, &mission), vec!["report"]);
+        for id in [&agent, &lead] {
             f.mgr
                 .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
                 .unwrap();

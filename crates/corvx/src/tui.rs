@@ -2862,7 +2862,11 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         chip(count_kind(app, "waiting"), "waiting", ACCENT),
         Span::raw(" "),
-        chip(count_kind(app, "done"), "done", GREEN),
+        chip(
+            count_kind(app, "done") + count_kind(app, "report"),
+            "done",
+            GREEN,
+        ),
         Span::raw(" "),
         chip(count_kind(app, "failed"), "failed", RED),
     ];
@@ -2926,6 +2930,12 @@ fn clip(text: &str, width: usize) -> String {
 /// The last few lines of a screen worth showing in a tile: not blank, and not the input box
 /// or footer lines a Claude Code screen ends with.
 fn tile_lines(screen: &str) -> Vec<String> {
+    if in_background(screen) {
+        return vec![
+            "conversation moved to the background".into(),
+            "Enter in its pane brings it back".into(),
+        ];
+    }
     let mut out: Vec<String> = screen
         .lines()
         .map(str::trim_end)
@@ -2951,6 +2961,25 @@ fn tile_lines(screen: &str) -> Vec<String> {
     let keep = out.len().saturating_sub(4);
     out.drain(..keep);
     out
+}
+
+/// Claude Code moved its conversation into the background (Esc when idle, or ← in newer
+/// versions) and shows its list of sessions instead; Enter brings the conversation back.
+/// Recognised by its text, plain or in colour.
+fn in_background(screen: &str) -> bool {
+    let plain = if screen.contains('\x1b') {
+        screen
+            .lines()
+            .map(strip_escapes)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        screen.to_string()
+    };
+    plain.contains("conversation moved to the background")
+        || plain
+            .lines()
+            .any(|l| l.contains("enter to return") && l.contains("space to reply"))
 }
 
 /// Text without terminal escape sequences.
@@ -3879,11 +3908,13 @@ fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Sess
     let inner_h = body.height.saturating_sub(2) as usize;
     let inner_w = body.width.saturating_sub(2) as usize;
     app.live_size.set((inner_w as u16, inner_h as u16));
+    let mut away = false;
     let (title, text): (String, Vec<Line>) = if s.state == SessionState::Running {
         let screen = match &app.peek {
             Some((id, text)) if *id == s.id => text.clone(),
             _ => String::new(),
         };
+        away = in_background(&screen);
         app.hits.borrow_mut().push((body, Hit::Live));
         let mut rows: Vec<&str> = screen.lines().collect();
         while rows
@@ -3903,6 +3934,11 @@ fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Sess
         (
             if back > 0 {
                 format!(" live · ↑ {back} lines back · scroll down to return ")
+            } else if away && typing {
+                " live · the conversation moved to the background · Enter brings it back ".into()
+            } else if away {
+                " live · the conversation moved to the background · in the pane, Enter brings it back "
+                    .into()
             } else if typing {
                 " live · typing ".into()
             } else {
@@ -3963,7 +3999,11 @@ fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Sess
             .block(
                 Block::bordered()
                     .border_type(BorderType::Rounded)
-                    .title(title)
+                    .title(if away {
+                        Line::styled(title, Style::default().fg(AMBER))
+                    } else {
+                        Line::raw(title)
+                    })
                     .title_bottom(Line::styled(
                         keys,
                         if typing {
@@ -4779,6 +4819,7 @@ fn kind_label(kind: &str) -> &'static str {
         "proposal" => "LEARN?",
         "done" => "DONE",
         "failed" => "FAILED",
+        "report" => "REPORT",
         _ => "?",
     }
 }
@@ -4793,6 +4834,7 @@ fn kind_style(kind: &str) -> Style {
         "suggestion" => GREEN,
         "proposal" => Color::Rgb(188, 140, 255),
         "done" => GREEN,
+        "report" => LEAD,
         "failed" => RED,
         _ => DIM,
     };
@@ -5275,5 +5317,37 @@ mod tests {
     fn home_expansion_only_touches_leading_tilde() {
         assert_eq!(expand_home("/abs/path"), "/abs/path");
         assert_eq!(expand_home("relative"), "relative");
+    }
+
+    #[test]
+    fn claude_codes_background_view_is_recognised() {
+        // As Claude Code v2.1.323 drew it after Esc in an idle conversation.
+        let away = "\
+ 0 awaiting input · 0 working · 1 completed
+
+Your conversation moved to the background — enter opens it · esc returns to
+it · ctrl+c twice quits
+
+Completed
+∙ Project state overview  adopted from previous supervisor                 5h
+─────────────────────────────────────────────
+❯ describe a task for a new session
+─────────────────────────────────────────────
+  ⏵⏵ auto mode · enter to return · space to reply · ? for shortcuts
+";
+        assert!(in_background(away));
+        // In colour, the words are split by escape codes.
+        assert!(in_background(
+            "\x1b[1mYour conversation\x1b[0m moved to the \x1b[2mbackground\x1b[0m — enter"
+        ));
+        assert_eq!(tile_lines(away)[0], "conversation moved to the background");
+        // A conversation that only mentions it is not the view.
+        let here =
+            "⏺ I ran the server in the background.\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)\n";
+        assert!(!in_background(here));
+        assert_eq!(
+            tile_lines(here),
+            vec!["⏺ I ran the server in the background."]
+        );
     }
 }

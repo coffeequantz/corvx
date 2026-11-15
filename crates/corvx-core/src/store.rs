@@ -338,7 +338,7 @@ impl Store {
         self.conn.execute(
             "UPDATE attention SET status = 'resolved', resolved_at = ?2, updated_at = ?2, note = 'agent moved on'
              WHERE session_id = ?1 AND status IN ('open', 'snoozed') AND kind != ?3
-                   AND kind NOT IN ('question', 'proposal')",
+                   AND kind NOT IN ('question', 'proposal', 'report')",
             params![session_id, now, state],
         )?;
         if !matches!(state, "blocked" | "waiting" | "done" | "failed") {
@@ -549,6 +549,26 @@ impl Store {
             "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
              VALUES (?1, 'trust', 3, ?2, ?3, ?4, 'open', ?5, ?5)",
             params![id, project, session_id, summary, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Opens a "report" item: for your information, a mission someone else supervises (the
+    /// project's lead) has finished. It stays until you acknowledge or dismiss it, whatever
+    /// the session does next. Returns the new item's id.
+    pub fn open_report(
+        &self,
+        session_id: &str,
+        project: &str,
+        summary: &str,
+        severity: u8,
+        now: i64,
+    ) -> Result<String> {
+        let id = self.fresh_attention_id(now)?;
+        self.conn.execute(
+            "INSERT INTO attention (id, kind, severity, project, session_id, summary, status, created_at, updated_at)
+             VALUES (?1, 'report', ?2, ?3, ?4, ?5, 'open', ?6, ?6)",
+            params![id, severity, project, session_id, summary, now],
         )?;
         Ok(id)
     }

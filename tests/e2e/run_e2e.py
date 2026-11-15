@@ -265,7 +265,7 @@ def inbox_in_the_terminal_ui(h: Harness):
         t.send(b"i")
         assert t.wait_for("exited with code 4", 5), "inbox does not list the item"
         t.send(b"a")
-        assert t.wait_for("Nothing needs you", 5), "acknowledging did not clear the inbox"
+        assert t.wait_for("Nothing needs you", 5), "acknowledging did not clear the inbox:\n" + t.text()
         t.send(b"q")
         t.pump(0.5)
     finally:
@@ -1129,6 +1129,11 @@ def a_lead_starts_missions(h: Harness):
     assert git("log", "-1", "--format=%s").startswith("Journal: e2e mission")
     history = h.corvx("missions", "e2e")
     assert "Build the widget form." in history and lead not in history, history
+    # The lead hears of it, and so do you: a note in the inbox, which you acknowledge.
+    notes = [l for l in h.attention_text().splitlines() if "lead's mission done" in l]
+    assert notes and "Build the widget form" in notes[0] and "The form is built." in notes[0], notes
+    h.corvx("attention", "ack", notes[0].split()[0])
+    assert "lead's mission done" not in h.attention_text()
 
 
 def the_live_pane(h: Harness):

@@ -11,6 +11,10 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 0;
 pub const JSONRPC_VERSION: &str = "2.0";
 
+/// The label that marks a project's lead: the long-lived agent the human talks to about a
+/// project, e.g. "lead · snip".
+pub const LEAD_LABEL: &str = "lead · ";
+
 /// Method names. Keep these stable; add new ones rather than changing old ones.
 pub mod methods {
     pub const DAEMON_INFO: &str = "daemon.info";
