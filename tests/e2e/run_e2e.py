@@ -1068,6 +1068,77 @@ def missions_cleanup_and_the_daemon(h: Harness):
     assert "2 agents" in h.corvx("missions", "e2e")
 
 
+def spend_is_visible(h: Harness):
+    """Claude Code's status line reports each session's cost; CORVX adds it up and shows it."""
+    sid = h.start(runtime="claude", command=[str(FAKE_CLAUDE), "work"])
+    wait_until(lambda: "status: corvx · $0.25" in h.corvx("session", "output", sid), 10, "the status line")
+    h.corvx("session", "input", sid, "work", "--enter")
+    # Each session's cost adds up its turns (other scenarios' agents report theirs too).
+    own = lambda: next((l for l in h.corvx("cost", "e2e").splitlines() if l.startswith(sid)), "")
+    wait_until(lambda: "$0.50" in own(), 10, "the second turn's cost")
+    out = h.corvx("cost")
+    assert re.search(r"^e2e +\$\d+\.\d\d +\$\d+\.\d\d", out, re.M) and "5-hour limit: 37% used" in out, out
+    t = Term([str(CORVX)], h.env, cols=130)
+    try:
+        assert t.wait_for(" today", 10), "the top bar does not show today's spend:\n" + t.text()
+        assert re.search(r"\$\d+\.\d\d today · 5h 37%", t.text()), t.text()
+        t.send(b"q")
+        t.pump(0.3)
+    finally:
+        t.close()
+    h.corvx("session", "stop", sid)
+
+
+def starting_a_new_project(h: Harness):
+    """A project from nothing: folder, git, registration, knowledge with the brief, and a lead
+    that starts by shaping the project with you. From the command line and the terminal UI."""
+    env = {**h.env, "CORVX_AGENT_COMMAND": str(FAKE_CLAUDE),
+           "GIT_AUTHOR_NAME": "e2e", "GIT_AUTHOR_EMAIL": "e2e@e2e",
+           "GIT_COMMITTER_NAME": "e2e", "GIT_COMMITTER_EMAIL": "e2e@e2e"}
+    run = lambda *a: subprocess.run([str(CORVX), *a], env=env, capture_output=True, text=True, timeout=60)
+    out = run("new", "Tiny Notes", "--in", str(h.base), "--workspace", "notes", "A", "place", "to", "jot", "things", "down")
+    assert out.returncode == 0, out.stderr
+    folder = h.base / "tiny-notes"
+    assert "created tiny-notes" in out.stdout and "its lead" in out.stdout, out.stdout
+    assert "A place to jot things down" in (folder / "README.md").read_text()
+    assert "A place to jot things down" in (folder / ".corvx" / "brief.md").read_text()
+    log = subprocess.run(["git", "-C", str(folder), "log", "--format=%s"], capture_output=True, text=True).stdout
+    assert "Start Tiny Notes" in log, log
+    assert "tiny-notes" in h.corvx("project", "list")
+    lead = next(l.split()[0] for l in h.corvx("session", "list").splitlines() if "lead · tiny-notes" in l)
+    h.sessions.append(lead)
+    started = [e for e in events_of(h, "session.started") if e.get("id") == lead][-1]
+    first = started["command"][-1]
+    assert "is a new project" in first and "A place to jot things down" in first, first
+    # A folder that is not empty is not taken over.
+    again = run("new", "Tiny Notes", "--in", str(h.base))
+    assert again.returncode != 0 and "not empty" in again.stderr, again.stderr
+
+    # In the terminal UI: a, a folder that is not there yet, what it is, Enter.
+    t = Term([str(CORVX)], env, cols=130, rows=34)
+    try:
+        assert t.wait_for("projects", 10)
+        t.send(b"a")
+        assert t.wait_for("path ›", 5), t.text()
+        for ch in str(h.base / "garden-log"):
+            t.send(ch.encode())
+        t.pump(0.3)
+        t.send(b"\r")
+        assert t.wait_for("start a new project", 5), t.text()
+        for ch in "Tracks what I planted":
+            t.send(ch.encode())
+        t.pump(0.3)
+        t.send(b"\r")
+        assert t.wait_for("created garden-log", 15), t.text()
+        t.send(b"\x1c")
+        t.pump(0.3)
+    finally:
+        t.close()
+    assert (h.base / "garden-log" / ".corvx" / "brief.md").read_text().count("Tracks what I planted") == 1
+    garden = next(l.split()[0] for l in h.corvx("session", "list").splitlines() if "lead · garden-log" in l)
+    h.sessions.append(garden)
+
+
 def a_lead_starts_missions(h: Harness):
     """Goals, a project lead you talk to, and the missions it starts under itself."""
     git = lambda *a: subprocess.run(["git", "-C", str(h.project), "-c", "user.name=e2e",
@@ -1113,6 +1184,24 @@ def a_lead_starts_missions(h: Harness):
         assert any(a["id"] == orch for a in m.tool("list_agents")), "the lead supervises its mission"
     finally:
         m.close()
+
+    # The lead waits while its mission works: the project is working, not asking for you.
+    h.corvx("session", "input", lead, "work", "--enter")
+    wait_until(lambda: item_for_session(h, lead, "waiting"), 10, "the lead to wait")
+    wait_until(lambda: "fake claude ready" in h.corvx("session", "output", orch), 10, "the mission to start")
+    h.corvx("session", "input", orch, "busy", "--enter")
+    wait_until(lambda: "working" in h.session_line(orch), 10, "the mission to work")
+    t = Term([str(CORVX)], h.env)
+    try:
+        assert t.wait_for("missions working", 10), "the lead row:\n" + t.text()
+        assert "waiting for your next" not in t.text(), "the waiting lead is listed:\n" + t.text()
+        row = next(l for l in t.screen.display if "e2e" in l[:16])
+        assert "▲" not in row, "a lead waiting on its mission asks for you:\n" + t.text()
+        assert "0 waiting" in t.text(), "the waiting lead is counted:\n" + t.text()
+    finally:
+        t.close()
+    h.corvx("session", "input", orch, "work", "--enter")
+    wait_until(lambda: "working" not in h.session_line(orch), 10, "the mission's turn to end")
 
     # The mission's orchestrator reports; its journal entry is written and committed, and the
     # mission shows in the history (the lead does not).
@@ -1190,7 +1279,8 @@ def the_live_pane(h: Harness):
         h.corvx("session", "stop", wheeled, check=False)
 
         # A click on the project selects it, and its overview replaces the live pane.
-        t.send(b"\x1b[<0;4;3M\x1b[<0;4;3m")
+        prow = next(i for i, l in enumerate(t.screen.display) if "e2e" in l[:16]) + 1
+        t.send(f"\x1b[<0;4;{prow}M\x1b[<0;4;{prow}m".encode())
         assert t.wait_for("GOALS", 5), "a click on the project did not select it:\n" + t.text()
         t.send(b"q")
         t.pump(0.3)
@@ -1377,6 +1467,8 @@ SCENARIOS = [
     the_knowledge_loop,
     missions_cleanup_and_the_daemon,
     a_lead_starts_missions,
+    spend_is_visible,
+    starting_a_new_project,
     the_live_pane,
     deciding_from_the_columns,
     setting_up_in_the_terminal_ui,

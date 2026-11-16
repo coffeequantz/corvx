@@ -2,9 +2,21 @@
 
 Build without boundaries.
 
-CORVX is a local-first control plane for AI coding agents: it runs them durably, knows what each one is doing, routes decisions to you, and remembers what it learns about every project. Design: [`CORVX_SPEC.md`](CORVX_SPEC.md) (v0.3). Interaction design: [`CORVX_UX.md`](CORVX_UX.md). Clickable prototype (pre-v0.3): `prototype/index.html`.
+CORVX is a control plane for AI coding agents, built around one workflow: you tell a project's lead what you want, it starts missions, their agents work side by side, and decisions come to you as often or as rarely as you choose. It runs the agents durably, knows what each one is doing, and remembers what it learns about every project. Design: [`CORVX_SPEC.md`](CORVX_SPEC.md) (v0.3). Interaction design: [`CORVX_UX.md`](CORVX_UX.md). Clickable prototype (pre-v0.3): `prototype/index.html`.
 
 ![CORVX in use: a project's lead starts a mission, its agents work side by side, a permission request is approved from the columns, and the finished mission reports to the inbox](docs/demo.gif)
+
+## What it adds to Claude Code
+
+Claude Code runs one agent well, and is growing its own list of sessions. CORVX is the layer above it:
+
+- **Many projects at once**, each with its goals, knowledge and a lead you talk to, in one view.
+- **Agents supervising agents**: a lead starts missions; each mission's orchestrator plans the work and runs its own agents in separate git worktrees.
+- **An autonomy dial**: per project, decide how much the agents decide themselves, with rules for what always comes to you, from approving everything yourself to letting the agents run.
+- **Knowledge that builds up**: what each mission learned becomes proposals you accept into the project's decisions and conventions, which every later agent reads.
+- **What it costs**: every session's estimated spend, per mission, per project and per day, and your subscription's usage limits.
+
+CORVX uses Claude Code's documented interfaces wherever there is one: hooks for what an agent is doing, the status line for cost, MCP for orchestration. The few things it reads from the screen are in one place, and `corvx doctor` tells you when the installed Claude Code is newer than they were confirmed with.
 
 > Status: M2 (orchestration through MCP) is done; M3 (the knowledge loop) is built and waiting for its five-mission trial; a usability pass comes before M4 (multiple machines). Not ready for general use.
 
@@ -31,7 +43,8 @@ cargo build --workspace
 cargo test --workspace
 python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no model calls
 
-./target/debug/corvx project add ./my-app
+./target/debug/corvx new "My app" a small tool that does X for Y   # folder, git, knowledge, and a lead that asks you about it
+./target/debug/corvx project add ./my-app      # or add one that exists
 ./target/debug/corvx knowledge init my-app        # .corvx/ knowledge files, read by every agent
 ./target/debug/corvx session start my-app --runtime claude -- claude
 ./target/debug/corvx session attach <id>      # Ctrl+\ then d to detach
@@ -52,6 +65,8 @@ python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no mode
 ./target/debug/corvx project set my-app --name "My app" --workspace clients   # the id stays
 ./target/debug/corvx project rescan my-app     # scan again: stack, test and build commands
 ./target/debug/corvx daemon restart            # load a new build; sessions in tmux keep running
+./target/debug/corvx cost                      # estimated spend today and in all, per project (cost my-app: per mission)
+./target/debug/corvx doctor                    # checks tmux, git, Claude Code's version, and that sessions report to CORVX
 ./target/debug/corvx rules                     # what CORVX asks you, allows or denies
 ./target/debug/corvx rules set delete-recursive allow --project my-app   # ask|allow|deny|off|default
 ./target/debug/corvx rules add --command '\bterraform\s+apply\b' --reason "changes infrastructure"
@@ -59,7 +74,11 @@ python3 tests/e2e/run_e2e.py        # end-to-end, with a stand-in agent; no mode
 ./target/debug/corvx                           # terminal UI: columns · Enter type to an agent · t talk · o mission · i inbox
 ```
 
-The terminal UI reads left to right, in four columns. Projects, with a `!` where something needs you. Then the selected project's lead (the agent you talk to about it) and its missions, each with its state, its agents and the goal it serves; earlier missions fold under one row. Then the agents of the selected mission as tiles showing the last lines of each one's screen (with the project selected: every agent working on it now). On the right, the selection itself: a project's goals, knowledge, what needs you and next step; a lead, mission or agent live; an ended mission's journal entry. `j`/`k` moves in a column and ←/→ between columns. Enter on a running session puts your keyboard in its pane: you type to the agent right there, and Ctrl+\ comes back. `t` sends one message without going in, `f` attaches full screen. When something needs a yes or no (a permission request, or Claude Code asking whether to trust a new folder), it shows at the top of the right side with the row selected, or any row above it: `y` approves, `Y` always, `n` denies. The live pane is in colour, and the mouse works: the wheel scrolls the session's history in the live pane (Claude Code gets the wheel itself and scrolls its own view) (and moves the selection in a column), and a click selects a project, mission or agent, or goes into the pane. To select text with the mouse, hold Option (or Shift, depending on your terminal). If Claude Code moves its conversation to the background (Esc while it is idle), the pane's title says so in amber; Enter in the pane brings it back. On a project, `t` talks to its lead, and starts it if none runs. The inbox (`i`) and rules (`l`) span every project and take the room beside the projects; Enter on an inbox item shows it in the columns.
+The terminal UI reads left to right, in four columns. Projects, with `▲` where something needs you (a decision, a question, a failure), a spinner while its agents work (even when its lead is only waiting on its missions), and `●` when it is quiet and your turn. Then the selected project's lead (the agent you talk to about it) and its missions, each with its state, its agents and the goal it serves; earlier missions fold under one row. Then the agents of the selected mission as tiles showing the last lines of each one's screen (with the project selected: every agent working on it now). On the right, the selection itself: a project's goals, knowledge, what needs you and next step; a lead, mission or agent live; an ended mission's journal entry. `j`/`k` moves in a column and ←/→ between columns. Enter on a running session puts your keyboard in its pane: you type to the agent right there, and Ctrl+\ comes back. `t` sends one message without going in, `f` attaches full screen (the session takes the whole terminal; Ctrl+\ then d comes back). When something needs a yes or no (a permission request, or Claude Code asking whether to trust a new folder), it shows at the top of the right side with the row selected, or any row above it: `y` approves, `Y` always, `n` denies. The live pane is in colour, and the mouse works: the wheel scrolls the session's history in the live pane (Claude Code gets the wheel itself and scrolls its own view) (and moves the selection in a column), and a click selects a project, mission or agent, or goes into the pane. To select text with the mouse, hold Option (or Shift, depending on your terminal). If Claude Code moves its conversation to the background (Esc while it is idle), the pane's title says so in amber; Enter in the pane brings it back. On a project, `t` talks to its lead, and starts it if none runs. The inbox (`i`) and rules (`l`) span every project and take the room beside the projects; Enter on an inbox item shows it in the columns.
+
+To start a project from nothing, press `a` and type a folder that does not exist yet (the prompt starts in the folder your projects are in): CORVX creates the folder and a git repository, sets up the knowledge files with what you wrote as the brief, and starts the project's lead, which asks you a few questions and proposes the first goals and guideposts for you to accept. It starts no work until you agree.
+
+Spend is shown where the work is: today's total and your subscription's 5-hour and weekly limits in the top bar, each mission's cost (with its agents) in its row, each agent's in its tile, and a project's today and in all in its detail. The numbers are Claude Code's own estimate at list prices, reported through its status line; on a subscription they are what the same use would cost on the API, and the limits are what actually binds. CORVX's sessions show CORVX's status line in place of your own.
 
 The lead is a long-lived agent on a strong model that you talk to about a project, in your own words. It reads the project's knowledge and goals, records new goals as proposals for you to accept, starts missions (`start_mission`: an orchestrator under it, which runs its own agents), passes your corrections on to them, and tells you when they finish. You hear of a finished mission too: a REPORT note in the inbox, nothing to decide, until you acknowledge it (`a`). Goals and guideposts live in `.corvx/goals.md`: guideposts are principles every mission follows, and each goal has a status (active, next, done, dropped). `g` adds a goal, `G` edits the file, and the mission form asks which goal a mission serves.
 

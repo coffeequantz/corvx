@@ -312,7 +312,25 @@ impl Server {
             }
             "list_agents" => {
                 let list = self.supervised()?;
-                Ok(json!(list.iter().map(describe).collect::<Vec<_>>()))
+                // With each one's estimated cost so far, so spend can inform the plan.
+                let usage: corvx_proto::UsageSummary = self
+                    .rpc(methods::USAGE_SUMMARY, json!({}))
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                Ok(json!(list
+                    .iter()
+                    .map(|a| {
+                        let mut d = describe(a);
+                        if let Some(u) = usage.sessions.iter().find(|u| u.id == a.id) {
+                            d["cost_usd"] = json!((u.cost_usd * 100.0).round() / 100.0);
+                            if let Some(c) = u.context_pct {
+                                d["context_pct"] = json!(c);
+                            }
+                        }
+                        d
+                    })
+                    .collect::<Vec<_>>()))
             }
             "read_screen" => {
                 let id = s("id").ok_or_else(|| anyhow!("id is required"))?;

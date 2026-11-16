@@ -23,7 +23,7 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE projects (
@@ -115,6 +115,35 @@ CREATE TABLE proposals (
     decided_at INTEGER
 );
 CREATE INDEX proposals_project ON proposals(project, status);
+";
+
+/// Version 11: spend, as Claude Code estimates it. `usage` holds each session's running total
+/// (`cost_run`: the last total its runtime reported, which restarts at 0 after /clear or a
+/// resume); `costs` each increase, for spend over time; `limits` a subscription's usage
+/// limits as last reported.
+const SCHEMA_V11: &str = "
+CREATE TABLE usage (
+    session_id  TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    cost_usd    REAL NOT NULL DEFAULT 0,
+    cost_run    REAL NOT NULL DEFAULT 0,
+    context_pct INTEGER,
+    model       TEXT,
+    updated_at  INTEGER NOT NULL
+);
+CREATE TABLE costs (
+    session_id TEXT NOT NULL,
+    project    TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    usd        REAL NOT NULL
+);
+CREATE INDEX costs_ts ON costs(ts);
+CREATE TABLE limits (
+    name       TEXT PRIMARY KEY,
+    used_pct   REAL NOT NULL,
+    resets_at  INTEGER,
+    updated_at INTEGER NOT NULL
+);
 ";
 
 /// Version 5: readable session labels.
@@ -226,6 +255,9 @@ impl Store {
         }
         if version < 10 {
             conn.execute_batch(SCHEMA_V10)?;
+        }
+        if version < 11 {
+            conn.execute_batch(SCHEMA_V11)?;
         }
         if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -798,6 +830,128 @@ impl Store {
              WHERE id = ?1 AND status IN ('open', 'snoozed')",
             params![id, now, reason],
         )? > 0)
+    }
+
+    /// Records the total cost a session's runtime reports, and how full its context is.
+    /// Returns the session's cost so far. A total lower than the last one is a new run (the
+    /// conversation was cleared or resumed), which adds to what came before.
+    pub fn record_usage(
+        &self,
+        session_id: &str,
+        project: &str,
+        run_total: f64,
+        context_pct: Option<u8>,
+        model: Option<&str>,
+        now: i64,
+    ) -> Result<f64> {
+        let (total, last): (f64, f64) = self
+            .conn
+            .query_row(
+                "SELECT cost_usd, cost_run FROM usage WHERE session_id = ?1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0.0, 0.0));
+        let run_total = run_total.max(0.0);
+        let added = if run_total >= last {
+            run_total - last
+        } else {
+            run_total
+        };
+        let total = total + added;
+        self.conn.execute(
+            "INSERT INTO usage (session_id, project, cost_usd, cost_run, context_pct, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO UPDATE SET cost_usd = ?3, cost_run = ?4,
+                 context_pct = COALESCE(?5, context_pct), model = COALESCE(?6, model), updated_at = ?7",
+            params![session_id, project, total, run_total, context_pct, model, now],
+        )?;
+        if added > 0.0 {
+            self.conn.execute(
+                "INSERT INTO costs (session_id, project, ts, usd) VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, project, now, added],
+            )?;
+        }
+        Ok(total)
+    }
+
+    /// Records a subscription usage limit ("five_hour", "seven_day") as last reported.
+    pub fn record_limit(
+        &self,
+        name: &str,
+        used_pct: f64,
+        resets_at: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO limits (name, used_pct, resets_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![name, used_pct, resets_at, now],
+        )?;
+        Ok(())
+    }
+
+    /// Spend since local midnight, in all, per project and per session, and the usage limits
+    /// still current at `now`.
+    pub fn usage_summary(&self, now: i64) -> Result<corvx_proto::UsageSummary> {
+        use corvx_proto::{ProjectUsage, SessionUsage, UsageLimit, UsageSummary};
+        let midnight: i64 = self.conn.query_row(
+            "SELECT CAST(strftime('%s', ?1, 'unixepoch', 'localtime', 'start of day', 'utc') AS INTEGER)",
+            params![now],
+            |r| r.get(0),
+        )?;
+        let mut projects: Vec<ProjectUsage> = self
+            .conn
+            .prepare(
+                "SELECT project, SUM(CASE WHEN ts >= ?1 THEN usd ELSE 0.0 END), SUM(usd)
+                 FROM costs GROUP BY project ORDER BY project",
+            )?
+            .query_map(params![midnight], |r| {
+                Ok(ProjectUsage {
+                    project: r.get(0)?,
+                    today_usd: r.get(1)?,
+                    total_usd: r.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        projects.retain(|p| p.total_usd > 0.0);
+        let sessions: Vec<SessionUsage> = self
+            .conn
+            .prepare(
+                "SELECT session_id, project, cost_usd, context_pct, model FROM usage ORDER BY session_id",
+            )?
+            .query_map([], |r| {
+                Ok(SessionUsage {
+                    id: r.get(0)?,
+                    project: r.get(1)?,
+                    cost_usd: r.get(2)?,
+                    context_pct: r.get(3)?,
+                    model: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let limits: Vec<UsageLimit> = self
+            .conn
+            .prepare(
+                "SELECT name, used_pct, resets_at, updated_at FROM limits
+                 WHERE resets_at IS NULL OR resets_at > ?1 ORDER BY name",
+            )?
+            .query_map(params![now], |r| {
+                Ok(UsageLimit {
+                    name: r.get(0)?,
+                    used_pct: r.get(1)?,
+                    resets_at: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(UsageSummary {
+            today_usd: projects.iter().map(|p| p.today_usd).sum(),
+            total_usd: projects.iter().map(|p| p.total_usd).sum(),
+            projects,
+            sessions,
+            limits,
+        })
     }
 
     /// Saves a session's current state. Called on start and whenever its state changes.

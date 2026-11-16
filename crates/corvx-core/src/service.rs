@@ -185,6 +185,10 @@ impl Core {
                 let done = knowledge::set_goal(&self.store, &p)?;
                 Ok(serde_json::to_value(done).expect("KnowledgeAccepted serializes"))
             }
+            methods::USAGE_SUMMARY => {
+                Ok(serde_json::to_value(self.store.usage_summary(now_secs())?)
+                    .expect("UsageSummary serializes"))
+            }
             methods::PROJECT_UPDATE => {
                 let p: ProjectUpdateParams = parse(params)?;
                 Ok(serde_json::to_value(self.project_update(p)?).expect("Project serializes"))

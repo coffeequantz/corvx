@@ -78,6 +78,11 @@ pub mod methods {
     /// Removes the worktrees (and branches) of a finished session and its agents, where
     /// their work is merged.
     pub const SESSION_CLEANUP: &str = "session.cleanup";
+    /// What Claude Code reports to its status line for a session (cost, context, limits);
+    /// sent by the status-line command CORVX registers. Returns the session's cost so far.
+    pub const SESSION_USAGE: &str = "session.usage";
+    /// Spend per session and project, today and in all, and the subscription's usage limits.
+    pub const USAGE_SUMMARY: &str = "usage.summary";
 }
 
 /// Error codes. JSON-RPC reserved range plus CORVX codes from 1000.
@@ -931,3 +936,66 @@ mod tests {
         assert_eq!(req.params, Value::Null);
     }
 }
+
+/// What Claude Code passed its status line for a session, as it sent it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionUsageParams {
+    pub id: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+/// A session's estimated cost so far, and everything spent today.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SessionUsageReply {
+    pub session_usd: f64,
+    pub today_usd: f64,
+}
+
+/// Estimated spend, from what Claude Code reports: its list-price estimate, which may differ
+/// from a bill, and on a subscription is what the same use would cost on the API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UsageSummary {
+    /// Since local midnight.
+    pub today_usd: f64,
+    pub total_usd: f64,
+    #[serde(default)]
+    pub projects: Vec<ProjectUsage>,
+    #[serde(default)]
+    pub sessions: Vec<SessionUsage>,
+    /// A Pro or Max subscription's usage limits, as last reported; expired windows left out.
+    #[serde(default)]
+    pub limits: Vec<UsageLimit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectUsage {
+    pub project: String,
+    pub today_usd: f64,
+    pub total_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SessionUsage {
+    pub id: String,
+    pub project: String,
+    pub cost_usd: f64,
+    /// How full its context window is, in percent.
+    #[serde(default)]
+    pub context_pct: Option<u8>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UsageLimit {
+    /// "five_hour" or "seven_day".
+    pub name: String,
+    pub used_pct: f64,
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UsageSummaryParams {}

@@ -7,6 +7,7 @@
 //! - `store`: SQLite persistence and the append-only event log.
 //! - `service`: maps protocol methods onto store operations.
 
+pub mod claude_screen;
 pub mod knowledge;
 pub mod paths;
 pub mod policy;

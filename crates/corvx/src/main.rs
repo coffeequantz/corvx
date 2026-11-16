@@ -94,6 +94,34 @@ enum Command {
         #[arg(long)]
         show: Option<String>,
     },
+    /// Start a new project: creates its folder and git repository, registers it, sets up its
+    /// knowledge files with your description as the brief, and starts its lead, which asks you
+    /// a few questions and proposes the first goals.
+    New {
+        /// Its name; the folder is named after it.
+        name: String,
+        /// What you are building, in your own words.
+        #[arg(num_args = 0.., trailing_var_arg = true)]
+        about: Vec<String>,
+        /// The folder to create it in (default: where your other projects are).
+        #[arg(long = "in")]
+        parent: Option<PathBuf>,
+        /// Workspace to group it under (default: "default").
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Do not start the lead.
+        #[arg(long)]
+        no_lead: bool,
+    },
+    /// Checks what CORVX relies on: the daemon, tmux, git, Claude Code's version, and whether
+    /// running sessions' hooks and status line reach CORVX.
+    Doctor,
+    /// Estimated spend, today and in all, per project (or for one project, per mission), and
+    /// your subscription's usage limits.
+    Cost {
+        /// A project id: its missions and other sessions.
+        project: Option<String>,
+    },
     /// CORVX's tools for agents, as an MCP server on stdio. Started by agent sessions.
     #[command(hide = true)]
     Mcp,
@@ -340,6 +368,10 @@ enum SessionCommand {
     /// Forward a runtime hook event (JSON on stdin) to the daemon. Used by the hooks CORVX registers.
     #[command(hide = true)]
     Hook { id: String },
+    /// Claude Code's status line for a session: reports its usage (JSON on stdin) to the
+    /// daemon and prints a short line. Registered by CORVX.
+    #[command(hide = true)]
+    StatusLine { id: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -479,6 +511,39 @@ fn run() -> Result<()> {
             &data_dir,
         ),
         Command::Missions { project, show } => list_missions(&project, show, &data_dir),
+        Command::Cost { project } => cost(project.as_deref(), &data_dir),
+        Command::Doctor => doctor(&data_dir),
+        Command::New {
+            name,
+            about,
+            parent,
+            workspace,
+            no_lead,
+        } => {
+            let mut client = connect(&data_dir)?;
+            let list: ProjectList = client.call(methods::PROJECT_LIST, &json!({}))?;
+            let parent = parent.unwrap_or_else(|| projects_folder(&list.projects));
+            let new = NewProject {
+                path: parent.join(folder_name(&name)),
+                name,
+                workspace,
+                about: about.join(" "),
+                lead: !no_lead,
+            };
+            let made = create_project(&mut client, &new)?;
+            println!("created {} at {}", made.project.id, made.project.path);
+            for step in &made.steps {
+                println!("  {step}");
+            }
+            match &made.lead {
+                Some(id) => println!(
+                    "its lead ({id}) is asking you about it: corvx lead {} \"…\", or open the terminal UI",
+                    made.project.id
+                ),
+                None => println!("next: corvx lead {} \"what I want to build…\"", made.project.id),
+            }
+            Ok(())
+        }
         Command::Goals { command, project } => goals(command, project, &data_dir),
         Command::Lead {
             project,
@@ -717,6 +782,10 @@ fn session(command: SessionCommand, data_dir: &std::path::Path) -> Result<()> {
         SessionCommand::Attach { id } => attach(&mut client, &id, data_dir),
         SessionCommand::Hook { id } => {
             forward_hook(data_dir, &id);
+            Ok(())
+        }
+        SessionCommand::StatusLine { id } => {
+            status_line(data_dir, &id);
             Ok(())
         }
         SessionCommand::Stop { id } => {
@@ -1177,6 +1246,461 @@ fn print_scan(p: &Project) {
 }
 
 /// Reads one hook event from stdin and sends it to the daemon. Best effort: silent on any failure.
+/// `corvx doctor`: what CORVX relies on, checked. Reports problems; never changes anything.
+fn doctor(data_dir: &std::path::Path) -> Result<()> {
+    use std::process::Command as Cmd;
+    let ok = |s: &str| println!("✓ {s}");
+    let warn = |s: &str| println!("! {s}");
+    let version = |cmd: &str, arg: &str| {
+        Cmd::new(cmd)
+            .arg(arg)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    match version("tmux", "-V") {
+        Some(v) => ok(&format!("{v}: agents' terminals outlive the daemon")),
+        None => warn("tmux not found: sessions end with the daemon (install tmux)"),
+    }
+    match version("git", "--version") {
+        Some(v) => {
+            let ident = |k: &str| {
+                Cmd::new("git")
+                    .args(["config", "--get", k])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            };
+            if ident("user.name") && ident("user.email") {
+                ok(&format!("{v}, with a user name and email for commits"))
+            } else {
+                warn(&format!(
+                    "{v}, but no user.name/user.email: commits (new projects, knowledge) will fail"
+                ))
+            }
+        }
+        None => warn("git not found: agents work in git worktrees"),
+    }
+    let tested = corvx_core::claude_screen::TESTED_VERSION;
+    match version("claude", "--version") {
+        Some(v) => {
+            let installed = v.split_whitespace().next().unwrap_or("").to_string();
+            let newer = cmp_versions(&installed, tested) == std::cmp::Ordering::Greater;
+            if newer {
+                println!(
+                    "· Claude Code {installed}; CORVX's screen checks were confirmed with {tested}. If the \
+trust question stops reaching the inbox, or the background-view hint stops showing, they need updating \
+(hooks, the status line and MCP are documented interfaces and unaffected)"
+                );
+            } else {
+                ok(&format!(
+                    "Claude Code {installed} (screen checks tested with {tested})"
+                ));
+            }
+        }
+        None => warn("Claude Code (claude) not found on PATH"),
+    }
+    let mut client = match Client::connect(&paths::socket_path(data_dir)) {
+        Ok(c) => c,
+        Err(_) => {
+            warn("the daemon is not running: corvx starts it when needed");
+            return Ok(());
+        }
+    };
+    let info = client.info()?;
+    if corvx_client::newer_build_on_disk(&info) {
+        warn(&format!(
+            "corvxd {} runs an older build: corvx daemon restart loads the new one",
+            info.pid
+        ));
+    } else {
+        ok(&format!("corvxd {} running", info.pid));
+    }
+    let list: SessionList = client.call(methods::SESSION_LIST, &json!({}))?;
+    // (An older daemon has no usage: its sessions then show as not reporting cost.)
+    let usage: corvx_proto::UsageSummary = client
+        .call(methods::USAGE_SUMMARY, &corvx_proto::UsageSummaryParams {})
+        .unwrap_or_default();
+    let now = corvx_core::store::now_secs();
+    let claude: Vec<&Session> = list
+        .sessions
+        .iter()
+        .filter(|s| {
+            s.state == corvx_proto::SessionState::Running && s.runtime.as_deref() == Some("claude")
+        })
+        .collect();
+    let (mut quiet_hooks, mut quiet_status) = (Vec::new(), Vec::new());
+    for s in &claude {
+        // A minute is enough for Claude Code to start and report.
+        if now - s.started_at < 60 {
+            continue;
+        }
+        if s.agent_source.is_none() {
+            quiet_hooks.push(s.id.as_str());
+        }
+        if !usage.sessions.iter().any(|u| u.id == s.id) {
+            quiet_status.push(s.id.as_str());
+        }
+    }
+    if claude.is_empty() {
+        ok("no Claude Code sessions running to check");
+    } else {
+        if quiet_hooks.is_empty() {
+            ok(&format!(
+                "hooks reach CORVX from all {} running Claude Code session(s)",
+                claude.len()
+            ));
+        } else {
+            warn(&format!(
+                "no hook events from {}: their state is unknown; an open trust question, or Claude Code not running CORVX's hooks",
+                quiet_hooks.join(", ")
+            ));
+        }
+        if quiet_status.is_empty() {
+            ok("the status line reports cost from all of them");
+        } else {
+            warn(&format!(
+                "no cost reported by {}: they started before CORVX had the status line; sessions started from now on report it",
+                quiet_status.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Compares dotted version numbers ("2.1.325").
+fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    parts(a).cmp(&parts(b))
+}
+
+/// A new project, as the human described it.
+pub(crate) struct NewProject {
+    /// The folder to create; must not exist, or be empty.
+    pub path: PathBuf,
+    pub name: String,
+    pub workspace: Option<String>,
+    /// What it is, in the human's words. Becomes the brief; the lead starts from it.
+    pub about: String,
+    /// Start its lead, to shape the project with the human.
+    pub lead: bool,
+}
+
+pub(crate) struct MadeProject {
+    pub project: Project,
+    /// What was done, in order, for the human.
+    pub steps: Vec<String>,
+    /// The lead's session id, when started.
+    pub lead: Option<String>,
+}
+
+/// A folder name for a project name: lower case, words joined with dashes.
+pub(crate) fn folder_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        if c.is_alphanumeric() || c == '_' || c == '.' {
+            out.extend(c.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches(['-', '.']).to_string();
+    if out.is_empty() {
+        "project".into()
+    } else {
+        out
+    }
+}
+
+/// Where new projects go by default: the folder most of your projects are in, else home.
+pub(crate) fn projects_folder(projects: &[Project]) -> PathBuf {
+    let mut counts: Vec<(PathBuf, usize, i64)> = Vec::new();
+    for p in projects {
+        if let Some(parent) = std::path::Path::new(&p.path).parent() {
+            match counts.iter_mut().find(|c| c.0 == parent) {
+                Some(c) => {
+                    c.1 += 1;
+                    c.2 = c.2.max(p.added_at);
+                }
+                None => counts.push((parent.to_path_buf(), 1, p.added_at)),
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|c| (c.1, c.2))
+        .map(|c| c.0)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The lead's first message for a project that was just created.
+fn shape_message(name: &str, about: &str) -> String {
+    let described = if about.trim().is_empty() {
+        "The human has not described it yet: start by asking what they want to build.".to_string()
+    } else {
+        format!("In the human's words: \"{}\"", about.trim())
+    };
+    format!(
+        "{name} is a new project, just created with CORVX: the folder holds a README and the knowledge files, \
+and nothing is built yet. {described}\n\nHelp the human shape it before any work starts. Ask a few short questions, \
+one or two at a time: who it is for, what a first useful version does, constraints, and any stack or tools they want. \
+Then propose with propose_knowledge: the brief (what it is, who it is for, current priorities), two or three first \
+goals, and a few guideposts. Tell them to accept what fits in the CORVX inbox. When the first goal is accepted, offer \
+to start a mission that sets the project up (stack, structure, a first test), and start it only when they agree."
+    )
+}
+
+/// Creates a project from nothing: its folder, a git repository with a first commit, its
+/// registration, its knowledge files with the brief, and (if asked) its lead.
+pub(crate) fn create_project(client: &mut Client, new: &NewProject) -> Result<MadeProject> {
+    use std::process::Command as Cmd;
+    let path = &new.path;
+    if path.exists() {
+        let empty = std::fs::read_dir(path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if !empty {
+            anyhow::bail!(
+                "{} already exists and is not empty: add it with corvx project add instead",
+                path.display()
+            );
+        }
+    }
+    std::fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
+    let mut steps = vec![format!("created the folder {}", path.display())];
+    let git = |args: &[&str]| -> Result<()> {
+        let out = Cmd::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .context("cannot run git")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    let readme = if new.about.trim().is_empty() {
+        format!("# {}\n", new.name)
+    } else {
+        format!("# {}\n\n{}\n", new.name, new.about.trim())
+    };
+    std::fs::write(path.join("README.md"), readme)?;
+    git(&["init", "-q"])?;
+    git(&["add", "-A"])?;
+    git(&["commit", "-q", "-m", &format!("Start {}", new.name)])
+        .context("the first commit failed: is git's user.name and user.email set?")?;
+    steps.push("made it a git repository, with a README as the first commit".into());
+    let project: Project = client.call(
+        methods::PROJECT_ADD,
+        &corvx_proto::ProjectAddParams {
+            path: path.display().to_string(),
+            name: Some(new.name.clone()),
+            workspace: new.workspace.clone(),
+        },
+    )?;
+    steps.push(format!(
+        "registered it as {} in {}",
+        project.id, project.workspace
+    ));
+    let _: corvx_proto::KnowledgeInit = client.call(
+        methods::KNOWLEDGE_INIT,
+        &corvx_proto::KnowledgeInitParams {
+            project: project.id.clone(),
+        },
+    )?;
+    if !new.about.trim().is_empty() {
+        let brief = path.join(".corvx").join("brief.md");
+        std::fs::write(
+            &brief,
+            format!(
+                "# {}\n\n## What it is\n\n{}\n\n## Current priorities\n\n(To be shaped with the lead.)\n",
+                new.name,
+                new.about.trim()
+            ),
+        )?;
+        let _: serde_json::Value = client.call(
+            methods::KNOWLEDGE_COMMIT,
+            &corvx_proto::KnowledgeCommitParams {
+                project: project.id.clone(),
+                file: corvx_proto::knowledge_files::BRIEF.into(),
+            },
+        )?;
+    }
+    steps.push(
+        "set up its knowledge files (brief, goals, decisions, conventions), committed".into(),
+    );
+    let lead = if new.lead {
+        let s = start_lead(
+            client,
+            &project.id,
+            DEFAULT_ORCHESTRATOR_MODEL,
+            Some(&shape_message(&new.name, &new.about)),
+        )?;
+        steps.push("started its lead, to shape the project with you".into());
+        Some(s.id)
+    } else {
+        None
+    };
+    Ok(MadeProject {
+        project,
+        steps,
+        lead,
+    })
+}
+
+/// Claude Code's status line: forwards what it reports to the daemon, and prints the
+/// session's cost and today's. Prints nothing when the daemon is not there; never fails.
+fn status_line(data_dir: &std::path::Path, session_id: &str) {
+    use std::io::Read;
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return;
+    }
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    let timeout = std::time::Duration::from_secs(1);
+    let Ok(mut client) = Client::connect_with_timeout(&paths::socket_path(data_dir), timeout)
+    else {
+        return;
+    };
+    let reply: Result<corvx_proto::SessionUsageReply> = client.call(
+        methods::SESSION_USAGE,
+        &corvx_proto::SessionUsageParams {
+            id: session_id.to_string(),
+            payload,
+        },
+    );
+    if let Ok(r) = reply {
+        println!(
+            "corvx · {} · {} today (estimated)",
+            usd(r.session_usd),
+            usd(r.today_usd)
+        );
+    }
+}
+
+/// Dollars, to the cent; under a cent shows as <$0.01.
+pub(crate) fn usd(v: f64) -> String {
+    if v.abs() < 1e-9 {
+        "$0.00".into()
+    } else if v > 0.0 && v < 0.005 {
+        "<$0.01".into()
+    } else {
+        format!("${v:.2}")
+    }
+}
+
+/// A usage limit's name as people say it.
+pub(crate) fn limit_label(name: &str) -> &str {
+    match name {
+        "five_hour" => "5-hour limit",
+        "seven_day" => "weekly limit",
+        other => other,
+    }
+}
+
+fn cost(project: Option<&str>, data_dir: &std::path::Path) -> Result<()> {
+    let mut client = connect(data_dir)?;
+    let u: corvx_proto::UsageSummary =
+        client.call(methods::USAGE_SUMMARY, &corvx_proto::UsageSummaryParams {})?;
+    match project {
+        None => {
+            println!("{:<20} {:>10} {:>10}", "PROJECT", "TODAY", "IN ALL");
+            for p in &u.projects {
+                println!(
+                    "{:<20} {:>10} {:>10}",
+                    p.project,
+                    usd(p.today_usd),
+                    usd(p.total_usd)
+                );
+            }
+            println!(
+                "{:<20} {:>10} {:>10}",
+                "all projects",
+                usd(u.today_usd),
+                usd(u.total_usd)
+            );
+        }
+        Some(project) => {
+            let list: corvx_proto::SessionList = client.call(
+                methods::SESSION_LIST,
+                &corvx_proto::SessionListParams {
+                    all: true,
+                    project: Some(project.to_string()),
+                },
+            )?;
+            let cost_of = |id: &str| {
+                u.sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map_or(0.0, |s| s.cost_usd)
+            };
+            // A mission's cost: its orchestrator and everything under it.
+            let tree = |root: &str| -> f64 {
+                let mut total = 0.0;
+                let mut todo = vec![root.to_string()];
+                while let Some(id) = todo.pop() {
+                    total += cost_of(&id);
+                    todo.extend(
+                        list.sessions
+                            .iter()
+                            .filter(|s| s.supervisor.as_deref() == Some(id.as_str()))
+                            .map(|s| s.id.clone()),
+                    );
+                }
+                total
+            };
+            println!("{:<20} {:>10}  NAME", "SESSION", "COST");
+            for s in list.sessions.iter().filter(|s| {
+                s.supervisor.is_none()
+                    || !list
+                        .sessions
+                        .iter()
+                        .any(|o| Some(o.id.as_str()) == s.supervisor.as_deref())
+            }) {
+                println!("{:<20} {:>10}  {}", s.id, usd(tree(&s.id)), display_name(s));
+            }
+            if let Some(p) = u.projects.iter().find(|p| p.project == project) {
+                println!(
+                    "{:<20} {:>10}  (today {})",
+                    project,
+                    usd(p.total_usd),
+                    usd(p.today_usd)
+                );
+            }
+        }
+    }
+    for l in &u.limits {
+        println!(
+            "{}: {:.0}% used{}",
+            limit_label(&l.name),
+            l.used_pct,
+            l.resets_at
+                .map(|t| format!(", resets in {}", until(t)))
+                .unwrap_or_default()
+        );
+    }
+    println!(
+        "Estimated by Claude Code at list prices; on a subscription, what the same use would cost on the API."
+    );
+    Ok(())
+}
+
+/// How long until a moment, e.g. "2h 10m" or "3d".
+fn until(t: i64) -> String {
+    let s = (t - corvx_core::store::now_secs()).max(0);
+    match s {
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 48 * 3600 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
 fn forward_hook(data_dir: &std::path::Path, session_id: &str) {
     use corvx_client::Client;
     use corvx_proto::{methods, SessionHookParams};
@@ -1344,6 +1868,14 @@ fn attach(client: &mut Client, id: &str, data_dir: &std::path::Path) -> Result<(
 fn attach_tmux(client: &mut Client, id: &str, data_dir: &std::path::Path) -> Result<()> {
     use corvx_proto::{methods, SessionList, SessionState};
     let socket = data_dir.join("tmux.sock");
+    // CORVX sizes each window to the pane it shows it in, which pins the size: tmux would
+    // draw that small window in a field of dots. Full screen, it follows this terminal.
+    let _ = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(&socket)
+        .args(["set-option", "-w", "-t", id, "window-size", "latest"])
+        .stderr(std::process::Stdio::null())
+        .status();
     let status = std::process::Command::new("tmux")
         .arg("-S")
         .arg(&socket)
@@ -1742,7 +2274,9 @@ fn orchestrator_prompt(agent_model: &str, human_approves_agents: bool) -> String
     let models = format!(
         "Models: you run on a strong model so you can plan and review; agents do the execution on cheaper ones. \
 start_agent uses {agent_model} unless you pass model. Pick haiku for mechanical work (renames, formatting, \
-docs, simple tests) and a stronger model (opus) only for a piece that needs it (tricky design, hard debugging)."
+docs, simple tests) and a stronger model (opus) only for a piece that needs it (tricky design, hard debugging). \
+list_agents shows each agent's estimated cost so far (cost_usd): keep it in proportion to the task, and say what the \
+mission cost in your report."
     );
     let approvals = approvals_policy(human_approves_agents);
     format!("{ORCHESTRATOR_PROMPT}\n\n{models}\n\n{approvals}")
@@ -2048,7 +2582,8 @@ next. Do not call report_done and do not stop on your own: you keep running unti
 fn lead_prompt() -> String {
     format!(
         "{LEAD_PROMPT}\n\nModels: missions' orchestrators run on opus unless you pass model, and their agents on \
-{DEFAULT_AGENT_MODEL} unless you pass agent_model.\n\n{}",
+{DEFAULT_AGENT_MODEL} unless you pass agent_model. list_agents shows what each mission has cost so far (cost_usd, \
+estimated); tell the human when a mission's cost is out of proportion to its goal.\n\n{}",
         approvals_policy(false).replace("your agents'", "your missions' orchestrators'")
     )
 }

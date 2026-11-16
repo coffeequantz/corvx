@@ -2,7 +2,7 @@
 
 **Status:** Draft v0.3 · **Date:** 2026-11-09 · **Owner:** coffeequantz · **UX companion:** `CORVX_UX.md`
 **Tagline:** Build without boundaries.
-**One-liner:** CORVX is an open-source, local-first control plane for AI coding agents: it runs them durably, knows what each one is doing, routes decisions to you, and remembers what it learns about every project.
+**One-liner:** CORVX is an open-source control plane for AI coding agents: it runs them durably, knows what each one is doing, routes decisions to you, and remembers what it learns about every project.
 
 ---
 
@@ -50,7 +50,6 @@ Orchestration comes from combining these: an orchestrator is an agent that uses 
 - A triaged attention queue: you see what needs you, not everything that exists.
 - Project knowledge that agents read and that improves through approved proposals.
 - Agent-agnostic: any CLI agent works through an adapter; Claude Code first.
-- Local-first: works offline on one machine with no account.
 - Open: documented protocol, MCP tools and adapters others can build on.
 
 ### Non-goals
@@ -282,7 +281,7 @@ In order of when they arrive:
 
 ## 14. Security and privacy
 
-- Local-first. Nothing leaves the machine unless you add a remote node or an integration.
+- Nothing leaves the machine unless you add a remote node or an integration.
 - Telemetry is off unless you opt in.
 - Owner-only socket and data folder; cleaned agent environment; hook timeouts (section 6.3).
 - Agents are untrusted: their permissions come from policy; destructive actions need approval.

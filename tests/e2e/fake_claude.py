@@ -44,6 +44,20 @@ with open(flags["--settings"]) as f:
     hooks = json.load(f)["hooks"]
 hook_cmd = hooks["Stop"][0]["hooks"][0]["command"]
 permission_cmd = hooks.get("PermissionRequest", [{"hooks": [{}]}])[0]["hooks"][0].get("command")
+with open(flags["--settings"]) as f:
+    status_cmd = json.load(f).get("statusLine", {}).get("command")
+spent = 0.0
+
+
+def status_line():
+    """Runs the status line as Claude Code does after a turn: the session's cost so far."""
+    if status_cmd:
+        payload = {"session_id": "fake-claude", "cost": {"total_cost_usd": spent},
+                   "model": {"display_name": "Fake"}, "context_window": {"used_percentage": 12},
+                   "rate_limits": {"five_hour": {"used_percentage": 37, "resets_at": 4102444800}}}
+        out = subprocess.run(status_cmd, shell=True, input=json.dumps(payload).encode(),
+                             capture_output=True).stdout.decode().strip()
+        print(f"status: {out}", flush=True)
 
 
 def hook(event, **fields):
@@ -128,10 +142,18 @@ def handle(text):
         hook("Stop")
         print("permission granted", flush=True)
     elif text == "work":
+        global spent
         hook("UserPromptSubmit", prompt="work")
         hook("PreToolUse", tool_name="Read")
         hook("Stop")
+        spent += 0.25
+        status_line()
         print("turn finished", flush=True)
+    elif text == "busy":
+        # A turn that goes on: working until the next line.
+        hook("UserPromptSubmit", prompt="busy")
+        hook("PreToolUse", tool_name="Read")
+        print("working on it", flush=True)
     elif text == "ask":
         hook("UserPromptSubmit", prompt="ask")
         hook("Notification", notification_type="permission_prompt",

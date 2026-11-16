@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use corvx_core::claude_screen;
 use corvx_core::knowledge::{date_of, time_of};
 use corvx_core::policy;
 use corvx_core::service::{Core, ServiceError};
@@ -426,7 +427,7 @@ impl SessionManager {
             seen.push(id.clone());
             let asking = tmux
                 .capture(id)
-                .map(|t| trust_question(&t))
+                .map(|t| claude_screen::trust_question(&t))
                 .unwrap_or(false);
             let open = core.store().open_item(id, "trust")?;
             match (asking, open) {
@@ -483,11 +484,10 @@ impl SessionManager {
                 .as_ref()
                 .and_then(|t| t.capture(id).ok())
                 .unwrap_or_default();
-            if screen.contains("❯ Yes, I trust this folder") || screen.contains("> Yes, I trust")
-            {
+            if claude_screen::trust_yes_selected(&screen) {
                 return self.input(id, b"\r");
             }
-            if !trust_question(&screen) {
+            if !claude_screen::trust_question(&screen) {
                 return Ok(());
             }
             self.input(id, b"\x1b[B")?;
@@ -593,6 +593,10 @@ impl SessionManager {
             methods::SESSION_HOOK => {
                 let p: SessionHookParams = parse(params)?;
                 self.hook(core, &p)
+            }
+            methods::SESSION_USAGE => {
+                let p: corvx_proto::SessionUsageParams = parse(params)?;
+                to_value(self.usage(core, &p)?)
             }
             methods::SESSION_PERMISSION => {
                 let p: SessionPermissionParams = parse(params)?;
@@ -763,9 +767,12 @@ impl SessionManager {
         create_private_dir(&logs).map_err(internal)?;
         let settings_path = logs.join(format!("{id}.settings.json"));
         let hook_cmd = hook_command(&self.data_dir, id);
+        let status_cmd = status_line_command(&self.data_dir, id);
         write_private(
             &settings_path,
-            claude_settings(&hook_cmd).to_string().as_bytes(),
+            claude_settings(&hook_cmd, &status_cmd)
+                .to_string()
+                .as_bytes(),
         )
         .map_err(internal)?;
         let mcp_path = logs.join(format!("{id}.mcp.json"));
@@ -975,6 +982,37 @@ impl SessionManager {
         Ok(SessionScreen { text, state, mouse })
     }
 
+    /// What Claude Code passed its status line: the session's estimated cost and context, and
+    /// a subscription's usage limits (for the whole account, so any session may report them).
+    fn usage(
+        &self,
+        core: &Core,
+        p: &corvx_proto::SessionUsageParams,
+    ) -> Result<corvx_proto::SessionUsageReply, ServiceError> {
+        let entry = self.entries.get(&p.id).ok_or_else(|| not_found(&p.id))?;
+        let v = &p.payload;
+        let now = now_secs();
+        let cost = v["cost"]["total_cost_usd"].as_f64().unwrap_or(0.0);
+        let context = v["context_window"]["used_percentage"]
+            .as_f64()
+            .map(|p| p.clamp(0.0, 100.0).round() as u8);
+        let model = v["model"]["display_name"].as_str();
+        let store = core.store();
+        let session_usd =
+            store.record_usage(&p.id, &entry.session.project, cost, context, model, now)?;
+        for name in ["five_hour", "seven_day"] {
+            let limit = &v["rate_limits"][name];
+            if let Some(pct) = limit["used_percentage"].as_f64() {
+                store.record_limit(name, pct, limit["resets_at"].as_i64(), now)?;
+            }
+        }
+        let today_usd = store.usage_summary(now)?.today_usd;
+        Ok(corvx_proto::SessionUsageReply {
+            session_usd,
+            today_usd,
+        })
+    }
+
     /// An agent reports the outcome of its task (the `report_done` tool).
     fn report(&mut self, core: &Core, p: &SessionReportParams) -> Result<(), ServiceError> {
         let state = match p.outcome.as_str() {
@@ -1027,7 +1065,28 @@ impl SessionManager {
                 AgentState::Done => ("done", 1),
                 _ => ("failed", 2),
             };
-            let summary = format!("lead's mission {word} · {mission}: {}", p.summary);
+            // What it cost: the orchestrator and every session under it.
+            let costs = core.store().usage_summary(now_secs())?.sessions;
+            let mut spent = 0.0;
+            let mut todo = vec![entry.session.id.clone()];
+            while let Some(id) = todo.pop() {
+                spent += costs
+                    .iter()
+                    .find(|u| u.id == id)
+                    .map_or(0.0, |u| u.cost_usd);
+                todo.extend(
+                    core.store()
+                        .supervised_by(&id)?
+                        .into_iter()
+                        .map(|(s, _)| s.id),
+                );
+            }
+            let cost = if spent > 0.0 {
+                format!(" (${spent:.2})")
+            } else {
+                String::new()
+            };
+            let summary = format!("lead's mission {word} · {mission}{cost}: {}", p.summary);
             let id = core.store().open_report(
                 &entry.session.id,
                 &entry.session.project,
@@ -2169,11 +2228,6 @@ fn is_idle_notification(payload: &Value, message: &str) -> bool {
     }
 }
 
-/// Whether a screen shows Claude Code's question whether to trust the folder.
-fn trust_question(screen: &str) -> bool {
-    screen.contains("trust this folder") || screen.contains("trust the files in this folder")
-}
-
 /// A permission request in one line, e.g. "Bash: npm test · Run the tests".
 fn describe_request(payload: &Value) -> String {
     let tool = payload
@@ -2373,8 +2427,9 @@ fn rule_hit(
     Ok(policy::check(&rules, tool, &input, &workdir))
 }
 
-/// Settings for Claude Code that register CORVX's hook command for the events we use.
-fn claude_settings(hook_cmd: &str) -> Value {
+/// Settings for Claude Code that register CORVX's hook command for the events we use, and
+/// its status line, through which Claude Code reports the session's cost and context.
+fn claude_settings(hook_cmd: &str, status_cmd: &str) -> Value {
     // A short timeout: if the daemon is slow or gone, the agent must not stall on our hook.
     let entry = json!([{"hooks": [{"type": "command", "command": hook_cmd, "timeout": 5}]}]);
     // Waits for your decision from the inbox. The dialog shows in the session meanwhile, and
@@ -2383,6 +2438,7 @@ fn claude_settings(hook_cmd: &str) -> Value {
                                          "timeout": APPROVAL_HOOK_TIMEOUT_SECS}]}]);
     json!({
         "permissions": {"allow": ["mcp__corvx"]},
+        "statusLine": {"type": "command", "command": status_cmd, "padding": 0},
         "hooks": {
             "PermissionRequest": permission,
             "UserPromptSubmit": entry,
@@ -2513,6 +2569,17 @@ fn strip_ansi(s: &str) -> String {
 fn hook_command(data_dir: &Path, session_id: &str) -> String {
     format!(
         "{} --data-dir {} session hook {}",
+        shell_quote(&corvx_bin().display().to_string()),
+        shell_quote(&data_dir.display().to_string()),
+        session_id
+    )
+}
+
+/// The status-line command Claude Code runs: it reports the session's usage to the daemon
+/// and prints a short line for the session's own footer.
+fn status_line_command(data_dir: &Path, session_id: &str) -> String {
+    format!(
+        "{} --data-dir {} session status-line {}",
         shell_quote(&corvx_bin().display().to_string()),
         shell_quote(&data_dir.display().to_string()),
         session_id
@@ -4049,7 +4116,11 @@ mod tests {
 
     #[test]
     fn claude_sessions_register_the_permission_hook_with_a_long_timeout() {
-        let settings = claude_settings("corvx session hook s1");
+        let settings = claude_settings("corvx session hook s1", "corvx session status-line s1");
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "corvx session status-line s1"
+        );
         let hook = &settings["hooks"]["PermissionRequest"][0]["hooks"][0];
         assert_eq!(hook["command"], "corvx session hook s1");
         assert!(hook["timeout"].as_u64().unwrap() >= 3600);
@@ -4328,6 +4399,51 @@ mod tests {
                 .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn usage_adds_up_across_runs_and_records_limits() {
+        let mut f = fixture();
+        let id = start(&mut f, "sleep", &["30"]);
+        let report = |f: &mut Fixture, cost: f64, extra: Value| {
+            let mut payload = json!({"cost": {"total_cost_usd": cost},
+                                     "context_window": {"used_percentage": 41.6},
+                                     "model": {"display_name": "Sonnet"}});
+            if let (Some(p), Some(e)) = (payload.as_object_mut(), extra.as_object()) {
+                p.extend(e.clone());
+            }
+            let r = f
+                .mgr
+                .handle(
+                    &f.core,
+                    methods::SESSION_USAGE,
+                    json!({"id": id, "payload": payload}),
+                )
+                .unwrap();
+            r["session_usd"].as_f64().unwrap()
+        };
+        assert!((report(&mut f, 0.5, json!({})) - 0.5).abs() < 1e-9);
+        assert!((report(&mut f, 1.25, json!({})) - 1.25).abs() < 1e-9);
+        // After /clear the runtime counts from 0 again: that adds to what came before.
+        let reset = json!({"rate_limits": {"five_hour": {"used_percentage": 23.5,
+                                                          "resets_at": now_secs() + 3600}}});
+        assert!((report(&mut f, 0.2, reset) - 1.45).abs() < 1e-9);
+        let summary: corvx_proto::UsageSummary =
+            serde_json::from_value(f.core.handle(methods::USAGE_SUMMARY, json!({})).unwrap())
+                .unwrap();
+        assert!((summary.today_usd - 1.45).abs() < 1e-9);
+        assert!((summary.total_usd - 1.45).abs() < 1e-9);
+        assert_eq!(summary.projects.len(), 1);
+        let s = &summary.sessions[0];
+        assert_eq!(
+            (s.context_pct, s.model.as_deref()),
+            (Some(42), Some("Sonnet"))
+        );
+        assert_eq!(summary.limits.len(), 1);
+        assert_eq!(summary.limits[0].name, "five_hour");
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
     }
 
     #[test]

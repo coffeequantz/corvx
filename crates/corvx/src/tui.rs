@@ -236,8 +236,12 @@ struct AddPreview {
     knowledge: bool,
     name: String,
     workspace: String,
-    /// 0 name, 1 workspace, 2 knowledge.
+    /// 0 name, 1 workspace, 2 knowledge (or, for a new project, what it is).
     field: usize,
+    /// The folder does not exist yet (or is empty): a new project is started there.
+    new: bool,
+    /// For a new project: what it is, in your words. Becomes its brief.
+    about: String,
 }
 
 const PREVIEW_FIELDS: usize = 3;
@@ -328,6 +332,8 @@ struct App {
     peek_mouse: bool,
     /// Where the live pane's text was drawn, and the screen row it starts at.
     live_area: std::cell::Cell<(Rect, usize)>,
+    /// The path prompt holds the suggested folder, untouched.
+    input_suggested: bool,
     /// Wheel steps over the live pane not yet sent (up is positive), and where the last was.
     wheel: Option<(i32, u16, u16)>,
     /// The live pane scrolled through tmux's history and needs reading again.
@@ -335,6 +341,10 @@ struct App {
     /// Until when the pane reads the screen quickly, while the session redraws.
     fast_peek_until: Instant,
     last_pane_peek: Instant,
+    /// Estimated spend: today, per project, and the subscription's limits.
+    usage: corvx_proto::UsageSummary,
+    /// Each session's estimated cost so far, and how full its context is.
+    costs: std::collections::HashMap<String, (f64, Option<u8>)>,
     /// Where things were drawn, for the mouse: each area and what it is.
     hits: std::cell::RefCell<Vec<(Rect, Hit)>>,
     last_peek: Instant,
@@ -448,6 +458,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             let r = crate::attach(&mut app.client, &id, &app.data_dir);
             *terminal = init_terminal();
             terminal.clear()?;
+            // Back to the pane's size, so the preview fits again.
+            let (cols, rows) = app.live_size.get();
+            if cols > 10 && rows > 3 {
+                let _ = app.rpc(
+                    methods::SESSION_RESIZE,
+                    json!({"id": id, "cols": cols, "rows": rows}),
+                );
+            }
             if app.report(r).is_some() {
                 app.flash = format!("detached from {id}");
             }
@@ -510,9 +528,12 @@ impl App {
             peek_mouse: false,
             live_area: std::cell::Cell::new((Rect::default(), 0)),
             wheel: None,
+            input_suggested: false,
             pane_stale: false,
             fast_peek_until: Instant::now(),
             last_pane_peek: Instant::now(),
+            usage: Default::default(),
+            costs: Default::default(),
             hits: Default::default(),
             last_peek: Instant::now(),
             inbox_sel: 0,
@@ -579,6 +600,18 @@ impl App {
         let list: SessionList =
             serde_json::from_value(self.rpc(methods::SESSION_LIST, json!({"all": true}))?)?;
         self.sessions = list.sessions;
+        // (An older daemon reports no spend.)
+        self.usage = self
+            .rpc(methods::USAGE_SUMMARY, json!({}))
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        self.costs = self
+            .usage
+            .sessions
+            .iter()
+            .map(|u| (u.id.clone(), (u.cost_usd, u.context_pct)))
+            .collect();
         if self.inbox_sel >= self.attention.len() {
             self.inbox_sel = self.attention.len().saturating_sub(1);
         }
@@ -2207,9 +2240,14 @@ impl App {
             KeyCode::Backspace => {
                 self.input.pop();
             }
+            // Typing a whole path replaces the suggested folder.
+            KeyCode::Char(c @ ('/' | '~')) if self.input_suggested => {
+                self.input = c.to_string();
+            }
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
         }
+        self.input_suggested = false;
     }
 
     /// Looks at the typed path before adding it: what it is built with, whether it is a git
@@ -2220,14 +2258,38 @@ impl App {
             self.flash = "type the path of a project directory".into();
             return;
         }
+        let workspace = self
+            .selected_project()
+            .map(|p| p.workspace.clone())
+            .unwrap_or_else(|| "default".into());
         let path = match std::fs::canonicalize(&expanded) {
-            Ok(p) if p.is_dir() => p,
-            Ok(_) => {
+            Ok(p) if p.is_dir() && !is_empty_dir(&p) => p,
+            Ok(p) if !p.is_dir() => {
                 self.flash = format!("not a directory: {expanded}");
                 return;
             }
-            Err(_) => {
-                self.flash = format!("no such path: {expanded}");
+            // A folder that is not there yet, or empty: start a new project in it.
+            _ => {
+                let path = PathBuf::from(expanded.trim_end_matches('/'));
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.preview = Some(AddPreview {
+                    scan: Default::default(),
+                    path,
+                    git: false,
+                    wired: false,
+                    existing: None,
+                    knowledge: true,
+                    name,
+                    workspace,
+                    field: 2,
+                    new: true,
+                    about: String::new(),
+                });
+                self.mode = Mode::AddPreview;
+                self.flash.clear();
                 return;
             }
         };
@@ -2243,10 +2305,6 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         // New projects go where the selected one is, unless you pick another.
-        let workspace = self
-            .selected_project()
-            .map(|p| p.workspace.clone())
-            .unwrap_or_else(|| "default".into());
         self.preview = Some(AddPreview {
             scan: corvx_core::scan::scan(&path),
             path,
@@ -2257,6 +2315,8 @@ impl App {
             name,
             workspace,
             field: 0,
+            new: false,
+            about: String::new(),
         });
         self.mode = Mode::AddPreview;
         self.flash.clear();
@@ -2278,7 +2338,11 @@ impl App {
             KeyCode::Esc => self.mode = Mode::AddPath,
             KeyCode::Tab | KeyCode::Down => p.field = (p.field + 1) % fields,
             KeyCode::BackTab | KeyCode::Up => p.field = (p.field + fields - 1) % fields,
-            KeyCode::Char(' ') if p.field == 2 => p.knowledge = !p.knowledge,
+            KeyCode::Char(' ') if p.field == 2 && !p.new => p.knowledge = !p.knowledge,
+            KeyCode::Backspace if p.field == 2 && p.new => {
+                p.about.pop();
+            }
+            KeyCode::Char(c) if p.field == 2 && p.new => p.about.push(c),
             KeyCode::Left | KeyCode::Right if p.field == 1 => {
                 p.workspace = cycle(&workspaces, &p.workspace, code == KeyCode::Left);
             }
@@ -2302,7 +2366,11 @@ impl App {
                     self.flash = format!("{id} is already added");
                     return;
                 }
-                self.add_project(&preview);
+                if preview.new {
+                    self.create_project(&preview);
+                } else {
+                    self.add_project(&preview);
+                }
             }
             _ => {}
         }
@@ -2586,10 +2654,39 @@ impl App {
         }
     }
 
+    /// Asks for a path, starting in the folder your projects are in: an existing project
+    /// is added; a folder that is not there yet becomes a new project.
     fn start_add(&mut self) {
         self.mode = Mode::AddPath;
-        self.input.clear();
+        self.input = format!("{}/", tilde(&crate::projects_folder(&self.projects)));
+        self.input_suggested = true;
         self.flash.clear();
+    }
+
+    /// Starts a new project: folder, git, registration, knowledge with the brief, and its
+    /// lead, which then asks you about it. Shows the lead.
+    fn create_project(&mut self, preview: &AddPreview) {
+        let new = crate::NewProject {
+            path: preview.path.clone(),
+            name: preview.name.trim().to_string(),
+            workspace: Some(preview.workspace.trim().to_string()),
+            about: preview.about.trim().to_string(),
+            lead: true,
+        };
+        let r = crate::create_project(&mut self.client, &new);
+        let Some(made) = self.report(r) else {
+            return;
+        };
+        let r = self.refresh();
+        self.report(r);
+        self.select_project(&made.project.id);
+        if let Some(lead) = &made.lead {
+            self.reveal(lead);
+        }
+        self.flash = format!(
+            "created {} · its lead is asking you about it: Enter types to it, t sends one message",
+            made.project.id
+        );
     }
 
     fn start_remove(&mut self) {
@@ -2769,6 +2866,24 @@ fn knowledge_summary(k: &Knowledge) -> String {
     )
 }
 
+/// A path with your home folder written as ~.
+fn tilde(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return if rest.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    path.display().to_string()
+}
+
+fn is_empty_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_none())
+}
+
 fn expand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -2782,7 +2897,7 @@ fn expand_home(path: &str) -> String {
 
 fn draw(f: &mut Frame, app: &App) {
     let [top, body, status, input] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(top_height(f.area())),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -2828,6 +2943,38 @@ fn draw(f: &mut Frame, app: &App) {
     }
 }
 
+/// The name in pixels with a shadow (two pixel rows to a line), drawn when there is room.
+const LOGO: [&str; 3] = [
+    "░▄▀▀▀░▄▀▀▄░█▀▀▄░█  ░█░▀▄░▄▀",
+    "░█   ░█ ░█░█▀█ ░▀▄░▄▀ ░▄▀▄",
+    " ░▀▀▀ ░▀▀ ░▀ ░▀  ░▀  ░▀  ░▀",
+];
+
+/// The banner's pixels are light, their shadows dim.
+fn logo_spans(line: &str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for c in line.chars() {
+        let color = match c {
+            '█' | '▀' | '▄' => Color::Rgb(220, 220, 220),
+            _ => Color::Rgb(110, 110, 110),
+        };
+        match spans.last_mut() {
+            Some(last) if last.style.fg == Some(color) => last.content.to_mut().push(c),
+            _ => spans.push(Span::styled(c.to_string(), Style::default().fg(color))),
+        }
+    }
+    spans
+}
+
+/// Rows the top takes: the logo and a blank line under it on a roomy terminal, else one.
+fn top_height(area: Rect) -> u16 {
+    if area.height >= 26 && area.width >= 80 {
+        LOGO.len() as u16 + 1
+    } else {
+        1
+    }
+}
+
 fn draw_top(f: &mut Frame, area: Rect, app: &App) {
     // Counts are chips: coloured when there is something, quiet when there is not.
     let chip = |n: usize, what: &str, color: Color| {
@@ -2843,15 +2990,7 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!(" {n} {what} "), Style::default().fg(DIM))
         }
     };
-    let mut spans = vec![
-        Span::styled(
-            " ◆ CORVX ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
+    let counts = vec![
         chip(count_yours_to_approve(app), "to approve", AMBER),
         Span::raw(" "),
         chip(
@@ -2860,7 +2999,7 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
             AMBER,
         ),
         Span::raw(" "),
-        chip(count_kind(app, "waiting"), "waiting", ACCENT),
+        chip(count_your_turn(app), "waiting", ACCENT),
         Span::raw(" "),
         chip(
             count_kind(app, "done") + count_kind(app, "report"),
@@ -2875,38 +3014,117 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .filter(|i| i.kind == "approval" && orchestrators(i))
         .count();
-    if with_orchestrators > 0 {
-        spans.push(Span::styled(
+    let orchestrators_note = (with_orchestrators > 0).then(|| {
+        Span::styled(
             format!("  ({with_orchestrators} with orchestrators)"),
             Style::default().fg(DIM),
+        )
+    });
+    // Spend once there is any to show (sessions report it through Claude Code's status line).
+    let mut spend = Vec::new();
+    if app.usage.total_usd > 0.0 || !app.usage.limits.is_empty() {
+        spend.push(Span::styled(
+            format!("{} today", crate::usd(app.usage.today_usd)),
+            Style::default().fg(Color::White),
         ));
     }
-    let left = Line::from(spans);
-    let room = (area.width as usize).saturating_sub(left.width() + 2);
-    f.render_widget(Paragraph::new(left), area);
-    let right = if !app.connected {
-        Line::styled(
-            "◌ daemon disconnected · retrying ",
+    for l in &app.usage.limits {
+        if !spend.is_empty() {
+            spend.push(Span::styled(" · ", Style::default().fg(DIM)));
+        }
+        spend.push(Span::styled(
+            format!(
+                "{} {:.0}%",
+                if l.name == "five_hour" { "5h" } else { "week" },
+                l.used_pct
+            ),
+            Style::default().fg(limit_color(l.used_pct)),
+        ));
+    }
+    let daemon = if !app.connected {
+        vec![Span::styled(
+            "◌ daemon disconnected · retrying",
             Style::default().fg(AMBER),
-        )
+        )]
     } else if app.newer_build {
-        Line::styled(
-            "↻ newer build: restart it from :  ● corvxd ",
+        vec![Span::styled(
+            "↻ newer build: restart it from :  ● corvxd",
             Style::default().fg(AMBER),
-        )
+        )]
     } else {
-        Line::from(vec![
+        vec![
             Span::styled("● ", Style::default().fg(GREEN)),
             Span::styled(
                 format!(
-                    "corvxd {} · {} projects ",
+                    "corvxd {} · {} projects",
                     app.daemon_pid,
                     app.projects.len()
                 ),
                 Style::default().fg(DIM),
             ),
-        ])
+        ]
     };
+
+    if area.height > 1 {
+        // The logo; beside it what needs you, and under that the spend and the daemon.
+        let logo_w = LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let logo: Vec<Line> = LOGO.iter().map(|l| Line::from(logo_spans(l))).collect();
+        f.render_widget(Paragraph::new(logo), area);
+        let x = area.x + logo_w as u16 + 4;
+        let beside = Rect::new(x, area.y, (area.x + area.width).saturating_sub(x + 1), 2);
+        let mut spend = if spend.is_empty() {
+            Line::styled("no spend reported yet", Style::default().fg(DIM))
+        } else {
+            Line::from(spend)
+        };
+        // The note on orchestrators' approvals goes beside the counts, or under them.
+        let mut counts = Line::from(counts);
+        if let Some(note) = orchestrators_note {
+            if counts.width() + note.width() <= beside.width as usize {
+                counts.push_span(note);
+            } else {
+                let mut under = vec![Span::styled(
+                    format!("{} · ", note.content.trim()),
+                    note.style,
+                )];
+                under.extend(spend.spans);
+                spend = Line::from(under);
+            }
+        }
+        f.render_widget(Paragraph::new(counts), beside);
+        let under = Rect::new(beside.x, beside.y + 1, beside.width, 1);
+        let daemon = Line::from(daemon);
+        let daemon = if spend.width() + daemon.width() + 3 <= under.width as usize {
+            daemon
+        } else {
+            let color = if app.connected { GREEN } else { AMBER };
+            Line::styled("●", Style::default().fg(color))
+        };
+        f.render_widget(Paragraph::new(spend), under);
+        f.render_widget(Paragraph::new(daemon.right_aligned()), under);
+        return;
+    }
+
+    let mut left = vec![
+        Span::styled(
+            " ◆ CORVX ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    left.extend(counts);
+    left.extend(orchestrators_note);
+    let left = Line::from(left);
+    let room = (area.width as usize).saturating_sub(left.width() + 2);
+    f.render_widget(Paragraph::new(left), area);
+    let mut right = spend;
+    right.push(Span::raw("   "));
+    right.extend(daemon);
+    right.push(Span::raw(" "));
+    let right = Line::from(right);
     // Only what fits beside the counts; at least the dot.
     let right = if right.width() <= room {
         right
@@ -2915,6 +3133,38 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
         Line::styled("● ", Style::default().fg(color))
     };
     f.render_widget(Paragraph::new(right.right_aligned()), area);
+}
+
+/// A session's estimated cost so far.
+fn cost_of(app: &App, id: &str) -> f64 {
+    app.costs.get(id).map_or(0.0, |c| c.0)
+}
+
+/// A session's cost with everything under it: a mission's orchestrator and its agents.
+fn tree_cost(app: &App, id: &str) -> f64 {
+    let mut total = 0.0;
+    let mut todo = vec![id.to_string()];
+    while let Some(i) = todo.pop() {
+        total += cost_of(app, &i);
+        todo.extend(
+            app.sessions
+                .iter()
+                .filter(|s| s.supervisor.as_deref() == Some(i.as_str()))
+                .map(|s| s.id.clone()),
+        );
+    }
+    total
+}
+
+/// A usage limit's colour: calm, then a warning, then red near the limit.
+fn limit_color(pct: f64) -> Color {
+    if pct >= 85.0 {
+        RED
+    } else if pct >= 60.0 {
+        AMBER
+    } else {
+        DIM
+    }
 }
 
 /// Cuts text to `width` characters, marking the cut.
@@ -2940,22 +3190,7 @@ fn tile_lines(screen: &str) -> Vec<String> {
         .lines()
         .map(str::trim_end)
         .filter(|l| !l.trim().is_empty())
-        .filter(|l| {
-            let t = l.trim();
-            // Box borders, the prompt line, and Claude Code's mode footer and hints.
-            !(t.chars().all(|c| "─━│╭╮╰╯┌┐└┘ ".contains(c))
-                || t.starts_with('>')
-                || t.starts_with('❯')
-                || t.starts_with('⏵')
-                || t.starts_with("│ >")
-                || t.contains("for shortcuts")
-                || t.contains("shift+tab")
-                || t.contains("tmux detected")
-                || t.contains("auto-accept edits")
-                || t.contains("accept edits on")
-                || t.contains("bypass permissions")
-                || t.contains("/effort"))
-        })
+        .filter(|l| !corvx_core::claude_screen::footer_noise(l))
         .map(|l| l.trim().to_string())
         .collect();
     let keep = out.len().saturating_sub(4);
@@ -2963,23 +3198,19 @@ fn tile_lines(screen: &str) -> Vec<String> {
     out
 }
 
-/// Claude Code moved its conversation into the background (Esc when idle, or ← in newer
-/// versions) and shows its list of sessions instead; Enter brings the conversation back.
-/// Recognised by its text, plain or in colour.
+/// Claude Code moved its conversation into the background; Enter brings it back.
+/// Recognised by its text (see `claude_screen`), plain or in colour.
 fn in_background(screen: &str) -> bool {
-    let plain = if screen.contains('\x1b') {
-        screen
+    if screen.contains('\x1b') {
+        let plain = screen
             .lines()
             .map(strip_escapes)
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        corvx_core::claude_screen::in_background(&plain)
     } else {
-        screen.to_string()
-    };
-    plain.contains("conversation moved to the background")
-        || plain
-            .lines()
-            .any(|l| l.contains("enter to return") && l.contains("space to reply"))
+        corvx_core::claude_screen::in_background(screen)
+    }
 }
 
 /// Text without terminal escape sequences.
@@ -3236,11 +3467,27 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
             .iter()
             .filter(|s| s.project == p.id && s.state == SessionState::Running)
             .count();
-        let needs = app.attention.iter().filter(|a| a.project == p.id).count();
-        let badge = match (running, needs) {
-            (_, n) if n > 0 => format!("▲{n}"),
-            (r, _) if r > 0 => format!("●{r}"),
-            _ => String::new(),
+        // ▲ only for what needs you. While anything works, the project is working, even
+        // when its lead waits (on its missions); once all is quiet, ● says it is your turn.
+        let items: Vec<&AttentionItem> =
+            app.attention.iter().filter(|a| a.project == p.id).collect();
+        let needs = items.iter().filter(|a| needs_you(a)).count();
+        let busy = app
+            .sessions
+            .iter()
+            .filter(|s| s.project == p.id && at_work(s))
+            .count();
+        let turn = items.iter().filter(|a| your_turn(app, a)).count();
+        let (badge, badge_color) = if needs > 0 {
+            (format!("▲{needs}"), AMBER)
+        } else if busy > 0 {
+            (format!("{}{busy}", spinner()), GREEN)
+        } else if turn > 0 {
+            (format!("●{turn}"), ACCENT)
+        } else if running > 0 {
+            (format!("●{running}"), DIM)
+        } else {
+            (String::new(), DIM)
         };
         let name = clip(&p.id, width.saturating_sub(3 + badge.chars().count()));
         let pad = width.saturating_sub(2 + name.chars().count() + badge.chars().count());
@@ -3260,7 +3507,7 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
                 },
             ),
             Span::styled(" ".repeat(pad), base),
-            Span::styled(badge, base.fg(if needs > 0 { AMBER } else { GREEN })),
+            Span::styled(badge, base.fg(badge_color)),
         ]));
     }
     if app.projects.is_empty() {
@@ -3286,7 +3533,12 @@ fn draw_missions_col(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width.saturating_sub(2) as usize;
     let rows = app.col1_rows(&p.id);
     let sel = app.col1_row().map(|r| r.key);
-    let needs = |id: &str| app.attention.iter().filter(|i| i.session_id == id).count();
+    let needs = |id: &str| {
+        app.attention
+            .iter()
+            .filter(|i| i.session_id == id && needs_you(i))
+            .count()
+    };
     let dim = Style::default().fg(DIM);
     let mut lines: Vec<Line> = Vec::new();
     // Each item's first line, how many lines it takes, and its key: for the mouse.
@@ -3360,11 +3612,23 @@ fn draw_missions_col(f: &mut Frame, area: Rect, app: &App) {
                         Style::default().fg(AMBER),
                     ),
                 ],
-                vec![
-                    state_glyph(s),
-                    Span::styled(short_state(s), agent_style(s)),
-                    Span::styled(" · t talks to it", dim),
-                ],
+                if waits_on_its_work(app, s) {
+                    vec![
+                        Span::styled(format!("{} ", spinner()), Style::default().fg(GREEN)),
+                        Span::styled("missions working", agent_style(s)),
+                    ]
+                } else {
+                    vec![state_glyph(s), Span::styled(short_state(s), agent_style(s))]
+                }
+                .into_iter()
+                .chain([Span::styled(
+                    match cost_of(app, &s.id) {
+                        c if c > 0.0 => format!(" · {}", crate::usd(c)),
+                        _ => " · t talks to it".into(),
+                    },
+                    dim,
+                )])
+                .collect(),
             )),
             RowKind::Mission(s) | RowKind::Loose(s) => {
                 let under: Vec<&Session> = app
@@ -3387,6 +3651,10 @@ fn draw_missions_col(f: &mut Frame, area: Rect, app: &App) {
                         "▰".repeat(filled),
                         "▱".repeat(shown - filled)
                     ));
+                }
+                let spent = tree_cost(app, &s.id);
+                if spent > 0.0 {
+                    facts.push_str(&format!("  {}", crate::usd(spent)));
                 }
                 if let Some(goal) = serves_of(s) {
                     facts.push_str(&format!("  → {goal}"));
@@ -3523,19 +3791,27 @@ fn draw_agents_col(f: &mut Frame, area: Rect, app: &App) {
         let w = rect.width.saturating_sub(2) as usize;
         let state = short_state(s);
         let name = clip(&title_of(s), w.saturating_sub(state.chars().count() + 6));
-        let needs = app
+        // What needs you first (▲); then what is yours to look at when you like (●).
+        let mine = |i: &&AttentionItem| i.session_id == s.id;
+        let item = app
             .attention
             .iter()
-            .filter(|i| i.session_id == s.id)
-            .count();
+            .filter(mine)
+            .find(|i| needs_you(i))
+            .map(|i| (i, "▲", AMBER))
+            .or_else(|| {
+                app.attention
+                    .iter()
+                    .filter(mine)
+                    .find(|i| i.kind != "waiting" || your_turn(app, i))
+                    .map(|i| (i, "●", ACCENT))
+            });
         let mut body: Vec<Line> = Vec::new();
-        if needs > 0 {
-            if let Some(item) = app.attention.iter().find(|i| i.session_id == s.id) {
-                body.push(Line::styled(
-                    clip(&format!("▲ {}", item.summary), w),
-                    Style::default().fg(AMBER),
-                ));
-            }
+        if let Some((i, mark, color)) = item {
+            body.push(Line::styled(
+                clip(&format!("{mark} {}", i.summary), w),
+                Style::default().fg(color),
+            ));
         } else if let Some(d) = &s.agent_detail {
             body.push(Line::styled(clip(d, w), agent_style(s)));
         }
@@ -3544,6 +3820,7 @@ fn draw_agents_col(f: &mut Frame, area: Rect, app: &App) {
         for l in tail.iter().skip(tail.len().saturating_sub(room)) {
             body.push(Line::styled(clip(l, w), Style::default().fg(DIM)));
         }
+        let spent = cost_of(app, &s.id);
         let title = Line::from(vec![
             Span::raw(" "),
             state_glyph(s),
@@ -3557,10 +3834,18 @@ fn draw_agents_col(f: &mut Frame, area: Rect, app: &App) {
                     Style::default()
                 },
             ),
+            Span::styled(
+                if spent > 0.0 {
+                    format!("{} ", crate::usd(spent))
+                } else {
+                    String::new()
+                },
+                Style::default().fg(DIM),
+            ),
         ]);
         let border = if selected {
             ACCENT
-        } else if needs > 0 {
+        } else if item.is_some_and(|(_, _, c)| c == AMBER) {
             AMBER
         } else {
             BORDER
@@ -3588,20 +3873,13 @@ const LEAD: Color = Color::Rgb(188, 140, 255);
 /// state never rests on colour alone.
 fn state_glyph(s: &Session) -> Span<'static> {
     use corvx_proto::AgentState::*;
-    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let (glyph, color) = if s.state == SessionState::Lost {
         ("◌", AMBER)
     } else if s.state != SessionState::Running {
         ("·", DIM)
     } else {
         match s.agent_state {
-            Working | Unknown => {
-                let ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                (SPIN[(ms / 100 % 10) as usize], GREEN)
-            }
+            Working | Unknown => (spinner(), GREEN),
             Waiting | Idle => ("●", ACCENT),
             Blocked => ("▲", AMBER),
             Done => ("✓", GREEN),
@@ -3837,6 +4115,26 @@ fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Sess
     if let Some(m) = model {
         facts.push(format!("on {m}"));
     }
+    if let Some(&(own, context)) = app.costs.get(&s.id) {
+        let all = tree_cost(app, &s.id);
+        facts.push(if all > own + 0.005 {
+            format!(
+                "{} · {} with its {}",
+                crate::usd(own),
+                crate::usd(all),
+                if matches!(row.kind, RowKind::Lead(_)) {
+                    "missions"
+                } else {
+                    "agents"
+                }
+            )
+        } else {
+            crate::usd(own)
+        });
+        if let (Some(c), SessionState::Running) = (context, s.state) {
+            facts.push(format!("context {c}%"));
+        }
+    }
     if !under.is_empty() {
         let running = under
             .iter()
@@ -4060,6 +4358,18 @@ fn draw_project_detail(f: &mut Frame, area: Rect, app: &App, p: &Project) {
                 dim,
             ),
         ]),
+        Line::from({
+            let spent = app.usage.projects.iter().find(|u| u.project == p.id);
+            vec![
+                label("spend"),
+                Span::raw(format!(
+                    "{} today · {} in all",
+                    crate::usd(spent.map_or(0.0, |u| u.today_usd)),
+                    crate::usd(spent.map_or(0.0, |u| u.total_usd))
+                )),
+                Span::styled("  estimated by Claude Code at list prices", dim),
+            ]
+        }),
         Line::from(vec![
             label("knowledge"),
             if !k.wired {
@@ -4120,17 +4430,22 @@ fn draw_project_detail(f: &mut Frame, area: Rect, app: &App, p: &Project) {
     }
     lines.push(Line::from(""));
     lines.push(section("NEEDS YOU"));
-    let items: Vec<&AttentionItem> = app.attention.iter().filter(|i| i.project == p.id).collect();
+    // A lead waiting on its missions is not waiting on you.
+    let items: Vec<&AttentionItem> = app
+        .attention
+        .iter()
+        .filter(|i| i.project == p.id && (i.kind != "waiting" || your_turn(app, i)))
+        .collect();
     if items.is_empty() {
         lines.push(Line::styled("  nothing", dim));
     }
     for item in items.iter().take(6) {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<8}", kind_label(&item.kind)),
+                format!("  {:<9}", kind_label(&item.kind)),
                 kind_style(&item.kind),
             ),
-            Span::raw(clip(&item.summary, area.width.saturating_sub(14) as usize)),
+            Span::raw(clip(&item.summary, area.width.saturating_sub(15) as usize)),
         ]));
     }
     if items.len() > 6 {
@@ -4245,6 +4560,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// What adding the typed path would add.
 fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
+    if p.new {
+        return draw_new_project(f, area, p);
+    }
     let label = |s: &str| Span::styled(format!("{s:<11}"), Style::default().fg(DIM));
     let or = |v: &Option<String>, none: &str| v.clone().unwrap_or_else(|| none.to_string());
     let field = |i: usize, text: &str| {
@@ -4346,6 +4664,62 @@ fn draw_preview(f: &mut Frame, area: Rect, p: &AddPreview) {
         .title(" add this project? ")
         .border_style(Style::default().fg(GREEN));
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The form for a project that does not exist yet.
+fn draw_new_project(f: &mut Frame, area: Rect, p: &AddPreview) {
+    let dim = Style::default().fg(DIM);
+    let label = |s: &str| Span::styled(format!("{s:<11}"), dim);
+    let field = |i: usize, text: &str| {
+        if p.field == i {
+            Span::styled(
+                format!("{text}█"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(text.to_string())
+        }
+    };
+    let lines = vec![
+        Line::from(vec![label("name"), field(0, &p.name)]),
+        Line::from(vec![
+            label("workspace"),
+            field(1, &p.workspace),
+            Span::styled(
+                if p.field == 1 {
+                    "  ←/→ existing ones"
+                } else {
+                    ""
+                },
+                dim,
+            ),
+        ]),
+        Line::from(vec![
+            label("folder"),
+            Span::raw(tilde(&p.path)),
+            Span::styled("  (new)", Style::default().fg(GREEN)),
+        ]),
+        Line::from(""),
+        Line::from(vec![label("what it is"), field(2, &p.about)]),
+        Line::styled("           what you are building, for whom", dim),
+        Line::from(""),
+        Line::styled("Enter creates:", dim),
+        Line::styled("· the folder and a git repository", dim),
+        Line::styled("· its knowledge files; what you wrote", dim),
+        Line::styled("  becomes the brief", dim),
+        Line::styled("· its lead, which asks you about it", dim),
+        Line::styled("  and proposes the first goals", dim),
+    ];
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" start a new project ")
+        .border_style(Style::default().fg(GREEN));
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
 }
 
 /// The form that starts a mission.
@@ -4530,7 +4904,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 None => "a adds a project · ? help · q quit".into(),
             },
             Mode::AddPath => {
-                "type the project's path · Tab completes · Enter look at it · Esc cancel".into()
+                "a project's folder, or a new one to start a project there · Tab completes · Enter next · Esc cancel".into()
+            }
+            Mode::AddPreview if app.preview.as_ref().is_some_and(|p| p.new) => {
+                "Enter create · Tab/↑↓ field · ←/→ pick a workspace · Esc back".into()
             }
             Mode::AddPreview => {
                 "Enter add · Tab/↑↓ field · ←/→ pick a workspace · space knowledge on/off · Esc back"
@@ -4789,6 +5166,71 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         w,
         h,
     )
+}
+
+/// A frame of the working spinner, from the clock.
+fn spinner() -> &'static str {
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    SPIN[(ms / 100 % 10) as usize]
+}
+
+/// A running session that is doing something, not waiting for anyone.
+fn at_work(s: &Session) -> bool {
+    use corvx_proto::AgentState::*;
+    s.state == SessionState::Running && matches!(s.agent_state, Working | Unknown)
+}
+
+/// Whether anything under a session (its missions, their agents) is at work.
+fn below_at_work(app: &App, id: &str) -> bool {
+    let mut todo = vec![id.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(i) = todo.pop() {
+        if !seen.insert(i.clone()) {
+            continue;
+        }
+        for s in app
+            .sessions
+            .iter()
+            .filter(|s| s.supervisor.as_deref() == Some(i.as_str()))
+        {
+            if at_work(s) {
+                return true;
+            }
+            todo.push(s.id.clone());
+        }
+    }
+    false
+}
+
+/// A session that waits while the work it started goes on: a lead whose missions run.
+fn waits_on_its_work(app: &App, s: &Session) -> bool {
+    use corvx_proto::AgentState::*;
+    s.state == SessionState::Running
+        && matches!(s.agent_state, Waiting | Idle)
+        && below_at_work(app, &s.id)
+}
+
+/// An attention item that asks something of you: a decision, an answer, a failure. The
+/// rest (done, reports, an agent waiting) is yours to look at when you like.
+fn needs_you(item: &AttentionItem) -> bool {
+    match item.kind.as_str() {
+        "approval" => !orchestrators(item),
+        "trust" | "blocked" | "question" | "failed" => true,
+        _ => false,
+    }
+}
+
+/// A session waiting for your next instruction, with nothing of its own still at work.
+fn your_turn(app: &App, item: &AttentionItem) -> bool {
+    item.kind == "waiting" && !below_at_work(app, &item.session_id)
+}
+
+fn count_your_turn(app: &App) -> usize {
+    app.attention.iter().filter(|i| your_turn(app, i)).count()
 }
 
 fn count_kind(app: &App, kind: &str) -> usize {
