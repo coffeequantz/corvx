@@ -197,6 +197,11 @@ pub struct SessionManager {
     trust_checked: HashMap<String, Instant>,
     /// Sessions whose trust question was answered: it is not raised again.
     trust_answered: std::collections::HashSet<String>,
+    /// What each session is doing, as far as its supervisor cares (`wake_signature`), and
+    /// when that last changed. None: it has not changed since this daemon started.
+    marks: HashMap<String, (String, Option<Instant>)>,
+    /// For each supervised session: the change its idle supervisor was last woken for.
+    woken: HashMap<String, Instant>,
 }
 
 impl SessionManager {
@@ -238,6 +243,8 @@ impl SessionManager {
             claude_projects: claude_projects_dir(),
             trust_checked: HashMap::new(),
             trust_answered: Default::default(),
+            marks: HashMap::new(),
+            woken: HashMap::new(),
         }
     }
 
@@ -389,7 +396,124 @@ impl SessionManager {
     pub fn tick(&mut self, core: &Core) -> Result<(), ServiceError> {
         self.poll_tmux();
         self.check_trust(core)?;
-        self.record_ends(core)
+        self.record_ends(core)?;
+        self.wake_idle(core)
+    }
+
+    /// An agent hears of answers and of its agents through `wait_for`, but only while it is
+    /// calling it. One whose turn has ended sits at its prompt, and would wait forever for
+    /// what has already arrived. CORVX types it in instead: the answer to its question, or a
+    /// line saying that an agent it supervises needs it.
+    fn wake_idle(&mut self, core: &Core) -> Result<(), ServiceError> {
+        let now = Instant::now();
+        let mut signatures = Vec::new();
+        for (id, entry) in &self.entries {
+            let s = entry.snapshot();
+            let approval = if s.agent_state == AgentState::Blocked {
+                core.store().open_approval_for(id)?
+            } else {
+                None
+            };
+            signatures.push((id.clone(), wake_signature(&s, approval.as_ref())));
+        }
+        for (id, sig) in signatures {
+            match self.marks.get(&id) {
+                Some((old, _)) if *old == sig => {}
+                Some(_) => {
+                    self.marks.insert(id, (sig, Some(now)));
+                }
+                None => {
+                    self.marks.insert(id, (sig, None));
+                }
+            }
+        }
+        let idle = |e: &Entry| {
+            let st = lock(&e.shared.status);
+            st.state == SessionState::Running
+                && st.agent_state == AgentState::Waiting
+                && st.agent_detail.is_none()
+        };
+
+        let mut messages: Vec<(String, String)> = Vec::new();
+        for q in core.store().undelivered_answers()? {
+            if !self.entries.get(&q.session_id).is_some_and(idle) {
+                continue;
+            }
+            let answer = q
+                .answer
+                .clone()
+                .unwrap_or_default()
+                .replace(['\r', '\n'], " ");
+            messages.push((
+                q.session_id.clone(),
+                format!(
+                    "[CORVX] The human answered your question (\"{}\"): {answer}",
+                    truncate(&q.summary.replace(['\r', '\n'], " "), 200)
+                ),
+            ));
+            core.store()
+                .mark_answer_delivered(&q.id, "typed into the session", now_secs())?;
+            core.store().append_event(
+                "attention.delivered",
+                &json!({"id": q.id, "session": q.session_id}),
+            )?;
+        }
+
+        for (sup_id, sup) in &self.entries {
+            if !idle(sup) {
+                continue;
+            }
+            let since = self.marks.get(sup_id).and_then(|m| m.1);
+            let mut news = Vec::new();
+            for (id, entry) in &self.entries {
+                if entry.session.supervisor.as_deref() != Some(sup_id.as_str()) {
+                    continue;
+                }
+                let Some((sig, Some(at))) = self.marks.get(id) else {
+                    continue;
+                };
+                let wants = sig == "ended" || sig == "turn over" || sig.starts_with("decide:");
+                // What changed while it was still working, it heard of then (or chose to leave).
+                if !wants || since.is_some_and(|t| *at < t) || self.woken.get(id) == Some(at) {
+                    continue;
+                }
+                let what = match sig.as_str() {
+                    "ended" => "has ended",
+                    "turn over" => {
+                        "is waiting for you (done, failed or wants its next instruction)"
+                    }
+                    _ => "asks you to decide a permission request",
+                };
+                news.push((
+                    id.clone(),
+                    *at,
+                    format!("{} {what}", display_label(&entry.session)),
+                ));
+            }
+            if news.is_empty() {
+                continue;
+            }
+            let lines: Vec<String> = news.iter().map(|n| n.2.clone()).collect();
+            messages.push((
+                sup_id.clone(),
+                format!(
+                    "[CORVX] {}. Call wait_for to see it and act on it.",
+                    lines.join("; ")
+                ),
+            ));
+            for (id, at, _) in news {
+                self.woken.insert(id, at);
+            }
+        }
+
+        for (id, text) in messages {
+            core.store()
+                .append_event("session.woken", &json!({"id": id, "text": text}))?;
+            if let Err(e) = self.input(&id, format!("{text}\r").as_bytes()) {
+                eprintln!("corvxd: could not wake {id}: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Claude Code asks whether to trust a folder before its hooks run, so no hook reports
@@ -2205,6 +2329,27 @@ fn map_hook(event: &str, payload: &Value) -> Option<(AgentState, Option<String>)
         "Stop" => Some((AgentState::Waiting, None)),
         _ => None,
     }
+}
+
+/// What a session is doing, as far as its supervisor is concerned: it ended, its turn is
+/// over, it waits on a permission request its supervisor decides, or it is busy.
+fn wake_signature(s: &Session, approval: Option<&AttentionItem>) -> String {
+    if s.state != SessionState::Running {
+        return "ended".into();
+    }
+    match s.agent_state {
+        AgentState::Waiting | AgentState::Done | AgentState::Failed => "turn over".into(),
+        AgentState::Blocked => match approval {
+            Some(a) if a.severity < 3 => format!("decide:{}", a.id),
+            _ => "blocked".into(),
+        },
+        other => format!("{other:?}"),
+    }
+}
+
+/// A session's label, or its id.
+fn display_label(s: &Session) -> String {
+    s.label.clone().unwrap_or_else(|| s.id.clone())
 }
 
 /// A notification that a permission dialog is waiting. (The request itself arrives as a
@@ -4566,6 +4711,102 @@ mod tests {
         f.mgr
             .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
             .unwrap();
+    }
+
+    /// What CORVX typed into a session to wake it.
+    fn wakes(f: &Fixture, id: &str) -> Vec<String> {
+        f.core
+            .store()
+            .recent_events(1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "session.woken" && e.payload["id"] == id)
+            .map(|e| e.payload["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Waits until a session's output contains `needle`.
+    fn shows(f: &mut Fixture, id: &str, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if output_text(f, id).0.contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn an_answer_is_typed_into_an_agent_whose_turn_has_ended() {
+        let mut f = fixture();
+        let id = start(&mut f, "cat", &[]);
+        let ask = |f: &mut Fixture, q: &str| {
+            let v = f
+                .mgr
+                .handle(
+                    &f.core,
+                    methods::ATTENTION_ASK,
+                    json!({"session_id": id, "question": q}),
+                )
+                .unwrap();
+            v["id"].as_str().unwrap().to_string()
+        };
+        let first = ask(&mut f, "SQLite or Postgres?");
+        let second = ask(&mut f, "Which port?");
+        send_hook(&mut f, &id, "Stop", json!({}));
+        f.mgr.tick(&f.core).unwrap();
+        // One reaches it through wait_for: it is not typed in as well.
+        for (q, a) in [(&first, "SQLite"), (&second, "8080")] {
+            f.core
+                .handle(methods::ATTENTION_ANSWER, json!({"id": q, "answer": a}))
+                .unwrap();
+        }
+        f.core
+            .handle(methods::ATTENTION_DELIVERED, json!({"id": second}))
+            .unwrap();
+        f.mgr.tick(&f.core).unwrap();
+        f.mgr.tick(&f.core).unwrap();
+        let typed = wakes(&f, &id);
+        assert_eq!(typed.len(), 1, "typed in once: {typed:?}");
+        assert!(typed[0].contains("(\"SQLite or Postgres?\"): SQLite"));
+        assert!(shows(&mut f, &id, "SQLite"), "it reaches the session");
+        assert!(f.core.store().undelivered_answers().unwrap().is_empty());
+        f.mgr
+            .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_idle_supervisor_is_woken_when_its_agent_needs_it() {
+        let mut f = fixture();
+        let sup = start(&mut f, "cat", &[]);
+        let early = start_supervised(&mut f, &sup, json!({"label": "agent · early"}));
+        let late = start_supervised(&mut f, &sup, json!({"label": "agent · late"}));
+        f.mgr.tick(&f.core).unwrap();
+        // Done while its supervisor still works: wait_for tells it, no need to wake it.
+        send_hook(&mut f, &early, "Stop", json!({}));
+        f.mgr.tick(&f.core).unwrap();
+        thread::sleep(Duration::from_millis(5));
+        send_hook(&mut f, &sup, "Stop", json!({}));
+        f.mgr.tick(&f.core).unwrap();
+        thread::sleep(Duration::from_millis(5));
+        // Done once its supervisor's turn is over: it is woken, once.
+        send_hook(&mut f, &late, "Stop", json!({}));
+        f.mgr.tick(&f.core).unwrap();
+        f.mgr.tick(&f.core).unwrap();
+        let typed = wakes(&f, &sup);
+        assert_eq!(typed.len(), 1, "woken once: {typed:?}");
+        assert!(typed[0].contains("agent · late is waiting"));
+        assert!(!typed[0].contains("early"));
+        assert!(shows(&mut f, &sup, "Call wait_for"));
+        for id in [&late, &early, &sup] {
+            f.mgr
+                .handle(&f.core, methods::SESSION_STOP, json!({"id": id}))
+                .unwrap();
+        }
     }
 
     #[test]

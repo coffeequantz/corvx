@@ -458,7 +458,7 @@ def approve_in_the_terminal_ui(h: Harness):
             assert t.wait_for("1 to approve", 10), "top bar does not count the approval:\n" + t.text()
             # The request is the most urgent item: the top of the inbox.
             t.key(b"i", b"k", b"k", b"k")
-            assert t.wait_for("asks to run", 5), "inbox does not show the request:\n" + t.text()
+            assert t.wait_for("Asks your permission to run", 5), "inbox does not show the request:\n" + t.text()
             assert "y approve" in t.text(), t.text()
             t.send(key)
             wait_until(lambda: expected in output_of(h, sid).replace("\r", ""), 10, f"{key!r} to reach the agent")
@@ -738,7 +738,7 @@ def orchestrator_decides_approvals(h: Harness):
             assert t.wait_for("1 to approve", 10), "the escalation does not reach the top bar:\n" + t.text()
             t.send(b"i")
             assert t.wait_for("orchestrator: you decide", 5), "inbox:\n" + t.text()
-            assert "y approve · Y always · n deny" in t.text(), "no keys in the detail box:\n" + t.text()
+            assert "y approve  Y always  n deny" in t.text(), "no keys in the detail box:\n" + t.text()
             t.send(b"y")
             wait_until(lambda: output_of(h, wid).count("allowed by hook") > before, 10,
                        "the approval from the terminal UI:\n" + t.text())

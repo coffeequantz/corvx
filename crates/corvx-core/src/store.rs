@@ -503,6 +503,27 @@ impl Store {
         )? > 0)
     }
 
+    /// Answered questions that have not reached their agent yet: neither through `wait_for`
+    /// nor typed into its session. Oldest first.
+    pub fn undelivered_answers(&self) -> Result<Vec<AttentionItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM attention WHERE kind = 'question' AND status = 'answered'
+                    AND note IS NULL ORDER BY resolved_at",
+        )?;
+        let rows = stmt.query_map([], attention_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records that a question's answer reached its agent, so it is not delivered twice.
+    /// Returns false if there is no such answered question.
+    pub fn mark_answer_delivered(&self, id: &str, how: &str, now: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attention SET note = ?2, updated_at = ?3
+             WHERE id = ?1 AND kind = 'question' AND status = 'answered'",
+            params![id, how, now],
+        )? > 0)
+    }
+
     /// Records a permission request from a session as an inbox item of kind "approval".
     /// Severity 3 is for a human to decide; severity 1, for the session's orchestrator.
     /// Other items for the session are resolved (it has moved on), questions excepted. An

@@ -112,6 +112,15 @@ impl Core {
                     .append_event("attention.answered", &json!({"id": p.id}))?;
                 Ok(json!({"ok": true}))
             }
+            methods::ATTENTION_DELIVERED => {
+                let p: AttentionIdParams = parse(params)?;
+                let marked = self.store.mark_answer_delivered(
+                    &p.id,
+                    "delivered through wait_for",
+                    now_secs(),
+                )?;
+                Ok(json!({"ok": marked}))
+            }
             methods::ATTENTION_GET => {
                 let p: AttentionIdParams = parse(params)?;
                 let item = self.store.get_attention(&p.id)?.ok_or_else(|| {

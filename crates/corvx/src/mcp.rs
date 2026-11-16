@@ -574,7 +574,14 @@ impl Server {
                 let item: AttentionItem =
                     serde_json::from_value(self.rpc(methods::ATTENTION_GET, json!({"id": qid}))?)?;
                 match item.status.as_str() {
+                    // CORVX typed the answer into this session while it was idle; it has it.
+                    "answered" if item.note.is_some() => {
+                        self.delivered_answers.insert(qid);
+                    }
                     "answered" => {
+                        // So CORVX does not type it into the session too. (An older daemon
+                        // does not know the method; it does not type answers either.)
+                        let _ = self.rpc(methods::ATTENTION_DELIVERED, json!({"id": qid}));
                         events.push(json!({"type": "answer", "question_id": qid,
                                            "question": item.summary, "answer": item.answer}));
                         self.delivered_answers.insert(qid);

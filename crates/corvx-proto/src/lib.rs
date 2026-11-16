@@ -35,6 +35,8 @@ pub mod methods {
     pub const ATTENTION_ASK: &str = "attention.ask";
     pub const ATTENTION_ANSWER: &str = "attention.answer";
     pub const ATTENTION_GET: &str = "attention.get";
+    /// An answered question reached its agent (through `wait_for`): don't deliver it again.
+    pub const ATTENTION_DELIVERED: &str = "attention.delivered";
     pub const SESSION_SCREEN: &str = "session.screen";
     pub const SESSION_REPORT: &str = "session.report";
     /// Asked by a waiting permission hook: has the human decided yet?

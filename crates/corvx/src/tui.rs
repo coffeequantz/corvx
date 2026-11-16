@@ -320,6 +320,8 @@ struct App {
     /// The daemon binary on disk is newer than the running daemon.
     newer_build: bool,
     talk_to: Option<TalkTo>,
+    /// The message line was opened from the inbox, and goes back to it.
+    talk_from_inbox: bool,
     /// The live pane: whose screen, and its text.
     peek: Option<(String, String)>,
     /// The session the keyboard is in (Mode::Live).
@@ -345,6 +347,8 @@ struct App {
     usage: corvx_proto::UsageSummary,
     /// Each session's estimated cost so far, and how full its context is.
     costs: std::collections::HashMap<String, (f64, Option<u8>)>,
+    /// The model each session last reported running (Claude Code's status line).
+    models: std::collections::HashMap<String, String>,
     /// Where things were drawn, for the mouse: each area and what it is.
     hits: std::cell::RefCell<Vec<(Rect, Hit)>>,
     last_peek: Instant,
@@ -521,6 +525,7 @@ impl App {
             stop_target: None,
             newer_build: false,
             talk_to: None,
+            talk_from_inbox: false,
             peek: None,
             live_id: None,
             live_size: std::cell::Cell::new((0, 0)),
@@ -534,6 +539,7 @@ impl App {
             last_pane_peek: Instant::now(),
             usage: Default::default(),
             costs: Default::default(),
+            models: Default::default(),
             hits: Default::default(),
             last_peek: Instant::now(),
             inbox_sel: 0,
@@ -611,6 +617,12 @@ impl App {
             .sessions
             .iter()
             .map(|u| (u.id.clone(), (u.cost_usd, u.context_pct)))
+            .collect();
+        self.models = self
+            .usage
+            .sessions
+            .iter()
+            .filter_map(|u| Some((u.id.clone(), u.model.clone()?)))
             .collect();
         if self.inbox_sel >= self.attention.len() {
             self.inbox_sel = self.attention.len().saturating_sub(1);
@@ -1711,15 +1723,22 @@ impl App {
     }
 
     fn key_talk(&mut self, code: KeyCode) {
+        let back = if self.talk_from_inbox {
+            Mode::Inbox
+        } else {
+            Mode::Normal
+        };
         match code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
+                self.mode = back;
+                self.talk_from_inbox = false;
                 self.input.clear();
                 self.talk_to = None;
             }
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.input);
-                self.mode = Mode::Normal;
+                self.mode = back;
+                self.talk_from_inbox = false;
                 let Some(target) = self.talk_to.take() else {
                     return;
                 };
@@ -2077,7 +2096,24 @@ impl App {
                     self.mode = Mode::Answer;
                     self.input.clear();
                 }
-                Some(_) => self.flash = "only questions take an answer".into(),
+                Some(item) => self.flash = not_here('r', item),
+                None => {}
+            },
+            // Tell the item's agent something: what's next, or how to get unstuck.
+            KeyCode::Char('t') => match self.attention.get(self.inbox_sel).cloned() {
+                Some(item)
+                    if self
+                        .sessions
+                        .iter()
+                        .any(|s| s.id == item.session_id && s.state == SessionState::Running) =>
+                {
+                    self.talk_to = Some(TalkTo::Session(item.session_id));
+                    self.talk_from_inbox = true;
+                    self.input.clear();
+                    self.mode = Mode::Talk;
+                    self.flash.clear();
+                }
+                Some(_) => self.flash = "its session is not running · Enter shows it".into(),
                 None => {}
             },
             KeyCode::Char(c @ ('y' | 'Y' | 'n')) => match self.attention.get(self.inbox_sel) {
@@ -2133,7 +2169,7 @@ impl App {
                         )
                     }
                 }
-                Some(_) => self.flash = "only permission requests take y / n".into(),
+                Some(item) => self.flash = not_here(c, item),
                 None => {}
             },
             // Edit a proposal in $EDITOR, then accept it.
@@ -2141,7 +2177,7 @@ impl App {
                 Some(item) if item.kind == "proposal" => {
                     self.pending_edit = Some(item.id.clone());
                 }
-                Some(_) => self.flash = "e is for knowledge proposals".into(),
+                Some(item) => self.flash = not_here('e', item),
                 None => {}
             },
             // A CORVX rule sent this to you: allow that rule from now on in this project.
@@ -2150,7 +2186,7 @@ impl App {
                     return;
                 };
                 let Some(rule) = rule_of(&item) else {
-                    self.flash = "L is for requests a CORVX rule sent you".into();
+                    self.flash = not_here('L', &item);
                     return;
                 };
                 if self.set_rule(&rule, Some(item.project.clone()), "allow") {
@@ -2175,7 +2211,7 @@ impl App {
                     );
                     self.set_autopilot(&item.session_id, true)
                 }
-                Some(_) => self.flash = "A is for permission requests".into(),
+                Some(item) => self.flash = not_here('A', &item),
                 None => {}
             },
             KeyCode::Char('x') => self.attention_action(
@@ -2911,7 +2947,7 @@ fn draw(f: &mut Frame, app: &App) {
     let wide_view = matches!(
         app.mode,
         Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject | Mode::Rules
-    );
+    ) || in_inbox(app);
     let main = if wide_view {
         let [projects, rest] = Layout::horizontal([
             Constraint::Length((body.width / 8).clamp(14, 22)),
@@ -2925,6 +2961,7 @@ fn draw(f: &mut Frame, app: &App) {
     };
     match app.mode {
         Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject => draw_inbox(f, main, app),
+        Mode::Talk if app.talk_from_inbox => draw_inbox(f, main, app),
         Mode::Rules => draw_rules(f, main, app),
         Mode::AddPreview if app.preview.is_some() => {
             draw_preview(f, main, app.preview.as_ref().unwrap())
@@ -3138,6 +3175,28 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
 /// A session's estimated cost so far.
 fn cost_of(app: &App, id: &str) -> f64 {
     app.costs.get(id).map_or(0.0, |c| c.0)
+}
+
+/// The model a session runs, short: what it last reported (Claude Code's status line, e.g.
+/// "Opus 4.5"), or else the model it was started with (`--model sonnet`).
+fn model_of(app: &App, s: &Session) -> Option<String> {
+    short_model(app.models.get(&s.id).map(String::as_str), &s.command)
+}
+
+fn short_model(reported: Option<&str>, command: &[String]) -> Option<String> {
+    let started = || {
+        command
+            .iter()
+            .enumerate()
+            .find_map(|(i, a)| match a.strip_prefix("--model=") {
+                Some(m) => Some(m),
+                None if a == "--model" => command.get(i + 1).map(String::as_str),
+                None => None,
+            })
+    };
+    let m = reported.or_else(started)?.trim();
+    let m = m.strip_prefix("claude-").unwrap_or(m).to_lowercase();
+    (!m.is_empty()).then_some(m)
 }
 
 /// A session's cost with everything under it: a mission's orchestrator and its agents.
@@ -3622,10 +3681,16 @@ fn draw_missions_col(f: &mut Frame, area: Rect, app: &App) {
                 }
                 .into_iter()
                 .chain([Span::styled(
-                    match cost_of(app, &s.id) {
-                        c if c > 0.0 => format!(" · {}", crate::usd(c)),
-                        _ => " · t talks to it".into(),
-                    },
+                    format!(
+                        "{}{}",
+                        model_of(app, s)
+                            .map(|m| format!(" · {m}"))
+                            .unwrap_or_default(),
+                        match cost_of(app, &s.id) {
+                            c if c > 0.0 => format!(" · {}", crate::usd(c)),
+                            _ => " · t talks to it".into(),
+                        }
+                    ),
                     dim,
                 )])
                 .collect(),
@@ -3642,6 +3707,9 @@ fn draw_missions_col(f: &mut Frame, area: Rect, app: &App) {
                     .filter(|a| a.state == SessionState::Running)
                     .count();
                 let mut facts = String::new();
+                if let Some(m) = model_of(app, s) {
+                    facts.push_str(&format!("  {m}"));
+                }
                 if !under.is_empty() {
                     // A small bar: one block per agent, filled while it runs.
                     let shown = under.len().min(6);
@@ -3790,7 +3858,13 @@ fn draw_agents_col(f: &mut Frame, area: Rect, app: &App) {
         let selected = Some(r.key.as_str()) == sel.as_deref() && app.col == 2;
         let w = rect.width.saturating_sub(2) as usize;
         let state = short_state(s);
-        let name = clip(&title_of(s), w.saturating_sub(state.chars().count() + 6));
+        let model = model_of(app, s)
+            .map(|m| format!("{m} "))
+            .unwrap_or_default();
+        let name = clip(
+            &title_of(s),
+            w.saturating_sub(state.chars().count() + model.chars().count() + 6),
+        );
         // What needs you first (▲); then what is yours to look at when you like (●).
         let mine = |i: &&AttentionItem| i.session_id == s.id;
         let item = app
@@ -3835,11 +3909,14 @@ fn draw_agents_col(f: &mut Frame, area: Rect, app: &App) {
                 },
             ),
             Span::styled(
-                if spent > 0.0 {
-                    format!("{} ", crate::usd(spent))
-                } else {
-                    String::new()
-                },
+                format!(
+                    "{model}{}",
+                    if spent > 0.0 {
+                        format!("{} ", crate::usd(spent))
+                    } else {
+                        String::new()
+                    }
+                ),
                 Style::default().fg(DIM),
             ),
         ]);
@@ -4106,11 +4183,7 @@ fn draw_session_detail(f: &mut Frame, area: Rect, app: &App, row: &Row, s: &Sess
         .iter()
         .filter(|a| a.supervisor.as_deref() == Some(s.id.as_str()))
         .collect();
-    let model = s
-        .command
-        .windows(2)
-        .find(|w| w[0] == "--model")
-        .map(|w| w[1].clone());
+    let model = model_of(app, s);
     let mut facts = vec![s.id.clone()];
     if let Some(m) = model {
         facts.push(format!("on {m}"));
@@ -4878,7 +4951,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         None
     };
-    let hint = if !app.flash.is_empty() {
+    // In the inbox, what just happened shows in the inbox itself: the keys stay here, so you
+    // can see what the next item takes.
+    let flash = !app.flash.is_empty() && !in_inbox(app);
+    let hint = if flash {
         app.flash.clone()
     } else if let Some(item) = pending {
         if item.kind == "trust" {
@@ -4937,22 +5013,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Mode::Palette => "type to filter · ↑↓ select · Enter run · Esc close".into(),
             Mode::ConfirmRemove => "y remove from CORVX · any other key cancels".into(),
             Mode::Help => "any key closes".into(),
-            Mode::Inbox => match app.attention.get(app.inbox_sel).map(|i| i.kind.as_str()) {
-                Some("approval") => {
-                    "y approve · Y always · n deny · A autopilot · Enter show it · j/k move · Esc"
-                        .into()
-                }
-                Some("suggestion") => {
-                    "y allow from now on · n keep asking · j/k move · Esc".into()
-                }
-                Some("proposal") => {
-                    "y accept · e edit, then accept · n reject · z snooze · j/k move · Esc".into()
-                }
-                Some("question") => {
-                    "r answer · Enter show it · a ack · z snooze · x dismiss · j/k move · Esc".into()
-                }
-                _ => "j/k move · Enter show it · a ack · z snooze · x dismiss · Esc"
-                    .into(),
+            Mode::Inbox => match app.attention.get(app.inbox_sel) {
+                Some(item) => inbox_keys(item),
+                None => "Esc back to the columns".into(),
             },
             Mode::Answer => "type your answer · Enter send · Esc cancel".into(),
             Mode::Deny => "why, or what to do instead (optional) · Enter deny · Esc cancel".into(),
@@ -4977,22 +5040,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
     ]);
     let mut line = line;
-    if app.flash.is_empty() {
-        // "Enter type to it · t one message": each key stands out from what it does.
-        for (i, part) in hint.split(" · ").enumerate() {
-            if i > 0 {
-                line.spans.push(Span::styled("  ", Style::default()));
-            }
-            let (key, what) = part.split_once(' ').unwrap_or((part, ""));
-            line.spans.push(Span::styled(
-                key.to_string(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-            if !what.is_empty() {
-                line.spans
-                    .push(Span::styled(format!(" {what}"), Style::default().fg(DIM)));
-            }
-        }
+    if !flash {
+        line.spans.extend(key_spans(&hint));
     } else {
         line.spans
             .push(Span::styled(hint, Style::default().fg(Color::Gray)));
@@ -5332,14 +5381,17 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
             summary,
         ]));
     }
-    // The selected item in full: a long command or question does not fit on its row.
-    let detail = app.attention.get(app.inbox_sel).filter(|i| {
-        matches!(
-            i.kind.as_str(),
-            "approval" | "question" | "blocked" | "suggestion" | "proposal"
-        ) || i.summary.len() > 60
-    });
-    let Some(item) = detail else {
+    // What just happened, where you are looking.
+    let block = if app.flash.is_empty() {
+        block
+    } else {
+        block.title_bottom(Line::styled(
+            format!(" {} ", app.flash),
+            Style::default().fg(Color::Gray),
+        ))
+    };
+    // The selected item in full: what it asks of you, and the keys that answer it.
+    let Some(item) = app.attention.get(app.inbox_sel) else {
         f.render_widget(Paragraph::new(lines).block(block), area);
         return;
     };
@@ -5349,59 +5401,126 @@ fn draw_inbox(f: &mut Frame, area: Rect, app: &App) {
             return;
         }
     }
-    let [list_area, detail_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(7)]).areas(area);
-    f.render_widget(Paragraph::new(lines).block(block), list_area);
     let agent = app
         .sessions
         .iter()
         .find(|s| s.id == item.session_id)
         .map(crate::display_name)
         .unwrap_or_else(|| item.session_id.clone());
-    let title = match item.kind.as_str() {
-        "approval" if orchestrators(item) => format!(" {agent} asks its orchestrator to run "),
-        "approval" => format!(" {agent} asks to run "),
-        "question" => format!(" {agent} asks "),
-        _ => format!(" {agent} "),
-    };
     let mut text = Vec::new();
+    text.push(Line::styled(
+        inbox_asks(item),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     if let Some(note) = item.note.as_deref().filter(|_| item.kind == "approval") {
         text.push(Line::styled(note.to_string(), Style::default().fg(AMBER)));
     }
     text.push(Line::raw(item.summary.clone()));
-    if orchestrators(item) {
-        text.push(Line::styled(
-            "Its orchestrator is deciding · you can still decide it: y / Y / n",
-            Style::default().fg(DIM),
-        ));
-    } else if item.kind == "suggestion" {
-        text.push(Line::styled(
-            "y allow it without asking from now on · n keep asking (not offered again)",
-            Style::default().fg(DIM),
-        ));
-    } else if let Some(rule) = rule_of(item) {
-        text.push(Line::styled(
-            format!(
-                "y approve · n deny · L allow {rule} in {} from now on · Enter attach",
-                item.project
-            ),
-            Style::default().fg(DIM),
-        ));
-    } else if item.kind == "approval" {
-        text.push(Line::styled(
-            "y approve · Y always · n deny · A autopilot · Enter attach",
-            Style::default().fg(DIM),
-        ));
-    }
+    text.push(Line::from(""));
+    text.push(Line::from(key_spans(&inbox_keys(item))));
+    // As tall as what it says, wrapped, and no more than half the inbox.
+    let width = area.width.saturating_sub(4).max(20) as usize;
+    let rows: usize = text.iter().map(|l| l.width().div_ceil(width).max(1)).sum();
+    let height = (rows as u16 + 2).clamp(5, (area.height / 2).max(5));
+    let [list_area, detail_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).areas(area);
+    f.render_widget(Paragraph::new(lines).block(block), list_area);
     let detail = Paragraph::new(text)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(title)
+                .title(format!(" {agent} · {} ", kind_label(&item.kind)))
                 .border_style(kind_style(&item.kind)),
         );
     f.render_widget(detail, detail_area);
+}
+
+/// Whether the inbox is on screen: browsing it, or typing an answer or message from it.
+fn in_inbox(app: &App) -> bool {
+    matches!(
+        app.mode,
+        Mode::Inbox | Mode::Answer | Mode::Deny | Mode::Reject
+    ) || (app.mode == Mode::Talk && app.talk_from_inbox)
+}
+
+/// What an inbox item asks of you, in plain words.
+fn inbox_asks(item: &AttentionItem) -> String {
+    match item.kind.as_str() {
+        "approval" if orchestrators(item) => {
+            "Asks its orchestrator for permission to run this. The orchestrator decides; you may decide it first."
+        }
+        "approval" => "Asks your permission to run this:",
+        "trust" => {
+            "Claude Code asks whether to trust this folder. The agent does not start until you answer:"
+        }
+        "question" => "Asks you, and waits for your answer:",
+        "blocked" => {
+            "Is stuck at a prompt in its session that CORVX cannot answer from here. Open it and answer there:"
+        }
+        "waiting" => "Finished its turn and waits for what to do next. Nothing runs until you tell it:",
+        "done" => "Reports that it is done. Review it, reply, or acknowledge:",
+        "failed" => "Failed. Look at it, tell it what to do, or acknowledge:",
+        "report" => "For your information, nothing to decide: a mission the lead started reported.",
+        "suggestion" => "CORVX suggests this, because you keep approving it:",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// The keys that answer an inbox item, as the status line and the item show them.
+fn inbox_keys(item: &AttentionItem) -> String {
+    let rule;
+    let keys = match item.kind.as_str() {
+        "approval" if orchestrators(item) => "y approve · Y always · n deny · Enter show it",
+        "approval" if rule_of(item).is_some() => {
+            rule = format!(
+                "y approve · n deny · L allow {} in {} from now on · A autopilot · Enter show it",
+                rule_of(item).unwrap_or_default(),
+                item.project
+            );
+            &rule
+        }
+        "approval" => "y approve · Y always · n deny · A autopilot · Enter show it",
+        "trust" => "y trust the folder · n don't (Claude Code exits) · Enter show it",
+        "suggestion" => "y allow it without asking from now on · n keep asking",
+        "proposal" => "y accept · e edit, then accept · n reject · z snooze",
+        "question" => "r answer · x dismiss (it is told) · z snooze · Enter show it",
+        "blocked" => "Enter open it, answer there · t type to it · a ack",
+        "waiting" => "t tell it what's next · Enter open it · a ack (it stays waiting)",
+        "done" | "failed" => "Enter look at it · t reply · a ack",
+        "report" => "a got it · Enter show the mission",
+        _ => "Enter show it · a ack · z snooze · x dismiss",
+    };
+    format!("{keys} · j/k move · Esc")
+}
+
+/// What a key that does not apply to an item says.
+fn not_here(key: char, item: &AttentionItem) -> String {
+    format!(
+        "{key} does not apply to {} {} · its keys are below",
+        if item.kind == "approval" { "an" } else { "a" },
+        kind_label(&item.kind)
+    )
+}
+
+/// "y approve · n deny": each key stands out from what it does.
+fn key_spans(hint: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, part) in hint.split(" · ").enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let (key, what) = part.split_once(' ').unwrap_or((part, ""));
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        if !what.is_empty() {
+            spans.push(Span::styled(format!(" {what}"), Style::default().fg(DIM)));
+        }
+    }
+    spans
 }
 
 /// The inbox with a knowledge proposal selected: the list, and the proposal in full below it.
@@ -5443,10 +5562,9 @@ fn draw_proposal(
         text.extend(p.text.lines().map(|l| Line::raw(l.to_string())));
     }
     text.push(Line::from(""));
-    text.push(Line::styled(
-        "y accept (written to the file and committed) · e edit, then accept · n reject, with why",
-        Style::default().fg(DIM),
-    ));
+    text.push(Line::from(key_spans(
+        "y accept (written to the file and committed) · e edit, then accept · n reject, with why · z snooze",
+    )));
     let height = (text.len() as u16 + 2).clamp(7, area.height.saturating_sub(5).max(7));
     let [list_area, detail_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).areas(area);
@@ -5737,6 +5855,24 @@ mod tests {
         assert_eq!(key_bytes(KeyCode::Up, false, false).unwrap(), "\x1b[A");
         assert_eq!(key_bytes(KeyCode::Char('b'), false, true).unwrap(), "\x1bb");
         assert!(key_bytes(KeyCode::F(5), false, false).is_none());
+    }
+
+    #[test]
+    fn a_sessions_model_is_what_it_reports_or_what_it_was_started_with() {
+        let cmd = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let started = cmd(&["claude", "--model", "sonnet", "do it"]);
+        assert_eq!(short_model(None, &started).as_deref(), Some("sonnet"));
+        assert_eq!(
+            short_model(None, &cmd(&["claude", "--model=claude-opus-4-5"])).as_deref(),
+            Some("opus-4-5")
+        );
+        assert_eq!(
+            short_model(Some("Opus 4.5"), &started).as_deref(),
+            Some("opus 4.5"),
+            "what it reports wins"
+        );
+        assert_eq!(short_model(None, &cmd(&["claude"])), None);
+        assert_eq!(short_model(None, &cmd(&["claude", "--model"])), None);
     }
 
     #[test]
