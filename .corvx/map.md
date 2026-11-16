@@ -18,6 +18,7 @@ rust
 - `prototype/` (1 file)
 - `tests/` (2 files): `e2e/`
 - `.gitignore`
+- `CLAUDE.md`
 - `CORVX_SPEC.md`
 - `CORVX_UX.md`
 - `Cargo.lock`
