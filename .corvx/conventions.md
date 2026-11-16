@@ -13,3 +13,9 @@ _Accepted 2026-11-16. Evidence: Website mission (s1794852249-3): the human's rul
 In user-facing copy (site, README, docs), write plain, factual sentences that say what CORVX does. No marketing slogans or clever taglines ("no black boxes" and the like). The one tagline is the README's "Build without boundaries.", used once.
 
 _Accepted 2026-11-16. Evidence: Human's review of the website: phrases like "no black boxes" are "unnecessary and weird"; fixed in commit c3ed163 on corvx/s1794852249-3._
+
+## Plain language in user-facing copy
+
+Write site, README and other user-facing copy in plain, factual sentences. No slogans or clever phrases ("no black boxes"), no embellishment unless it carries information: "open source" is enough. The tagline "Build without boundaries." stays.
+
+_Accepted 2026-11-16. Evidence: Website mission s1794852176-2: the human asked to drop "no black boxes" and said "just open source is enough", meaning simple language without extra embellishment._
