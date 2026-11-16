@@ -31,3 +31,9 @@ _Accepted 2026-11-16. Evidence: Human's review of the website (follow-up round, 
   - Regenerate it when the TUI logo changes.
 
 _Accepted 2026-11-16. Evidence: Human's review rounds on the website (commits c3ed163, 57aa64e, 3dc343c on corvx/s1794852249-3): "render the TUI logo as an image file", "pure black background"; 99×22 rendered unevenly, 108×24 crisp._
+
+## Website layout: minimal, essentials only
+
+2026-11-16: the site is minimal: lots of negative space, few borders, no cards, few words. Sections are only: hero (logo, tagline, one-line pitch, status line, GitHub button), the demo GIF, "What it does" (a short list), "Get started", "Open source" (one line), and a footer. TUI colours are quiet accents; the accent blue is used only for links and the one button. A new section or feature list must earn its place; prefer adding a line to an existing section.
+
+_Accepted 2026-11-16. Evidence: The human's item 3, "Minimalist and stylish, less is more… Cut or merge sections that do not earn their place"; implemented in commit 4ae1852 on corvx/s1794852249-3._
